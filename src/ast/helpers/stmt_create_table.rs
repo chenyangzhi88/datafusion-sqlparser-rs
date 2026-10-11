@@ -69,6 +69,8 @@ pub struct CreateTableBuilder {
     pub or_replace: bool,
     /// Whether the table is `TEMPORARY`.
     pub temporary: bool,
+    /// PostgreSQL UNLOGGED SQL persistence.
+    pub unlogged: bool,
     /// Whether the table is `EXTERNAL`.
     pub external: bool,
     /// Optional `GLOBAL` flag for dialects that support it.
@@ -87,8 +89,14 @@ pub struct CreateTableBuilder {
     pub dynamic: bool,
     /// The table name.
     pub name: ObjectName,
+    /// PostgreSQL standalone composite type supplying the table columns.
+    pub of_type: Option<ObjectName>,
     /// Column definitions for the table.
     pub columns: Vec<ColumnDef>,
+    /// PostgreSQL CTAS output aliases, without types.
+    pub query_columns: Vec<Ident>,
+    /// Optional explicit CTAS data mode.
+    pub with_data: Option<bool>,
     /// Table-level constraints.
     pub constraints: Vec<TableConstraint>,
     /// Source-ordered parenthesized definition items.
@@ -122,7 +130,7 @@ pub struct CreateTableBuilder {
     /// Optional `ORDER BY` for clustering/sorting.
     pub order_by: Option<OneOrManyWithParens<Expr>>,
     /// Optional `PARTITION BY` expression.
-    pub partition_by: Option<Box<Expr>>,
+    pub partition_by: Option<crate::ast::TablePartitionBy>,
     /// MySQL's complete typed partition declaration.
     pub mysql_partitioning: Option<crate::ast::MySqlPartitionBy>,
     /// Optional `CLUSTER BY` expressions.
@@ -195,6 +203,7 @@ impl CreateTableBuilder {
         Self {
             or_replace: false,
             temporary: false,
+            unlogged: false,
             external: false,
             global: None,
             if_not_exists: false,
@@ -204,7 +213,10 @@ impl CreateTableBuilder {
             snapshot: false,
             dynamic: false,
             name,
+            of_type: None,
             columns: vec![],
+            query_columns: vec![],
+            with_data: None,
             constraints: vec![],
             elements: vec![],
             hive_distribution: HiveDistributionStyle::NONE,
@@ -261,6 +273,12 @@ impl CreateTableBuilder {
         self.or_replace = or_replace;
         self
     }
+    /// Set PostgreSQL UNLOGGED SQL persistence.
+    pub fn unlogged(mut self, unlogged: bool) -> Self {
+        self.unlogged = unlogged;
+        self
+    }
+
     /// Mark the table as `TEMPORARY`.
     pub fn temporary(mut self, temporary: bool) -> Self {
         self.temporary = temporary;
@@ -393,7 +411,7 @@ impl CreateTableBuilder {
         self
     }
     /// Set `PARTITION BY` expression.
-    pub fn partition_by(mut self, partition_by: Option<Box<Expr>>) -> Self {
+    pub fn partition_by(mut self, partition_by: Option<crate::ast::TablePartitionBy>) -> Self {
         self.partition_by = partition_by;
         self
     }
@@ -575,6 +593,22 @@ impl CreateTableBuilder {
         self.backup = backup;
         self
     }
+    /// Set CTAS output names in target-list order.
+    pub fn query_columns(mut self, columns: Vec<Ident>) -> Self {
+        self.query_columns = columns;
+        self
+    }
+    /// Set the explicit CTAS population mode.
+    pub fn with_data(mut self, with_data: Option<bool>) -> Self {
+        self.with_data = with_data;
+        self
+    }
+    /// Set the PostgreSQL typed table's originating composite type.
+    pub fn of_type(mut self, of_type: Option<ObjectName>) -> Self {
+        self.of_type = of_type;
+        self
+    }
+
     /// Consume the builder and produce a `CreateTable`.
     pub fn build(mut self) -> CreateTable {
         // A plain COMMENT is the same table semantic value, not a second
@@ -604,6 +638,7 @@ impl CreateTableBuilder {
         CreateTable {
             or_replace: self.or_replace,
             temporary: self.temporary,
+            unlogged: self.unlogged,
             external: self.external,
             global: self.global,
             if_not_exists: self.if_not_exists,
@@ -613,7 +648,10 @@ impl CreateTableBuilder {
             snapshot: self.snapshot,
             dynamic: self.dynamic,
             name: self.name,
+            of_type: self.of_type,
             columns: self.columns,
+            query_columns: self.query_columns,
+            with_data: self.with_data,
             constraints: self.constraints,
             elements,
             hive_distribution: self.hive_distribution,
@@ -687,6 +725,7 @@ impl From<CreateTable> for CreateTableBuilder {
         Self {
             or_replace: table.or_replace,
             temporary: table.temporary,
+            unlogged: table.unlogged,
             external: table.external,
             global: table.global,
             if_not_exists: table.if_not_exists,
@@ -696,7 +735,10 @@ impl From<CreateTable> for CreateTableBuilder {
             snapshot: table.snapshot,
             dynamic: table.dynamic,
             name: table.name,
+            of_type: table.of_type,
             columns: table.columns,
+            query_columns: table.query_columns,
+            with_data: table.with_data,
             constraints: table.constraints,
             elements: table.elements,
             hive_distribution: table.hive_distribution,
@@ -753,7 +795,7 @@ impl From<CreateTable> for CreateTableBuilder {
 /// Helper return type when parsing configuration for a `CREATE TABLE` statement.
 #[derive(Default)]
 pub(crate) struct CreateTableConfiguration {
-    pub partition_by: Option<Box<Expr>>,
+    pub partition_by: Option<crate::ast::TablePartitionBy>,
     pub cluster_by: Option<WrappedCollection<Vec<Expr>>>,
     pub inherits: Option<Vec<ObjectName>>,
     pub table_options: CreateTableOptions,

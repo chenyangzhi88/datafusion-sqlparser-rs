@@ -541,7 +541,9 @@ fn parse_create_table_with_options() {
             );
             assert_eq!(
                 (
-                    Some(Box::new(Expr::Identifier(Ident::new("_PARTITIONDATE")))),
+                    Some(TablePartitionBy::Expression(Box::new(Expr::Identifier(
+                        Ident::new("_PARTITIONDATE")
+                    )))),
                     Some(WrappedCollection::NoWrapping(vec![
                         Expr::Identifier(Ident::new("userid")),
                         Expr::Identifier(Ident::new("age")),
@@ -1786,6 +1788,7 @@ fn parse_join_constraint_unnest_alias() {
                 with_ordinality: false,
             },
             global: false,
+            postgres_using_bindings: None,
             join_operator: JoinOperator::Join(JoinConstraint::On(Expr::BinaryOp {
                 left: Box::new(Expr::Identifier("c1".into())),
                 op: BinaryOperator::Eq,
@@ -2233,6 +2236,10 @@ fn parse_map_access_expr() {
             }),
             AccessExpr::Subscript(Subscript::Index {
                 index: Expr::Function(Function {
+                    mysql_literal_source: None,
+                    origin: FunctionOrigin::Source,
+                    from_first_last: None,
+
                     name: ObjectName::from(vec![Ident::with_span(
                         Span::new(Location::of(1, 11), Location::of(1, 22)),
                         "safe_offset",
@@ -2282,6 +2289,9 @@ fn test_bigquery_create_function() {
     assert_eq!(
         stmt,
         Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
+
             or_alter: false,
             or_replace: true,
             temporary: true,

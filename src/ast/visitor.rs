@@ -124,9 +124,7 @@ macro_rules! visit_noop {
     };
 }
 
-visit_noop!(
-    u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool, String
-);
+visit_noop!(u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool, String);
 
 // A tuple can contain real AST children (for example MySQL trigger ordering).
 // Traverse both components in source order rather than skipping the pair.
@@ -761,7 +759,3 @@ where
     v.visit(&mut StatementVisitor(f))?;
     ControlFlow::Continue(())
 }
-
-#[cfg(test)]
-#[path = "tests/mod.rs"]
-mod tests;

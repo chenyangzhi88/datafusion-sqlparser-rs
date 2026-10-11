@@ -116,6 +116,8 @@ fn parse_array_expr() {
     let select = clickhouse().verified_only_select(sql);
     assert_eq!(
         &Expr::Array(Array {
+            opening_token: AttachedToken::empty(),
+            closing_token: AttachedToken::empty(),
             elem: vec![
                 Expr::value(Value::SingleQuotedString("1".to_string())),
                 Expr::value(Value::SingleQuotedString("2".to_string())),
@@ -192,6 +194,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -269,13 +275,13 @@ fn parse_create_table_partition_by_after_order_by() {
         Statement::CreateTable(CreateTable { partition_by, .. }) => {
             assert_eq!(
                 partition_by,
-                Some(Box::new(BinaryOp {
+                Some(TablePartitionBy::Expression(Box::new(BinaryOp {
                     left: Box::new(Identifier(Ident::new("a"))),
                     op: BinaryOperator::Modulo,
                     right: Box::new(Expr::Value(
                         Value::Number("64".parse().unwrap(), false).with_empty_span(),
                     )),
-                }))
+                })))
             );
         }
         _ => unreachable!(),
@@ -886,6 +892,10 @@ fn parse_create_table_with_variant_default_expressions() {
                         options: vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::Materialized(Expr::Function(Function {
+                                mysql_literal_source: None,
+                                origin: FunctionOrigin::Source,
+                                from_first_last: None,
+
                                 name: ObjectName::from(vec![Ident::new("now")]),
                                 uses_odbc_syntax: false,
                                 args: FunctionArguments::List(FunctionArgumentList {
@@ -907,6 +917,10 @@ fn parse_create_table_with_variant_default_expressions() {
                         options: vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::Ephemeral(Some(Expr::Function(Function {
+                                mysql_literal_source: None,
+                                origin: FunctionOrigin::Source,
+                                from_first_last: None,
+
                                 name: ObjectName::from(vec![Ident::new("now")]),
                                 uses_odbc_syntax: false,
                                 args: FunctionArguments::List(FunctionArgumentList {
@@ -936,6 +950,10 @@ fn parse_create_table_with_variant_default_expressions() {
                         options: vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::Alias(Expr::Function(Function {
+                                mysql_literal_source: None,
+                                origin: FunctionOrigin::Source,
+                                from_first_last: None,
+
                                 name: ObjectName::from(vec![Ident::new("toString")]),
                                 uses_odbc_syntax: false,
                                 args: FunctionArguments::List(FunctionArgumentList {

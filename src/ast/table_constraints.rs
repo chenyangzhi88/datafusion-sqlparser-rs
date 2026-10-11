@@ -18,9 +18,9 @@
 //! SQL Abstract Syntax Tree (AST) types for table constraints
 
 use crate::ast::{
-    ConstraintCharacteristics, ConstraintReferenceMatchKind, Expr, Ident, IndexColumn, IndexOption,
-    IndexType, KeyOrIndexDisplay, NullsDistinctOption, ObjectName, ReferentialAction,
-    display_comma_separated, display_separated,
+    display_comma_separated, display_separated, ConstraintCharacteristics,
+    ConstraintReferenceMatchKind, Expr, Ident, IndexColumn, IndexOption, IndexType,
+    KeyOrIndexDisplay, NullsDistinctOption, ObjectName, ReferentialAction,
 };
 use crate::tokenizer::Span;
 use core::fmt;
@@ -257,6 +257,8 @@ impl crate::ast::Spanned for ExcludeConstraint {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// A `CHECK` constraint (`[ CONSTRAINT <name> ] CHECK (<expr>) [[NOT] ENFORCED]`).
 pub struct CheckConstraint {
+    /// PostgreSQL: this constraint is not inherited by descendant tables.
+    pub no_inherit: bool,
     /// Optional constraint name.
     pub name: Option<Ident>,
     /// The boolean expression the CHECK constraint enforces.
@@ -275,6 +277,9 @@ impl fmt::Display for CheckConstraint {
             display_constraint_name(&self.name),
             self.expr
         )?;
+        if self.no_inherit {
+            write!(f, " NO INHERIT")?;
+        }
         if let Some(b) = self.enforced {
             write!(f, " {}", if b { "ENFORCED" } else { "NOT ENFORCED" })
         } else {

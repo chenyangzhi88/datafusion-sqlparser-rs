@@ -10,9 +10,13 @@ fn match_against_original_expression_child_is_visited_once_without_literal_narro
             "body",
         )])],
         match_value: Box::new(Expr::BinaryOp {
-            left: Box::new(Expr::Value(Value::Number("11".into(), false).into())),
+            left: Box::new(Expr::Value(
+                Value::Number("11".parse().unwrap(), false).into(),
+            )),
             op: crate::ast::BinaryOperator::Plus,
-            right: Box::new(Expr::Value(Value::Number("22".into(), false).into())),
+            right: Box::new(Expr::Value(
+                Value::Number("22".parse().unwrap(), false).into(),
+            )),
         }),
         opt_search_modifier: Some(crate::ast::SearchModifier::InBooleanMode),
     };
@@ -24,8 +28,8 @@ fn match_against_original_expression_child_is_visited_once_without_literal_narro
         type Break = ();
         fn post_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<()> {
             if let Expr::Value(value) = expression {
-                if matches!(&value.value, Value::Number(number, _) if number == "22") {
-                    *expression = Expr::Value(Value::Number("33".into(), false).into());
+                if matches!(&value.value, Value::Number(number, _) if number.to_string() == "22") {
+                    *expression = Expr::Value(Value::Number("33".parse().unwrap(), false).into());
                 }
             }
             ControlFlow::Continue(())
@@ -39,7 +43,7 @@ fn match_against_original_expression_child_is_visited_once_without_literal_narro
 
 #[test]
 fn tuple_children_are_visited_in_order_and_break_stops_mutation() {
-    let literal = |value: &str| Expr::Value(Value::Number(value.into(), false).into());
+    let literal = |value: &str| Expr::Value(Value::Number(value.parse().unwrap(), false).into());
     let mut pair = (literal("11"), literal("22"));
     let mut reader = SourceOrderVisitor::default();
     assert!(Visit::visit(&pair, &mut reader).is_continue());
@@ -49,7 +53,7 @@ fn tuple_children_are_visited_in_order_and_break_stops_mutation() {
     impl VisitorMut for StopAfterFirst {
         type Break = &'static str;
         fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-            *expr = Expr::Value(Value::Number("33".into(), false).into());
+            *expr = Expr::Value(Value::Number("33".parse().unwrap(), false).into());
             ControlFlow::Break("first child")
         }
     }
@@ -108,7 +112,7 @@ impl Visitor for SourceOrderVisitor {
     fn pre_visit_expr(&mut self, value: &Expr) -> ControlFlow<()> {
         if let Expr::Value(value) = value {
             if let Value::Number(number, _) = &value.value {
-                self.numbers.push(number.clone());
+                self.numbers.push(number.to_string());
             }
         }
         ControlFlow::Continue(())
@@ -137,8 +141,8 @@ fn create_table_visits_canonical_definitions_once_in_interleaved_source_order() 
         fn pre_visit_expr(&mut self, value: &mut Expr) -> ControlFlow<()> {
             if let Expr::Value(value) = value {
                 if let Value::Number(number, _) = &mut value.value {
-                    self.0.push(number.clone());
-                    number.push('0');
+                    self.0.push(number.to_string());
+                    *number = format!("{number}0").parse().unwrap();
                 }
             }
             ControlFlow::Continue(())
@@ -216,8 +220,8 @@ fn create_table_bad_source_ordinals_are_rejected_but_direct_visitors_never_panic
             fn pre_visit_expr(&mut self, value: &mut Expr) -> ControlFlow<()> {
                 if let Expr::Value(value) = value {
                     if let Value::Number(number, _) = &mut value.value {
-                        self.0.push(number.clone());
-                        number.push('0');
+                        self.0.push(number.to_string());
+                        *number = format!("{number}0").parse().unwrap();
                     }
                 }
                 ControlFlow::Continue(())
@@ -241,10 +245,10 @@ fn create_table_source_order_honors_visitor_break_at_the_actual_constraint() {
         fn pre_visit_expr(&mut self, value: &Expr) -> ControlFlow<Self::Break> {
             if let Expr::Value(value) = value {
                 if let Value::Number(number, _) = &value.value {
-                    if number == "22" {
+                    if number.to_string() == "22" {
                         return ControlFlow::Break("constraint");
                     }
-                    self.0.push(number.clone());
+                    self.0.push(number.to_string());
                 }
             }
             ControlFlow::Continue(())

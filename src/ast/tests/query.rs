@@ -163,12 +163,10 @@ fn json_table_literal_slots_visit_the_same_expr_owner_and_preserve_their_source_
         7,
         "source, row path, named path, two defaults, nested path, nested named path are all actual Exprs"
     );
-    assert!(
-        literals
-            .0
-            .iter()
-            .all(|span| span.start.line == 1 && span.end.column > span.start.column)
-    );
+    assert!(literals
+        .0
+        .iter()
+        .all(|span| span.start.line == 1 && span.end.column > span.start.column));
     struct Bound;
     impl VisitorMut for Bound {
         type Break = ();
@@ -215,13 +213,11 @@ fn json_table_literal_slots_visit_the_same_expr_owner_and_preserve_their_source_
         .is_err(),
         "Expr storage does not admit new grammar"
     );
-    assert!(
-        crate::parser::Parser::parse_sql(
-            &crate::dialect::MySqlDialect {},
-            "SELECT * FROM JSON_TABLE('[]','$[*]' COLUMNS(v INT PATH CONCAT('$','.v'))) jt"
-        )
-        .is_err()
-    );
+    assert!(crate::parser::Parser::parse_sql(
+        &crate::dialect::MySqlDialect {},
+        "SELECT * FROM JSON_TABLE('[]','$[*]' COLUMNS(v INT PATH CONCAT('$','.v'))) jt"
+    )
+    .is_err());
     assert!(
         matches!(column.on_error.as_ref(),Some(JsonTableColumnErrorHandling::Default(Expr::Nested(value))) if matches!(value.as_ref(),Expr::Value(value) if matches!(&value.value,Value::SingleQuotedString(value) if value=="8")))
     );

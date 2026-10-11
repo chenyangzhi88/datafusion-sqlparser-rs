@@ -430,6 +430,7 @@ pub fn table_with_alias(
 
 pub fn join(relation: TableFactor) -> Join {
     Join {
+        postgres_using_bindings: None,
         relation,
         global: false,
         join_operator: JoinOperator::Join(JoinConstraint::Natural),
@@ -480,27 +481,29 @@ pub fn index_column(stmt: Statement) -> Expr {
                 TableConstraint::FulltextOrSpatial(constraint) => {
                     constraint.columns.first().unwrap().column.expr.clone()
                 }
-                _ => panic!("Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"),
+                _ => panic!(
+                    "Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"
+                ),
             }
         }
         Statement::AlterTable(alter_table) => match alter_table.operations.first().unwrap() {
-            AlterTableOperation::AddConstraint { constraint, .. } => {
-                match constraint {
-                    TableConstraint::Index(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
-                    }
-                    TableConstraint::Unique(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
-                    }
-                    TableConstraint::PrimaryKey(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
-                    }
-                    TableConstraint::FulltextOrSpatial(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
-                    }
-                    _ => panic!("Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"),
+            AlterTableOperation::AddConstraint { constraint, .. } => match constraint {
+                TableConstraint::Index(constraint) => {
+                    constraint.columns.first().unwrap().column.expr.clone()
                 }
-            }
+                TableConstraint::Unique(constraint) => {
+                    constraint.columns.first().unwrap().column.expr.clone()
+                }
+                TableConstraint::PrimaryKey(constraint) => {
+                    constraint.columns.first().unwrap().column.expr.clone()
+                }
+                TableConstraint::FulltextOrSpatial(constraint) => {
+                    constraint.columns.first().unwrap().column.expr.clone()
+                }
+                _ => panic!(
+                    "Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"
+                ),
+            },
             _ => panic!("Expected a constraint"),
         },
         _ => panic!("Expected CREATE INDEX, ALTER TABLE, or CREATE TABLE, got: {stmt:?}"),

@@ -325,13 +325,11 @@ fn mysql_all_set_options_share_one_rhs_cursor_without_scope_inheritance_in_the_p
         crate::parser::ParserError::ParserError("one failure".into())
     );
     let foreign = crate::dialect::PostgreSqlDialect {};
-    assert!(
-        Parser::new(&foreign)
-            .try_with_sql("a=1")
-            .unwrap()
-            .parse_mysql_set_options_with(|_, _, value| Ok(value))
-            .is_err()
-    );
+    assert!(Parser::new(&foreign)
+        .try_with_sql("a=1")
+        .unwrap()
+        .parse_mysql_set_options_with(|_, _, value| Ok(value))
+        .is_err());
 }
 
 #[test]
@@ -389,22 +387,18 @@ fn mysql_set_rhs_callback_runs_once_at_each_actual_operator_frontier() {
     );
     let foreign_dialect = crate::dialect::PostgreSqlDialect {};
     let mut foreign = Parser::new(&foreign_dialect).try_with_sql("a=1").unwrap();
-    assert!(
-        foreign
-            .parse_mysql_set_assignments_with(|_, _, value| Ok(value))
-            .is_err()
-    );
+    assert!(foreign
+        .parse_mysql_set_assignments_with(|_, _, value| Ok(value))
+        .is_err());
 }
 
 #[test]
 fn mysql_help_preserves_one_system_mask_and_rejects_expression_or_prepared_grammar() {
     for sql in ["HELP HELP", "HELP help", "HELP status", "HELP `SELECT`"] {
         let statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
-        let [
-            Statement::Help {
-                mask: Expr::Identifier(identifier),
-            },
-        ] = statements.as_slice()
+        let [Statement::Help {
+            mask: Expr::Identifier(identifier),
+        }] = statements.as_slice()
         else {
             panic!("HELP must retain the actual identifier grammar: {sql}");
         };
@@ -418,11 +412,9 @@ fn mysql_help_preserves_one_system_mask_and_rejects_expression_or_prepared_gramm
         "HELP '海豚'",
     ] {
         let statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
-        let [
-            Statement::Help {
-                mask: Expr::Value(value),
-            },
-        ] = statements.as_slice()
+        let [Statement::Help {
+            mask: Expr::Value(value),
+        }] = statements.as_slice()
         else {
             panic!("HELP must retain one system-text grammar node: {sql}");
         };
@@ -645,12 +637,9 @@ fn mysql_schema_read_only_is_alter_only_and_uses_native_literal_and_conflict_gra
         };
         assert_eq!(alter.name.is_some(), named, "{sql}");
         assert!(!alter.if_exists);
-        let [
-            crate::ast::AlterSchemaOperation::SetOptionsParens {
-                options:
-                    crate::ast::AlterSchemaSetOperation::MySqlDatabaseDefaults { read_only, .. },
-            },
-        ] = alter.operations.as_slice()
+        let [crate::ast::AlterSchemaOperation::SetOptionsParens {
+            options: crate::ast::AlterSchemaSetOperation::MySqlDatabaseDefaults { read_only, .. },
+        }] = alter.operations.as_slice()
         else {
             panic!("native options")
         };
@@ -771,13 +760,11 @@ fn mysql_at_time_zone_is_only_the_native_cast_datetime_production() {
     ] {
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
     }
-    assert!(
-        Parser::parse_sql(
-            &crate::dialect::PostgreSqlDialect {},
-            "SELECT a AT TIME ZONE 'UTC'"
-        )
-        .is_ok()
-    );
+    assert!(Parser::parse_sql(
+        &crate::dialect::PostgreSqlDialect {},
+        "SELECT a AT TIME ZONE 'UTC'"
+    )
+    .is_ok());
 }
 
 #[test]
@@ -904,8 +891,8 @@ mod mysql_byte_source {
     use crate::parser::{MySqlParsedStatement, ParserError};
     use crate::tokenizer::{MySqlLexicalUnit, MySqlSourceAdapter, MySqlTokenCursor, Token};
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     };
 
     // Deliberately finite pinned-native fact fixtures. This is NOT a fallback
@@ -1158,12 +1145,10 @@ mod mysql_byte_source {
             .unwrap()
             .parse_next_mysql_source();
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("system text budget refused before conversion")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("system text budget refused before conversion"));
         drop(owner);
         assert_eq!(facts.live.load(Ordering::SeqCst), 0);
     }
@@ -1541,17 +1526,15 @@ mod mysql_byte_source {
             .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
             .unwrap();
         parser.parse_expr().unwrap();
-        assert!(
-            parser
-                .tokens
-                .raw()
-                .unwrap()
-                .cursor
-                .borrow_mut()
-                .finish_canonical_digest()
-                .unwrap()
-                .is_none()
-        );
+        assert!(parser
+            .tokens
+            .raw()
+            .unwrap()
+            .cursor
+            .borrow_mut()
+            .finish_canonical_digest()
+            .unwrap()
+            .is_none());
         drop((parser, owner));
         assert_eq!(
             facts.digest_hash_calls.load(Ordering::SeqCst),
@@ -1910,13 +1893,11 @@ mod mysql_byte_source {
             sql.extend_from_slice(&bytes);
             sql.push(b'\'');
             let result = parsed(&sql, &facts, false, false);
-            let [
-                SelectItem::MySqlProjection {
-                    expr,
-                    source_occurrence,
-                    ..
-                },
-            ] = projection(&result)
+            let [SelectItem::MySqlProjection {
+                expr,
+                source_occurrence,
+                ..
+            }] = projection(&result)
             else {
                 panic!("one raw projection")
             };
@@ -1989,12 +1970,10 @@ mod mysql_byte_source {
         let facts = Facts::new("utf8mb4");
         let result = parsed(b"SELECT /*!80000 1*/+2", &facts, false, false);
         assert_eq!(cpp(&result), b"SELECT  1 +2");
-        assert!(
-            result
-                .cpp
-                .iter()
-                .any(|piece| matches!(piece, SqlCppPiece::Space))
-        );
+        assert!(result
+            .cpp
+            .iter()
+            .any(|piece| matches!(piece, SqlCppPiece::Space)));
         let result = parsed(b"SELECT /*!99999 ignored*/1", &facts, false, false);
         assert_eq!(cpp(&result), b"SELECT 1");
         let result = parsed(
@@ -2184,24 +2163,20 @@ mod mysql_byte_source {
         let mut facts = Facts::new("utf8mb4");
         let owner = facts.owner(b"SELECT 1".to_vec());
         facts.limit = 1;
-        assert!(
-            Parser::new(&MySqlDialect {})
-                .try_with_mysql_source(owner.occurrence(0..8).unwrap(), &facts)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("budget")
-        );
+        assert!(Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..8).unwrap(), &facts)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("budget"));
         facts.limit = usize::MAX;
         facts.minimum = 2;
-        assert!(
-            Parser::new(&MySqlDialect {})
-                .try_with_mysql_source(owner.occurrence(0..8).unwrap(), &facts)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("client charset")
-        );
+        assert!(Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..8).unwrap(), &facts)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("client charset"));
         facts.minimum = 1;
         let calls = Arc::new(AtomicUsize::new(0));
         let probe = calls.clone();
@@ -2287,14 +2262,12 @@ mod mysql_byte_source {
             })
             .collect();
         assert_eq!(actual, source_occurrence.bytes().unwrap());
-        assert!(
-            Parser::new(&MySqlDialect {})
-                .try_with_mysql_source(owner.occurrence(0..0).unwrap(), &facts)
-                .unwrap()
-                .parse_next_mysql_source()
-                .unwrap()
-                .is_none()
-        );
+        assert!(Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..0).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source()
+            .unwrap()
+            .is_none());
         assert!(parsed.source_occurrence.slice(9..1).is_err());
         for sql in [
             b"--".as_slice(),
@@ -2302,20 +2275,18 @@ mod mysql_byte_source {
             b"/*comment*/".as_slice(),
         ] {
             let owner = facts.owner(sql.to_vec());
-            assert!(
-                Parser::new(&MySqlDialect {})
-                    .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
-                    .unwrap()
-                    .parse_next_mysql_source()
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(Parser::new(&MySqlDialect {})
+                .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                .unwrap()
+                .parse_next_mysql_source()
+                .unwrap()
+                .is_none());
         }
     }
 
     #[test]
-    fn command_terminal_retains_comment_source_without_inventing_a_statement_or_skipping_delimiters()
-     {
+    fn command_terminal_retains_comment_source_without_inventing_a_statement_or_skipping_delimiters(
+    ) {
         let facts = Facts::new("utf8mb4");
         for bytes in [
             b"#tail".as_slice(),
@@ -2346,16 +2317,14 @@ mod mysql_byte_source {
         }
         for bytes in [b"".as_slice(), b" \n\t"] {
             let owner = facts.owner(bytes.to_vec());
-            assert!(
-                Parser::new(&MySqlDialect {})
-                    .try_with_mysql_source(owner.occurrence(0..bytes.len()).unwrap(), &facts)
-                    .unwrap()
-                    .parse_next_mysql_command_with_body::<Statement, ()>(|_| {
-                        panic!("bare EOF is not a comment-only statement")
-                    })
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(Parser::new(&MySqlDialect {})
+                .try_with_mysql_source(owner.occurrence(0..bytes.len()).unwrap(), &facts)
+                .unwrap()
+                .parse_next_mysql_command_with_body::<Statement, ()>(|_| {
+                    panic!("bare EOF is not a comment-only statement")
+                })
+                .unwrap()
+                .is_none());
         }
         for bytes in [
             b"; SELECT 1".as_slice(),
@@ -2443,19 +2412,17 @@ mod mysql_byte_source {
             vec![
                 Value::HexStringLiteral("0F".into()),
                 Value::HexStringLiteral("05".into()),
-                Value::Number("1.25e-3".into(), false),
-                Value::Number("2e+9".into(), false)
+                Value::Number("1.25e-3".parse().unwrap(), false),
+                Value::Number("2e+9".parse().unwrap(), false)
             ]
         );
         for sql in [br"SELECT X'4\1'".as_slice(), br"SELECT b'1\0'".as_slice()] {
             let owner = facts.owner(sql.to_vec());
-            assert!(
-                Parser::new(&MySqlDialect {})
-                    .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
-                    .unwrap()
-                    .parse_next_mysql_source()
-                    .is_err()
-            );
+            assert!(Parser::new(&MySqlDialect {})
+                .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                .unwrap()
+                .parse_next_mysql_source()
+                .is_err());
         }
         for sql in [b"SELECT X''".as_slice(), b"SELECT b''".as_slice()] {
             let actual = parsed(sql, &facts, false, false);
@@ -2492,17 +2459,15 @@ mod mysql_byte_source {
         else {
             panic!("decimal plus real alias")
         };
-        assert_eq!(value.value, Value::Number("1.2".into(), false));
+        assert_eq!(value.value, Value::Number("1.2".parse().unwrap(), false));
         assert_eq!(alias.bytes().unwrap(), b"a");
         let invalid = b"SELECT 1.2e";
         let owner = facts.owner(invalid.to_vec());
-        assert!(
-            Parser::new(&MySqlDialect {})
-                .try_with_mysql_source(owner.occurrence(0..invalid.len()).unwrap(), &facts)
-                .unwrap()
-                .parse_next_mysql_source()
-                .is_err()
-        );
+        assert!(Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..invalid.len()).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source()
+            .is_err());
     }
 
     #[test]
@@ -2543,13 +2508,11 @@ mod mysql_byte_source {
             b"CREATE TABLE t(s SET(_binary'a'))".as_slice(),
         ] {
             let owner = facts.owner(sql.to_vec());
-            assert!(
-                Parser::new(&MySqlDialect {})
-                    .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
-                    .unwrap()
-                    .parse_next_mysql_source()
-                    .is_err()
-            );
+            assert!(Parser::new(&MySqlDialect {})
+                .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                .unwrap()
+                .parse_next_mysql_source()
+                .is_err());
         }
 
         let mut sql = b"SELECT '".to_vec();
@@ -2627,14 +2590,12 @@ mod mysql_byte_source {
             "tail domain is semantic, not only the first segment"
         );
         let reversed = vec![value.segments()[1].clone(), value.segments()[0].clone()];
-        assert!(
-            MySqlText::from_segments(
-                semantic.occurrence(0..3).unwrap(),
-                reversed,
-                facts.admit(256).unwrap()
-            )
-            .is_err()
-        );
+        assert!(MySqlText::from_segments(
+            semantic.occurrence(0..3).unwrap(),
+            reversed,
+            facts.admit(256).unwrap()
+        )
+        .is_err());
         let overlap = vec![
             value.segments()[0].clone(),
             MySqlTextSegment::new(
@@ -2646,14 +2607,12 @@ mod mysql_byte_source {
             )
             .unwrap(),
         ];
-        assert!(
-            MySqlText::from_segments(
-                semantic.occurrence(0..3).unwrap(),
-                overlap,
-                facts.admit(256).unwrap()
-            )
-            .is_err()
-        );
+        assert!(MySqlText::from_segments(
+            semantic.occurrence(0..3).unwrap(),
+            overlap,
+            facts.admit(256).unwrap()
+        )
+        .is_err());
         drop(changed);
         drop(semantic);
         drop(clone);
@@ -2714,11 +2673,10 @@ mod mysql_byte_source {
                 .unwrap(),
             b"=(@side:=7)"
         );
-        assert!(
-            load.assignments
-                .iter()
-                .all(|item| item.cpp_piece_range.is_some())
-        );
+        assert!(load
+            .assignments
+            .iter()
+            .all(|item| item.cpp_piece_range.is_some()));
         assert!(
             matches!(&load.assignments[0].assignment.value, Expr::Nested(value) if matches!(value.as_ref(), Expr::BinaryOp { op: BinaryOperator::Assignment, .. }))
         );
@@ -2909,11 +2867,9 @@ mod mysql_byte_source {
             1,
             "ENGINE is retained without either COMMENT copy"
         );
-        assert!(
-            options
-                .iter()
-                .all(|value| !matches!(value, SqlOption::Comment(_)))
-        );
+        assert!(options
+            .iter()
+            .all(|value| !matches!(value, SqlOption::Comment(_))));
         struct Seen(Vec<Vec<u8>>);
         impl Visitor for Seen {
             type Break = ();
@@ -2951,11 +2907,9 @@ mod mysql_byte_source {
         let DataType::MySqlEnum(members) = &table.columns[0].data_type else {
             panic!("enum")
         };
-        assert!(
-            members
-                .iter()
-                .all(|value| value.role() == MySqlTextRole::Validated)
-        );
+        assert!(members
+            .iter()
+            .all(|value| value.role() == MySqlTextRole::Validated));
         assert!(
             matches!(&table.comment, Some(CommentDef::MySql { text, .. }) if text.role() == MySqlTextRole::Validated)
         );
@@ -3122,11 +3076,9 @@ mod mysql_byte_source {
         assert_eq!(detached, *original);
         assert!(detached.bytes().is_err());
         let short = facts.owner(b"x".to_vec());
-        assert!(
-            detached
-                .reattach(&short, facts.admit(256).unwrap())
-                .is_err()
-        );
+        assert!(detached
+            .reattach(&short, facts.admit(256).unwrap())
+            .is_err());
         assert!(
             detached.bytes().is_err(),
             "failed checked admission leaves transport detached"
@@ -3358,13 +3310,11 @@ fn mysql_cast_character_set_and_zerofill_are_structured() {
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected SELECT body")
     };
-    let [
-        SelectItem::UnnamedExpr(Expr::Convert {
-            data_type: Some(DataType::Char(None)),
-            charset: Some(charset),
-            ..
-        }),
-    ] = select.projection.as_slice()
+    let [SelectItem::UnnamedExpr(Expr::Convert {
+        data_type: Some(DataType::Char(None)),
+        charset: Some(charset),
+        ..
+    })] = select.projection.as_slice()
     else {
         panic!("expected charset conversion: {:?}", select.projection)
     };
@@ -3563,25 +3513,21 @@ fn mysql_alter_column_visibility_has_structured_ast() {
         let Statement::AlterTable(alter_table) = statement else {
             panic!("expected ALTER TABLE");
         };
-        let [
-            AlterTableOperation::AlterColumn {
-                op: AlterColumnOperation::SetVisibility { visible },
-                ..
-            },
-        ] = alter_table.operations.as_slice()
+        let [AlterTableOperation::AlterColumn {
+            op: AlterColumnOperation::SetVisibility { visible },
+            ..
+        }] = alter_table.operations.as_slice()
         else {
             panic!("expected structured column visibility operation");
         };
         assert_eq!(*visible, expected_visible);
     }
 
-    assert!(
-        Parser::parse_sql(
-            &MySqlDialect {},
-            "ALTER TABLE t ALTER COLUMN c SET INVISIBLE EXTRA",
-        )
-        .is_err()
-    );
+    assert!(Parser::parse_sql(
+        &MySqlDialect {},
+        "ALTER TABLE t ALTER COLUMN c SET INVISIBLE EXTRA",
+    )
+    .is_err());
 }
 
 #[test]
@@ -3615,14 +3561,10 @@ fn mysql_partition_by(statement: &Statement) -> &MySqlPartitionBy {
     let Statement::AlterTable(alter) = statement else {
         panic!("expected ALTER TABLE: {statement:?}");
     };
-    let [
-        AlterTableOperation::SetOptionsParens {
-            options:
-                AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::PartitionBy(
-                    partitioning,
-                )),
-        },
-    ] = alter.operations.as_slice()
+    let [AlterTableOperation::SetOptionsParens {
+        options:
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::PartitionBy(partitioning)),
+    }] = alter.operations.as_slice()
     else {
         panic!("expected typed PARTITION BY: {statement:?}");
     };
@@ -4115,13 +4057,11 @@ fn mysql_select_into_file_is_structured_and_roundtrips() {
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected SELECT body")
     };
-    assert!(
-        select
-            .into
-            .as_ref()
-            .map(|destination| &destination.target)
-            .is_some_and(|target| matches!(target, SelectIntoTarget::File(file) if file.dumpfile))
-    );
+    assert!(select
+        .into
+        .as_ref()
+        .map(|destination| &destination.target)
+        .is_some_and(|target| matches!(target, SelectIntoTarget::File(file) if file.dumpfile)));
 }
 
 #[test]

@@ -59,6 +59,19 @@ const AND_PREC: u8 = 20;
 const OR_PREC: u8 = 10;
 
 impl Dialect for PostgreSqlDialect {
+    // CREATE/GRANT start an embedded schema element; WINDOW starts the named
+    // window clause. They cannot be implicit aliases, but remain allowed
+    // after AS through is_select_item_alias.
+    fn is_column_alias(&self, keyword: &Keyword, _parser: &mut Parser) -> bool {
+        !matches!(keyword, Keyword::CREATE | Keyword::GRANT | Keyword::WINDOW)
+            && !crate::keywords::RESERVED_FOR_COLUMN_ALIAS.contains(keyword)
+    }
+
+    fn is_table_alias(&self, keyword: &Keyword, _parser: &mut Parser) -> bool {
+        !matches!(keyword, Keyword::CREATE | Keyword::GRANT)
+            && !crate::keywords::RESERVED_FOR_TABLE_ALIAS.contains(keyword)
+    }
+
     fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
         Some('"')
     }
@@ -243,6 +256,10 @@ impl Dialect for PostgreSqlDialect {
     /// ```sql
     /// SELECT json_object('label': 'value')
     /// ```
+    fn supports_named_fn_args_with_assignment_operator(&self) -> bool {
+        true
+    }
+
     fn supports_named_fn_args_with_expr_name(&self) -> bool {
         true
     }
@@ -308,6 +325,10 @@ impl Dialect for PostgreSqlDialect {
     }
 
     fn supports_select_wildcard_with_alias(&self) -> bool {
+        true
+    }
+
+    fn supports_select_expr_star(&self) -> bool {
         true
     }
 

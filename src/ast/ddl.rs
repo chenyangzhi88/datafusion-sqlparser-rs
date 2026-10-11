@@ -36,6 +36,11 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::value::escape_single_quote_string;
 use crate::ast::{
+    display_comma_separated, display_separated,
+    table_constraints::{
+        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
+        UniqueConstraint,
+    },
     AttachedToken, BeginEndStatements, CommentDef, ConditionalStatements, CreateFunctionBody,
     CreateFunctionUsing, CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr,
     FileFormat, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
@@ -45,12 +50,7 @@ use crate::ast::{
     OrderByExpr, ProjectionSelect, Query, RefreshModeKind, ResetConfig, RowAccessPolicy,
     SequenceOptions, Spanned, SqlOption, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod,
-    TriggerReferencing, Value, ValueWithSpan, WrappedCollection, display_comma_separated,
-    display_separated,
-    table_constraints::{
-        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
-        UniqueConstraint,
-    },
+    TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
 };
 use crate::display_utils::{Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
@@ -666,6 +666,13 @@ impl fmt::Display for MySqlPartitionMaintenance {
 pub enum AlterTableSetOperation {
     /// Portable `SET (...)` options.
     Options(Vec<SqlOption>),
+    /// PostgreSQL `RESET (...)` restores named relation options to their defaults.
+    PostgreSqlReset(Vec<SqlOption>),
+    /// PostgreSQL SET LOGGED / SET UNLOGGED SQL persistence.
+    PostgreSqlPersistence {
+        /// Whether to use `LOGGED` rather than `UNLOGGED` persistence.
+        logged: bool,
+    },
     /// MySQL table defaults changed without rewriting existing character data.
     MySqlDefaultCharacterSet {
         /// New default character set.
@@ -689,7 +696,7 @@ impl AlterTableSetOperation {
     /// `SET (...)` options.
     pub fn iter(&self) -> core::slice::Iter<'_, SqlOption> {
         match self {
-            Self::Options(options) => options.iter(),
+            Self::Options(options) | Self::PostgreSqlReset(options) => options.iter(),
             _ => [].iter(),
         }
     }
@@ -701,6 +708,14 @@ impl fmt::Display for AlterTableSetOperation {
             Self::Options(options) => {
                 write!(f, "SET ({})", display_comma_separated(options))
             }
+            Self::PostgreSqlReset(options) => {
+                write!(f, "RESET ({})", display_comma_separated(options))
+            }
+            Self::PostgreSqlPersistence { logged } => f.write_str(if *logged {
+                "SET LOGGED"
+            } else {
+                "SET UNLOGGED"
+            }),
             Self::MySqlDefaultCharacterSet { charset, collation } => {
                 write!(f, "DEFAULT CHARACTER SET = {charset}")?;
                 if let Some(collation) = collation {
@@ -725,6 +740,20 @@ impl fmt::Display for AlterTableSetOperation {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterTableOperation {
+    /// Add or remove a direct table inheritance relationship.
+    Inherit {
+        /// Actual parent relation, resolved under the statement search path.
+        parent: ObjectName,
+        /// `NO INHERIT` removes this parent without removing local columns.
+        remove: bool,
+    },
+    /// Attach the table to a standalone named composite type.
+    Of {
+        /// Standalone composite type to which the table is attached.
+        type_name: ObjectName,
+    },
+    /// Detach a typed table while retaining its own row type and data.
+    NotOf,
     /// `ADD <table_constraint> [NOT VALID]`
     AddConstraint {
         /// The table constraint to add.
@@ -1056,6 +1085,16 @@ pub enum AlterTableOperation {
         /// The new owner to assign to the table.
         new_owner: Owner,
     },
+    /// `SET SCHEMA schema_name` moves the relation to another schema.
+    SetSchema {
+        /// Destination schema name.
+        schema_name: Ident,
+    },
+    /// PostgreSQL logical tablespace assignment.
+    SetTablespace {
+        /// Destination tablespace name.
+        tablespace_name: Ident,
+    },
     /// Snowflake table clustering options
     /// <https://docs.snowflake.com/en/sql-reference/sql/alter-table#clustering-actions-clusteringaction>
     ClusterBy {
@@ -1311,6 +1350,11 @@ pub enum AlterIndexOperation {
 impl fmt::Display for AlterTableOperation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            AlterTableOperation::Inherit { parent, remove } => {
+                write!(f, "{}INHERIT {parent}", if *remove { "NO " } else { "" })
+            }
+            AlterTableOperation::Of { type_name } => write!(f, "OF {type_name}"),
+            AlterTableOperation::NotOf => f.write_str("NOT OF"),
             AlterTableOperation::AddPartitions {
                 if_not_exists,
                 new_partitions,
@@ -1576,6 +1620,12 @@ impl fmt::Display for AlterTableOperation {
             AlterTableOperation::OwnerTo { new_owner } => {
                 write!(f, "OWNER TO {new_owner}")
             }
+            AlterTableOperation::SetSchema { schema_name } => {
+                write!(f, "SET SCHEMA {schema_name}")
+            }
+            AlterTableOperation::SetTablespace { tablespace_name } => {
+                write!(f, "SET TABLESPACE {tablespace_name}")
+            }
             AlterTableOperation::SetTblProperties { table_properties } => {
                 write!(
                     f,
@@ -1684,6 +1734,16 @@ pub struct AlterType {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterTypeOperation {
+    /// Change ordered PostgreSQL base-type support properties.
+    SetDefinition {
+        /// Definition attributes, including explicit NONE and quoted names.
+        options: Vec<SqlOption>,
+    },
+    /// Move the type and its implicit array into another schema.
+    SetSchema {
+        /// The destination schema identifier.
+        schema_name: Ident,
+    },
     /// Rename the type.
     Rename(AlterTypeRename),
     /// Add a new value to the type (for enum-like types).
@@ -1739,6 +1799,10 @@ pub struct AlterTypeRenameValue {
 impl fmt::Display for AlterTypeOperation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::SetDefinition { options } => {
+                write!(f, "SET ({})", display_comma_separated(options))
+            }
+            Self::SetSchema { schema_name } => write!(f, "SET SCHEMA {schema_name}"),
             Self::Rename(AlterTypeRename { new_name }) => {
                 write!(f, "RENAME TO {new_name}")
             }
@@ -1819,10 +1883,19 @@ pub enum OperatorOption {
     Commutator(ObjectName),
     /// `NEGATOR = neg_op`
     Negator(ObjectName),
-    /// `HASHES`
-    Hashes,
-    /// `MERGES`
-    Merges,
+    /// `HASHES [= boolean]`
+    Hashes(bool),
+    /// `MERGES [= boolean]`
+    Merges(bool),
+    /// PostgreSQL's accepted legacy SORT1/SORT2/LTCMP/GTCMP flags.
+    LegacyMerge(Ident),
+    /// Unknown definition attributes are retained for execution-time warnings.
+    Unrecognized {
+        /// Unrecognized definition attribute name.
+        name: Ident,
+        /// Optional expression assigned to the attribute.
+        value: Option<Expr>,
+    },
 }
 
 impl fmt::Display for AlterOperator {
@@ -1865,8 +1938,18 @@ impl fmt::Display for OperatorOption {
             Self::Join(None) => write!(f, "JOIN = NONE"),
             Self::Commutator(op_name) => write!(f, "COMMUTATOR = {}", op_name),
             Self::Negator(op_name) => write!(f, "NEGATOR = {}", op_name),
-            Self::Hashes => write!(f, "HASHES"),
-            Self::Merges => write!(f, "MERGES"),
+            Self::Hashes(true) => write!(f, "HASHES"),
+            Self::Hashes(false) => write!(f, "HASHES = FALSE"),
+            Self::Merges(true) => write!(f, "MERGES"),
+            Self::Merges(false) => write!(f, "MERGES = FALSE"),
+            Self::LegacyMerge(name) => name.fmt(f),
+            Self::Unrecognized { name, value } => {
+                name.fmt(f)?;
+                if let Some(value) = value {
+                    write!(f, " = {value}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1912,6 +1995,8 @@ pub enum AlterColumnOperation {
     SetDataType {
         /// Target data type for the column.
         data_type: DataType,
+        /// PostgreSQL explicit collation of the target attribute.
+        collation: Option<ObjectName>,
         /// PostgreSQL-specific `USING <expr>` expression for conversion.
         using: Option<Expr>,
         /// Set to true if the statement includes the `SET DATA TYPE` keywords.
@@ -1974,6 +2059,7 @@ impl fmt::Display for AlterColumnOperation {
             }
             AlterColumnOperation::SetDataType {
                 data_type,
+                collation,
                 using,
                 had_set,
             } => {
@@ -1981,6 +2067,9 @@ impl fmt::Display for AlterColumnOperation {
                     write!(f, "SET DATA ")?;
                 }
                 write!(f, "TYPE {data_type}")?;
+                if let Some(collation) = collation {
+                    write!(f, " COLLATE {collation}")?;
+                }
                 if let Some(expr) = using {
                     write!(f, " USING {expr}")?;
                 }
@@ -2280,6 +2369,8 @@ impl fmt::Display for CreateProcedureBody {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct CreateProcedure {
+    /// Transient parser source, moved into the one routine body owner.
+    pub parsed_source: RoutineSourceProvenance,
     /// MySQL saved-body source/header facts; never a portable body substitute.
     pub mysql_body: Option<MySqlProgramBody>,
     /// `CREATE OR ALTER`, used by SQL Server dialects.
@@ -3088,7 +3179,11 @@ impl ConstraintCharacteristics {
     fn enforced_text(&self) -> Option<&'static str> {
         self.enforced.map(
             |enforced| {
-                if enforced { "ENFORCED" } else { "NOT ENFORCED" }
+                if enforced {
+                    "ENFORCED"
+                } else {
+                    "NOT ENFORCED"
+                }
             },
         )
     }
@@ -3407,7 +3502,7 @@ pub enum UserDefinedTypeRangeOption {
     /// Function to compute the difference between two subtype values: `SUBTYPE_DIFF = subtype_diff_function`
     SubtypeDiff(ObjectName),
     /// Name of the corresponding multirange type: `MULTIRANGE_TYPE_NAME = multirange_type_name`
-    MultirangeTypeName(ObjectName),
+    MultirangeTypeName(DataType),
 }
 
 impl fmt::Display for UserDefinedTypeRangeOption {
@@ -3451,6 +3546,15 @@ impl fmt::Display for UserDefinedTypeRangeOption {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum UserDefinedTypeSqlDefinitionOption {
+    /// A syntactically valid definition attribute unknown to PostgreSQL's type
+    /// definition service. Its case-sensitive name and optional argument are
+    /// retained so that the service can issue a WARNING in source order.
+    Unrecognized {
+        /// Original attribute label, including quote semantics and source span.
+        name: Ident,
+        /// Optional argument; an unknown attribute never evaluates this value.
+        value: Option<Expr>,
+    },
     /// Function to convert from external text representation to internal: `INPUT = input_function`
     Input(ObjectName),
     /// Function to convert from internal to external text representation: `OUTPUT = output_function`
@@ -3473,6 +3577,8 @@ pub enum UserDefinedTypeSqlDefinitionOption {
     PassedByValue,
     /// Storage alignment requirement (1, 2, 4, or 8 bytes): `ALIGNMENT = alignment`
     Alignment(Alignment),
+    /// Alignment argument retained for PostgreSQL semantic validation.
+    AlignmentName(String),
     /// Storage strategy for varlena types: `STORAGE = storage`
     Storage(UserDefinedTypeStorage),
     /// Copy properties from an existing type: `LIKE = like_type`
@@ -3494,6 +3600,13 @@ pub enum UserDefinedTypeSqlDefinitionOption {
 impl fmt::Display for UserDefinedTypeSqlDefinitionOption {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            UserDefinedTypeSqlDefinitionOption::Unrecognized { name, value } => {
+                write!(f, "{name}")?;
+                if let Some(value) = value {
+                    write!(f, " = {value}")?;
+                }
+                Ok(())
+            }
             UserDefinedTypeSqlDefinitionOption::Input(name) => write!(f, "INPUT = {}", name),
             UserDefinedTypeSqlDefinitionOption::Output(name) => write!(f, "OUTPUT = {}", name),
             UserDefinedTypeSqlDefinitionOption::Receive(name) => write!(f, "RECEIVE = {}", name),
@@ -3512,6 +3625,9 @@ impl fmt::Display for UserDefinedTypeSqlDefinitionOption {
             UserDefinedTypeSqlDefinitionOption::PassedByValue => write!(f, "PASSEDBYVALUE"),
             UserDefinedTypeSqlDefinitionOption::Alignment(align) => {
                 write!(f, "ALIGNMENT = {}", align)
+            }
+            UserDefinedTypeSqlDefinitionOption::AlignmentName(value) => {
+                write!(f, "ALIGNMENT = '{}'", escape_single_quote_string(value))
             }
             UserDefinedTypeSqlDefinitionOption::Storage(storage) => {
                 write!(f, "STORAGE = {}", storage)
@@ -3730,6 +3846,8 @@ pub struct CreateTable {
     pub or_replace: bool,
     /// `TEMP` or `TEMPORARY` clause
     pub temporary: bool,
+    /// PostgreSQL `UNLOGGED` SQL persistence.
+    pub unlogged: bool,
     /// `EXTERNAL` clause
     pub external: bool,
     /// `DYNAMIC` clause
@@ -3749,8 +3867,14 @@ pub struct CreateTable {
     pub snapshot: bool,
     /// Table name
     pub name: ObjectName,
+    /// PostgreSQL standalone composite type supplying the table columns.
+    pub of_type: Option<ObjectName>,
     /// Column definitions
     pub columns: Vec<ColumnDef>,
+    /// Output aliases in PostgreSQL CREATE TABLE AS, independent of typed definitions.
+    pub query_columns: Vec<Ident>,
+    /// Explicit CTAS data mode; omission has the same semantics as WITH DATA.
+    pub with_data: Option<bool>,
     /// Table constraints
     pub constraints: Vec<TableConstraint>,
     /// Source order of the parenthesized table definition. PostgreSQL uses
@@ -3793,9 +3917,9 @@ pub struct CreateTable {
     /// than empty (represented as ()), the latter meaning "no sorting".
     /// <https://clickhouse.com/docs/en/sql-reference/statements/create/table/>
     pub order_by: Option<OneOrManyWithParens<Expr>>,
-    /// BigQuery: A partition expression for the table.
-    /// <https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#partition_expression>
-    pub partition_by: Option<Box<Expr>>,
+    /// PostgreSQL strategy/key/opclass definition, or an expression-based
+    /// partition clause for dialects such as BigQuery and ClickHouse.
+    pub partition_by: Option<crate::ast::TablePartitionBy>,
     /// MySQL's complete typed partition declaration, independent of portable PARTITION BY.
     pub mysql_partitioning: Option<MySqlPartitionBy>,
     /// BigQuery: Table clustering column list.
@@ -4160,7 +4284,7 @@ impl fmt::Display for CreateTable {
         //   `CREATE TABLE t (a INT) AS SELECT a from t2`
         write!(
             f,
-            "CREATE {or_replace}{external}{global}{temporary}{transient}{volatile}{dynamic}{iceberg}{snapshot}TABLE {if_not_exists}{name}",
+            "CREATE {or_replace}{external}{global}{temporary}{unlogged}{transient}{volatile}{dynamic}{iceberg}{snapshot}TABLE {if_not_exists}{name}",
             or_replace = if self.or_replace { "OR REPLACE " } else { "" },
             external = if self.external { "EXTERNAL " } else { "" },
             snapshot = if self.snapshot { "SNAPSHOT " } else { "" },
@@ -4174,6 +4298,7 @@ impl fmt::Display for CreateTable {
                 ""
             },
             temporary = if self.temporary { "TEMPORARY " } else { "" },
+            unlogged = if self.unlogged { "UNLOGGED " } else { "" },
             transient = if self.transient { "TRANSIENT " } else { "" },
             volatile = if self.volatile { "VOLATILE " } else { "" },
             // Only for Snowflake
@@ -4181,13 +4306,18 @@ impl fmt::Display for CreateTable {
             dynamic = if self.dynamic { "DYNAMIC " } else { "" },
             name = self.name,
         )?;
+        if let Some(of_type) = &self.of_type {
+            write!(f, " OF {of_type}")?;
+        }
         if let Some(partition_of) = &self.partition_of {
             write!(f, " PARTITION OF {partition_of}")?;
         }
         if let Some(on_cluster) = &self.on_cluster {
             write!(f, " ON CLUSTER {on_cluster}")?;
         }
-        if !self.elements.is_empty() {
+        if !self.query_columns.is_empty() {
+            write!(f, " ({})", display_comma_separated(&self.query_columns))?;
+        } else if !self.elements.is_empty() {
             f.write_str(" (")?;
             NewLine.fmt(f)?;
             for (index, element) in self.elements.iter().enumerate() {
@@ -4211,6 +4341,7 @@ impl fmt::Display for CreateTable {
             && self.like.is_none()
             && self.clone.is_none()
             && self.partition_of.is_none()
+            && self.of_type.is_none()
         {
             // PostgreSQL allows `CREATE TABLE t ();`, but requires empty parens
             f.write_str(" ()")?;
@@ -4487,6 +4618,13 @@ impl fmt::Display for CreateTable {
                 write!(f, " {partitioning}")?;
             }
             write!(f, " AS {query}")?;
+            if let Some(with_data) = self.with_data {
+                f.write_str(if with_data {
+                    " WITH DATA"
+                } else {
+                    " WITH NO DATA"
+                })?;
+            }
         } else if let Some(partitioning) = &self.mysql_partitioning {
             write!(f, " {partitioning}")?;
         }
@@ -4504,32 +4642,44 @@ impl fmt::Display for CreateTable {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum ForValues {
     /// `FOR VALUES IN (expr, ...)`
-    In(Vec<Expr>),
-    /// `FOR VALUES FROM (expr|MINVALUE|MAXVALUE, ...) TO (expr|MINVALUE|MAXVALUE, ...)`
+    In {
+        /// The list partition values.
+        values: Vec<Expr>,
+        /// Actual IN token: native PartitionBoundSpec.location uses @3.
+        token: AttachedToken,
+    },
+    /// `FOR VALUES FROM (...) TO (...)`
     From {
-        /// The lower bound values for the partition.
+        /// The lower partition bounds.
         from: Vec<PartitionBoundValue>,
-        /// The upper bound values for the partition.
+        /// The upper partition bounds.
         to: Vec<PartitionBoundValue>,
+        /// Actual FROM token: native PartitionBoundSpec.location uses @3.
+        token: AttachedToken,
     },
     /// `FOR VALUES WITH (MODULUS n, REMAINDER r)`
     With {
-        /// The modulus value for hash partitioning.
+        /// Hash partition modulus.
         modulus: u64,
-        /// The remainder value for hash partitioning.
+        /// Hash partition remainder.
         remainder: u64,
+        /// Actual WITH token: native PartitionBoundSpec.location uses @3.
+        token: AttachedToken,
     },
     /// `DEFAULT`
-    Default,
+    Default {
+        /// Actual DEFAULT token, native location @1.
+        token: AttachedToken,
+    },
 }
 
 impl fmt::Display for ForValues {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ForValues::In(values) => {
+            ForValues::In { values, .. } => {
                 write!(f, "FOR VALUES IN ({})", display_comma_separated(values))
             }
-            ForValues::From { from, to } => {
+            ForValues::From { from, to, .. } => {
                 write!(
                     f,
                     "FOR VALUES FROM ({}) TO ({})",
@@ -4537,13 +4687,15 @@ impl fmt::Display for ForValues {
                     display_comma_separated(to)
                 )
             }
-            ForValues::With { modulus, remainder } => {
+            ForValues::With {
+                modulus, remainder, ..
+            } => {
                 write!(
                     f,
                     "FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})"
                 )
             }
-            ForValues::Default => write!(f, "DEFAULT"),
+            ForValues::Default { .. } => write!(f, "DEFAULT"),
         }
     }
 }
@@ -4559,17 +4711,17 @@ pub enum PartitionBoundValue {
     /// An expression representing a partition bound value.
     Expr(Expr),
     /// Represents negative infinity in partition bounds.
-    MinValue,
+    MinValue(AttachedToken),
     /// Represents positive infinity in partition bounds.
-    MaxValue,
+    MaxValue(AttachedToken),
 }
 
 impl fmt::Display for PartitionBoundValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             PartitionBoundValue::Expr(expr) => write!(f, "{expr}"),
-            PartitionBoundValue::MinValue => write!(f, "MINVALUE"),
-            PartitionBoundValue::MaxValue => write!(f, "MAXVALUE"),
+            PartitionBoundValue::MinValue(_) => write!(f, "MINVALUE"),
+            PartitionBoundValue::MaxValue(_) => write!(f, "MAXVALUE"),
         }
     }
 }
@@ -4627,7 +4779,7 @@ pub struct CreateDomain {
     /// The default value of the domain.
     pub default: Option<Expr>,
     /// The constraints of the domain.
-    pub constraints: Vec<TableConstraint>,
+    pub constraints: Vec<ColumnOptionDef>,
 }
 
 impl fmt::Display for CreateDomain {
@@ -4683,6 +4835,9 @@ impl fmt::Display for FunctionReturnType {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// CREATE FUNCTION statement
 pub struct CreateFunction {
+    /// Transient PostgreSQL parser source. Consumed by definition analysis;
+    /// not an execution capability and never rendered as SQL.
+    pub parsed_source: RoutineSourceProvenance,
     /// MySQL saved-body source/header facts; never an evaluated function body.
     pub mysql_body: Option<MySqlProgramBody>,
     /// True if this is a `CREATE OR ALTER FUNCTION` statement
@@ -5549,6 +5704,8 @@ pub struct CreateView {
     pub or_replace: bool,
     /// if true, has MATERIALIZED view modifier
     pub materialized: bool,
+    /// PostgreSQL recursive view, lowered to a recursive CTE during analysis.
+    pub recursive: bool,
     /// Snowflake: SECURE view modifier
     /// <https://docs.snowflake.com/en/sql-reference/sql/create-view#syntax>
     pub secure: bool,
@@ -5590,7 +5747,7 @@ pub struct CreateView {
     pub to: Option<ObjectName>,
     /// MySQL: Optional parameters for the view algorithm, definer, and security context
     pub params: Option<CreateViewParams>,
-    /// MySQL view row-validation policy.
+    /// View row-validation policy (PostgreSQL and MySQL).
     pub check_option: Option<ViewCheckOption>,
 }
 
@@ -5607,7 +5764,7 @@ impl fmt::Display for CreateView {
         }
         write!(
             f,
-            "{secure}{materialized}{temporary}VIEW {if_not_and_name}{to}",
+            "{secure}{materialized}{temporary}{recursive}VIEW {if_not_and_name}{to}",
             if_not_and_name = if self.if_not_exists {
                 if self.name_before_not_exists {
                     format!("{} IF NOT EXISTS", self.name)
@@ -5617,6 +5774,7 @@ impl fmt::Display for CreateView {
             } else {
                 format!("{}", self.name)
             },
+            recursive = if self.recursive { "RECURSIVE " } else { "" },
             secure = if self.secure { "SECURE " } else { "" },
             materialized = if self.materialized {
                 "MATERIALIZED "
@@ -6003,6 +6161,8 @@ impl fmt::Display for AlterTable {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct DropFunction {
+    /// ROUTINE includes both functions and procedures.
+    pub is_routine: bool,
     /// Whether to include the `IF EXISTS` clause.
     pub if_exists: bool,
     /// One or more functions to drop
@@ -6015,7 +6175,12 @@ impl fmt::Display for DropFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "DROP FUNCTION{} {}",
+            "DROP {}{} {}",
+            if self.is_routine {
+                "ROUTINE"
+            } else {
+                "FUNCTION"
+            },
             if self.if_exists { " IF EXISTS" } else { "" },
             display_comma_separated(&self.func_desc),
         )?;
@@ -6040,14 +6205,19 @@ impl Spanned for DropFunction {
 pub struct CreateOperator {
     /// Operator name (can be schema-qualified)
     pub name: ObjectName,
-    /// FUNCTION or PROCEDURE parameter (function name)
-    pub function: ObjectName,
+    /// FUNCTION or PROCEDURE parameter (function name). PostgreSQL validates
+    /// its presence during execution, so the parser preserves an omitted value.
+    pub function: Option<ObjectName>,
     /// Whether PROCEDURE keyword was used (vs FUNCTION)
     pub is_procedure: bool,
     /// LEFTARG parameter (left operand type)
     pub left_arg: Option<DataType>,
+    /// SETOF is a syntactic modifier PostgreSQL rejects during definition.
+    pub left_arg_setof: bool,
     /// RIGHTARG parameter (right operand type)
     pub right_arg: Option<DataType>,
+    /// SETOF modifier on the right operand type.
+    pub right_arg_setof: bool,
     /// Operator options (COMMUTATOR, NEGATOR, RESTRICT, JOIN, HASHES, MERGES)
     pub options: Vec<OperatorOption>,
 }
@@ -6093,13 +6263,24 @@ impl fmt::Display for CreateOperator {
         } else {
             "FUNCTION"
         };
-        let mut params = vec![format!("{} = {}", function_keyword, self.function)];
+        let mut params = Vec::new();
+        if let Some(function) = &self.function {
+            params.push(format!("{} = {}", function_keyword, function));
+        }
 
         if let Some(left_arg) = &self.left_arg {
-            params.push(format!("LEFTARG = {}", left_arg));
+            params.push(format!(
+                "LEFTARG = {}{}",
+                if self.left_arg_setof { "SETOF " } else { "" },
+                left_arg
+            ));
         }
         if let Some(right_arg) = &self.right_arg {
-            params.push(format!("RIGHTARG = {}", right_arg));
+            params.push(format!(
+                "RIGHTARG = {}{}",
+                if self.right_arg_setof { "SETOF " } else { "" },
+                right_arg
+            ));
         }
 
         for option in &self.options {
@@ -6673,6 +6854,8 @@ pub struct AlterFunction {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterFunctionKind {
+    /// `ROUTINE`, resolved to the actual catalog kind.
+    Routine,
     /// `FUNCTION`
     Function,
     /// `PROCEDURE`
@@ -6684,6 +6867,7 @@ pub enum AlterFunctionKind {
 impl fmt::Display for AlterFunctionKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::Routine => write!(f, "ROUTINE"),
             Self::Function => write!(f, "FUNCTION"),
             Self::Procedure => write!(f, "PROCEDURE"),
             Self::Aggregate => write!(f, "AGGREGATE"),
@@ -6761,7 +6945,9 @@ impl fmt::Display for AlterFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ALTER {} ", self.kind)?;
         match self.kind {
-            AlterFunctionKind::Function | AlterFunctionKind::Procedure => {
+            AlterFunctionKind::Function
+            | AlterFunctionKind::Procedure
+            | AlterFunctionKind::Routine => {
                 write!(f, "{} ", self.function)?;
             }
             AlterFunctionKind::Aggregate => {
@@ -7047,4 +7233,118 @@ impl From<AlterPolicy> for crate::ast::Statement {
     fn from(v: AlterPolicy) -> Self {
         crate::ast::Statement::AlterPolicy(v)
     }
+}
+
+/// PostgreSQL view options live on the same view relation.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterViewOptions {
+    /// Set or replace named relation options.
+    Set(Vec<SqlOption>),
+    /// Restore the defaults of named relation options.
+    Reset(Vec<Ident>),
+}
+impl fmt::Display for AlterViewOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Set(options) => write!(f, "SET ({})", display_comma_separated(options)),
+            Self::Reset(names) => write!(f, "RESET ({})", display_comma_separated(names)),
+        }
+    }
+}
+
+/// Data-only receipt from actual lexical rewrite emission. Original SQL is a
+/// reversible parser view of database bytes; offsets refer to those bytes.
+/// The application consumes this receipt once, rather than parsing it again.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ParsedRoutineSource {
+    /// Original SQL as a reversible parser view of database-encoded bytes.
+    pub original_sql: String,
+    /// PostgreSQL database encoding identifier used to interpret the source bytes.
+    pub database_encoding_id: i32,
+    /// Database-byte offset of this source fragment within the original command input.
+    pub native_source_offset: i32,
+    /// Original database-byte position for each parser character boundary; generated boundaries use `-1`.
+    pub database_locations: Vec<i32>,
+    /// UTF-8 byte positions of parser character boundaries, including the final boundary.
+    pub character_bytes: Vec<u32>,
+    /// Parser character index at the start of each line, beginning with zero.
+    pub line_starts: Vec<u32>,
+    /// Tokens consumed by the parser, with their original database-byte positions.
+    pub tokens: Vec<ParsedSourceToken>,
+}
+
+/// Parser-only origin is not part of a statement's SQL semantic equality.
+/// It cannot confer catalog or execution capabilities.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct RoutineSourceProvenance {
+    /// Source receipt from actual parsing, or `None` when no origin was supplied.
+    pub receipt: Option<ParsedRoutineSource>,
+    /// SQL-standard routine body extent in parser coordinates, or an empty span when absent.
+    pub body_span: Span,
+}
+impl PartialEq for RoutineSourceProvenance {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for RoutineSourceProvenance {}
+impl PartialOrd for RoutineSourceProvenance {
+    fn partial_cmp(&self, _: &Self) -> Option<core::cmp::Ordering> {
+        Some(core::cmp::Ordering::Equal)
+    }
+}
+impl Ord for RoutineSourceProvenance {
+    fn cmp(&self, _: &Self) -> core::cmp::Ordering {
+        core::cmp::Ordering::Equal
+    }
+}
+impl core::hash::Hash for RoutineSourceProvenance {
+    fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
+}
+
+impl Default for RoutineSourceProvenance {
+    fn default() -> Self {
+        Self {
+            receipt: None,
+            body_span: Span::empty(),
+        }
+    }
+}
+
+/// Tokens from the parser invocation that produced this AST. Literal payloads
+/// stay in that AST; the receipt retains their kind and location only.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum ParsedSourceTokenKind {
+    /// Unquoted identifier or keyword.
+    Word,
+    /// Quoted identifier.
+    QuotedWord,
+    /// Literal token; its value remains in the expression AST.
+    Literal,
+    /// Operator or punctuation token.
+    Symbol,
+}
+/// One consumed token and its parser-to-original-source position receipt.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ParsedSourceToken {
+    /// Lexical category of the consumed token.
+    pub kind: ParsedSourceTokenKind,
+    /// Token spelling retained for keyword and operator identification.
+    pub spelling: String,
+    /// Token extent in the coordinate system of the parser input.
+    pub parser_span: Span,
+    /// Inclusive original database-byte position, or `-1` for a generated token.
+    pub start: i32,
+    /// Exclusive original database-byte position, or `-1` for a generated token.
+    pub end: i32,
 }

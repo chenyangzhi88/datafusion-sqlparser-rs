@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::dialect::{Dialect, MySqlDialect};
 use crate::keywords::Keyword;
-use crate::mysql_keywords::{MYSQL_8_0_46_KEYWORDS, mysql_8_0_46_keyword};
+use crate::mysql_keywords::{mysql_8_0_46_keyword, MYSQL_8_0_46_KEYWORDS};
 
 #[test]
 fn mysql_window_parent_identifiers_use_the_real_nonreserved_domain() {
@@ -198,11 +198,9 @@ fn create_table_plain_comments_have_one_canonical_last_wins_value_and_roundtrip(
             panic!("options")
         };
         assert_eq!(options.len(), 1);
-        assert!(
-            options
-                .iter()
-                .all(|option| !matches!(option, SqlOption::Comment(_)))
-        );
+        assert!(options
+            .iter()
+            .all(|option| !matches!(option, SqlOption::Comment(_))));
         assert!(table.validate_source_order().is_ok());
         let rendered = table.to_string();
         assert_eq!(rendered.matches("COMMENT").count(), 1);
@@ -568,13 +566,11 @@ fn character_attributes_remain_real_column_options_not_fixed_collations() {
                 .any(|option| matches!(option.option, ColumnOption::Collation(_)))
         }));
     }
-    assert!(
-        Parser::parse_sql(
-            &crate::dialect::PostgreSqlDialect {},
-            "CREATE TABLE t(a CHAR(2) ASCII)"
-        )
-        .is_err()
-    );
+    assert!(Parser::parse_sql(
+        &crate::dialect::PostgreSqlDialect {},
+        "CREATE TABLE t(a CHAR(2) ASCII)"
+    )
+    .is_err());
 }
 
 #[test]
@@ -618,11 +614,9 @@ fn character_attribute_words_preserve_case_order_and_existing_type_syntax() {
             );
         }
         assert_eq!(table.columns[4].data_type, DataType::Binary(Some(2)));
-        assert!(
-            table.columns[4..]
-                .iter()
-                .all(|column| column.options.is_empty())
-        );
+        assert!(table.columns[4..]
+            .iter()
+            .all(|column| column.options.is_empty()));
         assert!(matches!(table.columns[6].data_type, DataType::Enum(..)));
         assert!(matches!(table.columns[7].data_type, DataType::Set(..)));
     }
@@ -741,11 +735,9 @@ fn character_attribute_tokens_keep_the_shared_keyword_boundary() {
 #[test]
 fn mysql_8_0_46_keyword_registry_is_complete_sorted_and_unique() {
     assert_eq!(MYSQL_8_0_46_KEYWORDS.len(), 751);
-    assert!(
-        MYSQL_8_0_46_KEYWORDS
-            .windows(2)
-            .all(|pair| pair[0].word < pair[1].word)
-    );
+    assert!(MYSQL_8_0_46_KEYWORDS
+        .windows(2)
+        .all(|pair| pair[0].word < pair[1].word));
     let unique = MYSQL_8_0_46_KEYWORDS
         .iter()
         .map(|keyword| keyword.word)

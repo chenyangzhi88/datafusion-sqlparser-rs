@@ -606,7 +606,9 @@ fn parse_create_table_like_with_defaults() {
                 stmt.like,
                 Some(CreateTableLikeKind::Parenthesized(CreateTableLike {
                     name: ObjectName::from(vec![Ident::new("old".to_string())]),
-                    defaults: Some(CreateTableLikeDefaults::Including),
+                    options: vec![CreateTableLikeOption::Including(
+                        CreateTableLikeOptionKind::Defaults
+                    )],
                 }))
             )
         }
@@ -624,7 +626,9 @@ fn parse_create_table_like_with_defaults() {
                 stmt.like,
                 Some(CreateTableLikeKind::Parenthesized(CreateTableLike {
                     name: ObjectName::from(vec![Ident::new("old".to_string())]),
-                    defaults: Some(CreateTableLikeDefaults::Excluding),
+                    options: vec![CreateTableLikeOption::Excluding(
+                        CreateTableLikeOptionKind::Defaults
+                    )],
                 }))
             )
         }
@@ -952,6 +956,7 @@ fn parse_drop_and_comment_collation_ast() {
     assert_eq!(
         pg_and_generic().verified_stmt("DROP COLLATION test0"),
         Statement::Drop {
+            concurrently: false,
             object_type: ObjectType::Collation,
             if_exists: false,
             names: vec![ObjectName::from(vec![Ident::new("test0")])],
@@ -966,6 +971,7 @@ fn parse_drop_and_comment_collation_ast() {
     assert_eq!(
         pg_and_generic().verified_stmt("DROP COLLATION IF EXISTS test0"),
         Statement::Drop {
+            concurrently: false,
             object_type: ObjectType::Collation,
             if_exists: true,
             names: vec![ObjectName::from(vec![Ident::new("test0")])],
@@ -980,6 +986,7 @@ fn parse_drop_and_comment_collation_ast() {
     assert_eq!(
         pg_and_generic().verified_stmt("COMMENT ON COLLATION test0 IS 'US English'"),
         Statement::Comment {
+            routine_arguments: None,
             object_type: CommentObject::Collation,
             object_name: ObjectName::from(vec![Ident::new("test0")]),
             comment: Some("US English".to_string()),
@@ -1031,6 +1038,7 @@ fn parse_alter_table_alter_column() {
             assert_eq!(
                 op,
                 AlterColumnOperation::SetDataType {
+                    collation: None,
                     data_type: DataType::Text,
                     using: Some(using_expr),
                     had_set: true,
@@ -1294,6 +1302,7 @@ fn parse_copy_from_stdin_without_semicolon() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["bitwise_test".into()]),
                 columns: vec![],
@@ -1350,6 +1359,7 @@ fn test_copy_from() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1368,6 +1378,7 @@ fn test_copy_from() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1386,6 +1397,7 @@ fn test_copy_from() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1410,6 +1422,7 @@ fn test_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1428,6 +1441,7 @@ fn test_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1446,6 +1460,7 @@ fn test_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1487,6 +1502,7 @@ fn parse_copy_from() {
     assert_eq!(
         pg_and_generic().one_statement_parses_to(sql, ""),
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["table".into()]),
                 columns: vec!["a".into(), "b".into()],
@@ -1533,6 +1549,7 @@ fn parse_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1551,6 +1568,7 @@ fn parse_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["country".into()]),
                 columns: vec![],
@@ -1568,6 +1586,7 @@ fn parse_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["country".into()]),
                 columns: vec![],
@@ -1586,6 +1605,7 @@ fn parse_copy_to() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Query(Box::new(Query {
                 with: None,
                 body: Box::new(SetExpr::Select(Box::new(Select {
@@ -1659,6 +1679,7 @@ fn parse_copy_from_before_v9_0() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1688,6 +1709,7 @@ fn parse_copy_from_before_v9_0() {
     assert_eq!(
         pg_and_generic().one_statement_parses_to(sql, ""),
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -1716,6 +1738,7 @@ fn parse_copy_to_before_v9_0() {
     assert_eq!(
         stmt,
         Statement::Copy {
+            where_clause: None,
             source: CopySource::Table {
                 table_name: ObjectName::from(vec!["users".into()]),
                 columns: vec![],
@@ -2121,12 +2144,27 @@ fn parse_pg_on_conflict() {
         Statement::Insert(Insert {
             on:
                 Some(OnInsert::OnConflict(OnConflict {
-                    conflict_target: Some(ConflictTarget::Columns(cols)),
+                    conflict_target:
+                        Some(ConflictTarget::Inference {
+                            elements: cols,
+                            predicate,
+                        }),
                     action,
                 })),
             ..
         }) => {
-            assert_eq!(vec![Ident::from("did")], cols);
+            assert_eq!(predicate, None);
+            assert!(cols.iter().all(|element| element.operator_class.is_none()
+                && element.column.options == OrderByOptions::default()));
+            assert_eq!(
+                vec![Ident::from("did")]
+                    .into_iter()
+                    .map(Expr::Identifier)
+                    .collect::<Vec<_>>(),
+                cols.into_iter()
+                    .map(|element| element.column.expr)
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 OnConflictAction::DoUpdate(DoUpdate {
                     assignments: vec![Assignment {
@@ -2153,12 +2191,27 @@ fn parse_pg_on_conflict() {
         Statement::Insert(Insert {
             on:
                 Some(OnInsert::OnConflict(OnConflict {
-                    conflict_target: Some(ConflictTarget::Columns(cols)),
+                    conflict_target:
+                        Some(ConflictTarget::Inference {
+                            elements: cols,
+                            predicate,
+                        }),
                     action,
                 })),
             ..
         }) => {
-            assert_eq!(vec![Ident::from("did"), Ident::from("area"),], cols);
+            assert_eq!(predicate, None);
+            assert!(cols.iter().all(|element| element.operator_class.is_none()
+                && element.column.options == OrderByOptions::default()));
+            assert_eq!(
+                vec![Ident::from("did"), Ident::from("area"),]
+                    .into_iter()
+                    .map(Expr::Identifier)
+                    .collect::<Vec<_>>(),
+                cols.into_iter()
+                    .map(|element| element.column.expr)
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 OnConflictAction::DoUpdate(DoUpdate {
                     assignments: vec![
@@ -2215,12 +2268,27 @@ fn parse_pg_on_conflict() {
         Statement::Insert(Insert {
             on:
                 Some(OnInsert::OnConflict(OnConflict {
-                    conflict_target: Some(ConflictTarget::Columns(cols)),
+                    conflict_target:
+                        Some(ConflictTarget::Inference {
+                            elements: cols,
+                            predicate,
+                        }),
                     action,
                 })),
             ..
         }) => {
-            assert_eq!(vec![Ident::from("did")], cols);
+            assert_eq!(predicate, None);
+            assert!(cols.iter().all(|element| element.operator_class.is_none()
+                && element.column.options == OrderByOptions::default()));
+            assert_eq!(
+                vec![Ident::from("did")]
+                    .into_iter()
+                    .map(Expr::Identifier)
+                    .collect::<Vec<_>>(),
+                cols.into_iter()
+                    .map(|element| element.column.expr)
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 OnConflictAction::DoUpdate(DoUpdate {
                     assignments: vec![Assignment {
@@ -2464,7 +2532,7 @@ fn parse_pg_unary_ops() {
         let select = pg().verified_only_select(&format!("SELECT {}a", &str_op));
         assert_eq!(
             SelectItem::UnnamedExpr(Expr::UnaryOp {
-                op: *op,
+                op: op.clone(),
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
             }),
             select.projection[0]
@@ -2480,7 +2548,7 @@ fn parse_pg_postfix_factorial() {
         let select = pg().verified_only_select(&format!("SELECT a{}", &str_op));
         assert_eq!(
             SelectItem::UnnamedExpr(Expr::UnaryOp {
-                op: *op,
+                op: op.clone(),
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
             }),
             select.projection[0]
@@ -2519,6 +2587,8 @@ fn parse_pg_regex_match_ops() {
                 left: Box::new(Expr::Value(single_quoted_string("abc").with_empty_span(),)),
                 compare_op: op.clone(),
                 right: Box::new(Expr::Array(Array {
+                    opening_token: AttachedToken::empty(),
+                    closing_token: AttachedToken::empty(),
                     elem: vec![
                         Expr::Value(single_quoted_string("^a").with_empty_span()),
                         Expr::Value(single_quoted_string("x").with_empty_span()),
@@ -2563,6 +2633,8 @@ fn parse_pg_like_match_ops() {
                 left: Box::new(Expr::Value(single_quoted_string("abc").with_empty_span(),)),
                 compare_op: op.clone(),
                 right: Box::new(Expr::Array(Array {
+                    opening_token: AttachedToken::empty(),
+                    closing_token: AttachedToken::empty(),
                     elem: vec![Expr::Value(single_quoted_string("a_c%").with_empty_span())],
                     named: true,
                 })),
@@ -2642,7 +2714,11 @@ fn parse_array_index_expr() {
             root: Box::new(Expr::Nested(Box::new(Expr::Cast {
                 kind: CastKind::Cast,
                 expr: Box::new(Expr::Array(Array {
+                    opening_token: AttachedToken::empty(),
+                    closing_token: AttachedToken::empty(),
                     elem: vec![Expr::Array(Array {
+                        opening_token: AttachedToken::empty(),
+                        closing_token: AttachedToken::empty(),
                         elem: vec![num[2].clone(), num[3].clone(),],
                         named: true,
                     })],
@@ -2674,6 +2750,8 @@ fn parse_array_index_expr() {
     let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::Array(sqlparser::ast::Array {
+            opening_token: AttachedToken::empty(),
+            closing_token: AttachedToken::empty(),
             elem: vec![],
             named: true
         }),
@@ -2800,6 +2878,7 @@ fn parse_create_index() {
     let sql = "CREATE INDEX IF NOT EXISTS my_index ON my_table(col1, col2)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -2835,6 +2914,7 @@ fn parse_create_anonymous_index() {
     let sql = "CREATE INDEX ON my_table(col1, col2)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name,
             table_name: ObjectName(table_name),
             using,
@@ -2910,6 +2990,10 @@ fn parse_create_indices_with_operator_classes() {
             let expected_function_column = IndexColumn {
                 column: OrderByExpr {
                     expr: Expr::Function(Function {
+                        mysql_literal_source: None,
+                        origin: FunctionOrigin::Source,
+                        from_first_last: None,
+
                         name: ObjectName(vec![ObjectNamePart::Identifier(Ident {
                             value: "concat_users_name".to_owned(),
                             quote_style: None,
@@ -2953,6 +3037,7 @@ fn parse_create_indices_with_operator_classes() {
 
             match pg().verified_stmt(&single_column_sql_statement) {
                 Statement::CreateIndex(CreateIndex {
+                    kind: CreateIndexKind::Ordinary,
                     name: Some(ObjectName(name)),
                     table_name: ObjectName(table_name),
                     using: Some(using),
@@ -2981,6 +3066,7 @@ fn parse_create_indices_with_operator_classes() {
 
             match pg().verified_stmt(&multi_column_sql_statement) {
                 Statement::CreateIndex(CreateIndex {
+                    kind: CreateIndexKind::Ordinary,
                     name: Some(ObjectName(name)),
                     table_name: ObjectName(table_name),
                     using: Some(using),
@@ -3033,7 +3119,11 @@ fn parse_create_index_with_schema_qualified_operator_class() {
     let sql = "CREATE INDEX my_index ON my_table USING HNSW (embedding public.vector_cosine_ops)";
 
     match pg().verified_stmt(sql) {
-        Statement::CreateIndex(CreateIndex { columns, .. }) => {
+        Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
+            columns,
+            ..
+        }) => {
             assert_eq!(1, columns.len());
             let idx_col = &columns[0];
 
@@ -3064,6 +3154,7 @@ fn parse_create_bloom() {
         "CREATE INDEX bloomidx ON tbloom USING BLOOM (i1, i2, i3) WITH (length = 80, col1 = 2, col2 = 2, col3 = 4)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using: Some(using),
@@ -3120,6 +3211,7 @@ fn parse_create_brin() {
     let sql = "CREATE INDEX brin_sensor_data_recorded_at ON sensor_data USING BRIN (recorded_at)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using: Some(using),
@@ -3187,6 +3279,7 @@ fn parse_create_index_concurrently() {
     let sql = "CREATE INDEX CONCURRENTLY IF NOT EXISTS my_index ON my_table(col1, col2)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -3222,6 +3315,7 @@ fn parse_create_index_with_predicate() {
     let sql = "CREATE INDEX IF NOT EXISTS my_index ON my_table(col1, col2) WHERE col3 IS NULL";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -3257,6 +3351,7 @@ fn parse_create_index_with_include() {
     let sql = "CREATE INDEX IF NOT EXISTS my_index ON my_table(col1, col2) INCLUDE (col3, col4)";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -3292,6 +3387,7 @@ fn parse_create_index_with_nulls_distinct() {
     let sql = "CREATE INDEX IF NOT EXISTS my_index ON my_table(col1, col2) NULLS NOT DISTINCT";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -3325,6 +3421,7 @@ fn parse_create_index_with_nulls_distinct() {
     let sql = "CREATE INDEX IF NOT EXISTS my_index ON my_table(col1, col2) NULLS DISTINCT";
     match pg().verified_stmt(sql) {
         Statement::CreateIndex(CreateIndex {
+            kind: CreateIndexKind::Ordinary,
             name: Some(ObjectName(name)),
             table_name: ObjectName(table_name),
             using,
@@ -3362,6 +3459,10 @@ fn parse_array_subquery_expr() {
     let select = pg().verified_only_select(sql);
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("ARRAY")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -3617,6 +3718,8 @@ fn test_json() {
             left: Box::new(Expr::Identifier(Ident::from("info"))),
             op: BinaryOperator::HashMinus,
             right: Box::new(Expr::Array(Array {
+                opening_token: AttachedToken::empty(),
+                closing_token: AttachedToken::empty(),
                 elem: vec![
                     Expr::Value((Value::SingleQuotedString("a".to_string())).with_empty_span()),
                     Expr::Value((Value::SingleQuotedString("b".to_string())).with_empty_span()),
@@ -3673,6 +3776,8 @@ fn test_json() {
             left: Box::new(Expr::Identifier(Ident::new("info"))),
             op: BinaryOperator::QuestionAnd,
             right: Box::new(Expr::Array(Array {
+                opening_token: AttachedToken::empty(),
+                closing_token: AttachedToken::empty(),
                 elem: vec![
                     Expr::Value((Value::SingleQuotedString("b".to_string())).with_empty_span()),
                     Expr::Value((Value::SingleQuotedString("c".to_string())).with_empty_span())
@@ -3690,6 +3795,8 @@ fn test_json() {
             left: Box::new(Expr::Identifier(Ident::new("info"))),
             op: BinaryOperator::QuestionPipe,
             right: Box::new(Expr::Array(Array {
+                opening_token: AttachedToken::empty(),
+                closing_token: AttachedToken::empty(),
                 elem: vec![
                     Expr::Value((Value::SingleQuotedString("b".to_string())).with_empty_span()),
                     Expr::Value((Value::SingleQuotedString("c".to_string())).with_empty_span())
@@ -3856,6 +3963,10 @@ fn test_composite_value() {
     assert_eq!(
         &Expr::CompoundFieldAccess {
             root: Box::new(Expr::Nested(Box::new(Expr::Function(Function {
+                mysql_literal_source: None,
+                origin: FunctionOrigin::Source,
+                from_first_last: None,
+
                 name: ObjectName::from(vec![
                     Ident::new("information_schema"),
                     Ident::new("_pg_expandarray")
@@ -3866,6 +3977,8 @@ fn test_composite_value() {
                     duplicate_treatment: None,
                     args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Array(
                         Array {
+                            opening_token: AttachedToken::empty(),
+                            closing_token: AttachedToken::empty(),
                             elem: vec![
                                 Expr::Value(
                                     (Value::SingleQuotedString("i".to_string())).with_empty_span()
@@ -4061,6 +4174,10 @@ fn parse_current_functions() {
     let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("CURRENT_CATALOG")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -4074,6 +4191,10 @@ fn parse_current_functions() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("CURRENT_USER")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -4087,6 +4208,10 @@ fn parse_current_functions() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("SESSION_USER")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -4100,6 +4225,10 @@ fn parse_current_functions() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("USER")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -4548,6 +4677,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -4611,6 +4744,7 @@ $$"#;
     assert_eq!(
         pg_and_generic().verified_stmt(sql1),
         Statement::CreateFunction(CreateFunction {
+parsed_source: RoutineSourceProvenance::default(), mysql_body: None,
             or_alter: false,
             or_replace: true,
             temporary: false,
@@ -4658,6 +4792,7 @@ $$"#;
     assert_eq!(
         pg_and_generic().verified_stmt(sql2),
         Statement::CreateFunction(CreateFunction {
+parsed_source: RoutineSourceProvenance::default(), mysql_body: None,
             or_alter: false,
             or_replace: true,
             temporary: false,
@@ -4701,6 +4836,7 @@ $$"#;
     assert_eq!(
         pg_and_generic().verified_stmt(sql3),
         Statement::CreateFunction(CreateFunction {
+parsed_source: RoutineSourceProvenance::default(), mysql_body: None,
             or_alter: false,
             or_replace: true,
             temporary: false,
@@ -4748,6 +4884,7 @@ $$"#;
     assert_eq!(
         pg_and_generic().verified_stmt(sql4),
         Statement::CreateFunction(CreateFunction {
+parsed_source: RoutineSourceProvenance::default(), mysql_body: None,
             or_alter: false,
             or_replace: true,
             temporary: false,
@@ -4791,6 +4928,8 @@ $$"#;
     assert_eq!(
         pg_and_generic().verified_stmt(sql5),
         Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
             or_alter: false,
             or_replace: true,
             temporary: false,
@@ -4837,6 +4976,8 @@ fn parse_create_function() {
     assert_eq!(
         pg_and_generic().verified_stmt(sql),
         Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
             or_alter: false,
             or_replace: false,
             temporary: false,
@@ -4973,6 +5114,8 @@ fn parse_create_function_c_with_module_pathname() {
     assert_eq!(
         pg_and_generic().verified_stmt(sql),
         Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
             or_alter: false,
             or_replace: false,
             temporary: false,
@@ -5021,6 +5164,7 @@ fn parse_drop_function() {
     assert_eq!(
         pg().verified_stmt(sql),
         Statement::DropFunction(DropFunction {
+            is_routine: false,
             if_exists: true,
             func_desc: vec![FunctionDesc {
                 name: ObjectName::from(vec![Ident {
@@ -5038,6 +5182,7 @@ fn parse_drop_function() {
     assert_eq!(
         pg().verified_stmt(sql),
         Statement::DropFunction(DropFunction {
+            is_routine: false,
             if_exists: true,
             func_desc: vec![FunctionDesc {
                 name: ObjectName::from(vec![Ident {
@@ -5065,6 +5210,7 @@ fn parse_drop_function() {
     assert_eq!(
         pg().verified_stmt(sql),
         Statement::DropFunction(DropFunction {
+            is_routine: false,
             if_exists: true,
             func_desc: vec![
                 FunctionDesc {
@@ -5671,18 +5817,15 @@ fn parse_create_table_with_partition_by() {
                 ],
                 create_table.columns
             );
-            match *create_table.partition_by.unwrap() {
-                Expr::Function(f) => {
-                    assert_eq!("RANGE", f.name.to_string());
+            match create_table.partition_by.unwrap() {
+                TablePartitionBy::PostgreSql { strategy, keys } => {
+                    assert_eq!("RANGE", strategy.to_string());
                     assert_eq!(
-                        FunctionArguments::List(FunctionArgumentList {
-                            duplicate_treatment: None,
-                            clauses: vec![],
-                            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                                Expr::Identifier(Ident::new("a"))
-                            ))],
-                        }),
-                        f.args
+                        vec![PartitionKey {
+                            expression: Expr::Identifier(Ident::new("a")),
+                            operator_class: None
+                        }],
+                        keys
                     );
                 }
                 _ => unreachable!(),
@@ -5701,6 +5844,7 @@ fn parse_join_constraint_unnest_alias() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::UNNEST {
                 alias: table_alias(true, "f"),
                 array_exprs: vec![Expr::CompoundIdentifier(vec![
@@ -5738,6 +5882,9 @@ fn test_simple_postgres_insert_with_alias() {
     assert_eq!(
         statement,
         Statement::Insert(Insert {
+            postgres_insert_bindings: None,
+            overriding: None,
+
             insert_token: AttachedToken::empty(),
             optimizer_hints: vec![],
             or: None,
@@ -5757,12 +5904,12 @@ fn test_simple_postgres_insert_with_alias() {
                 }
             }),
             columns: vec![
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "id".to_string(),
                     quote_style: None,
                     span: Span::empty(),
                 }),
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "a".to_string(),
                     quote_style: None,
                     span: Span::empty(),
@@ -5818,6 +5965,9 @@ fn test_simple_postgres_insert_with_alias() {
     assert_eq!(
         statement,
         Statement::Insert(Insert {
+            postgres_insert_bindings: None,
+            overriding: None,
+
             insert_token: AttachedToken::empty(),
             optimizer_hints: vec![],
             or: None,
@@ -5837,12 +5987,12 @@ fn test_simple_postgres_insert_with_alias() {
                 }
             }),
             columns: vec![
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "id".to_string(),
                     quote_style: None,
                     span: Span::empty(),
                 }),
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "a".to_string(),
                     quote_style: None,
                     span: Span::empty(),
@@ -5900,6 +6050,9 @@ fn test_simple_insert_with_quoted_alias() {
     assert_eq!(
         statement,
         Statement::Insert(Insert {
+            postgres_insert_bindings: None,
+            overriding: None,
+
             insert_token: AttachedToken::empty(),
             optimizer_hints: vec![],
             or: None,
@@ -5919,12 +6072,12 @@ fn test_simple_insert_with_quoted_alias() {
                 }
             }),
             columns: vec![
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "id".to_string(),
                     quote_style: None,
                     span: Span::empty(),
                 }),
-                ObjectName::from(Ident {
+                Expr::Identifier(Ident {
                     value: "a".to_string(),
                     quote_style: None,
                     span: Span::empty(),
@@ -6200,16 +6353,19 @@ fn parse_create_domain() {
         data_type: DataType::Integer(None),
         collation: None,
         default: None,
-        constraints: vec![CheckConstraint {
+        constraints: vec![ColumnOptionDef {
             name: None,
-            expr: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(test_utils::number("0").into())),
+            option: ColumnOption::Check(CheckConstraint {
+                no_inherit: false,
+                name: None,
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(test_utils::number("0").into())),
+                }),
+                enforced: None,
             }),
-            enforced: None,
-        }
-        .into()],
+        }],
     });
 
     assert_eq!(pg().verified_stmt(sql1), expected);
@@ -6220,16 +6376,19 @@ fn parse_create_domain() {
         data_type: DataType::Integer(None),
         collation: Some(Ident::with_quote('"', "en_US")),
         default: None,
-        constraints: vec![CheckConstraint {
+        constraints: vec![ColumnOptionDef {
             name: None,
-            expr: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(test_utils::number("0").into())),
+            option: ColumnOption::Check(CheckConstraint {
+                no_inherit: false,
+                name: None,
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(test_utils::number("0").into())),
+                }),
+                enforced: None,
             }),
-            enforced: None,
-        }
-        .into()],
+        }],
     });
 
     assert_eq!(pg().verified_stmt(sql2), expected);
@@ -6240,16 +6399,19 @@ fn parse_create_domain() {
         data_type: DataType::Integer(None),
         collation: None,
         default: Some(Expr::Value(test_utils::number("1").into())),
-        constraints: vec![CheckConstraint {
+        constraints: vec![ColumnOptionDef {
             name: None,
-            expr: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(test_utils::number("0").into())),
+            option: ColumnOption::Check(CheckConstraint {
+                no_inherit: false,
+                name: None,
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(test_utils::number("0").into())),
+                }),
+                enforced: None,
             }),
-            enforced: None,
-        }
-        .into()],
+        }],
     });
 
     assert_eq!(pg().verified_stmt(sql3), expected);
@@ -6260,16 +6422,19 @@ fn parse_create_domain() {
         data_type: DataType::Integer(None),
         collation: Some(Ident::with_quote('"', "en_US")),
         default: Some(Expr::Value(test_utils::number("1").into())),
-        constraints: vec![CheckConstraint {
+        constraints: vec![ColumnOptionDef {
             name: None,
-            expr: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(test_utils::number("0").into())),
+            option: ColumnOption::Check(CheckConstraint {
+                no_inherit: false,
+                name: None,
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(test_utils::number("0").into())),
+                }),
+                enforced: None,
             }),
-            enforced: None,
-        }
-        .into()],
+        }],
     });
 
     assert_eq!(pg().verified_stmt(sql4), expected);
@@ -6280,16 +6445,19 @@ fn parse_create_domain() {
         data_type: DataType::Integer(None),
         collation: None,
         default: None,
-        constraints: vec![CheckConstraint {
+        constraints: vec![ColumnOptionDef {
             name: Some(Ident::new("my_constraint")),
-            expr: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(test_utils::number("0").into())),
+            option: ColumnOption::Check(CheckConstraint {
+                no_inherit: false,
+                name: None,
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("VALUE"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(test_utils::number("0").into())),
+                }),
+                enforced: None,
             }),
-            enforced: None,
-        }
-        .into()],
+        }],
     });
 
     assert_eq!(pg().verified_stmt(sql5), expected);
@@ -6299,6 +6467,7 @@ fn parse_create_domain() {
 fn parse_create_simple_before_insert_trigger() {
     let sql = "CREATE TRIGGER check_insert BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION check_account_insert";
     let expected = Statement::CreateTrigger(CreateTrigger {
+        mysql_body: None,
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -6313,6 +6482,7 @@ fn parse_create_simple_before_insert_trigger() {
         trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
         condition: None,
         exec_body: Some(TriggerExecBody {
+            arguments: vec![],
             exec_type: TriggerExecBodyType::Function,
             func_desc: FunctionDesc {
                 name: ObjectName::from(vec![Ident::new("check_account_insert")]),
@@ -6331,6 +6501,7 @@ fn parse_create_simple_before_insert_trigger() {
 fn parse_create_after_update_trigger_with_condition() {
     let sql = "CREATE TRIGGER check_update AFTER UPDATE ON accounts FOR EACH ROW WHEN (NEW.balance > 10000) EXECUTE FUNCTION check_account_update";
     let expected = Statement::CreateTrigger(CreateTrigger {
+        mysql_body: None,
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -6352,6 +6523,7 @@ fn parse_create_after_update_trigger_with_condition() {
             right: Box::new(Expr::value(number("10000"))),
         }))),
         exec_body: Some(TriggerExecBody {
+            arguments: vec![],
             exec_type: TriggerExecBodyType::Function,
             func_desc: FunctionDesc {
                 name: ObjectName::from(vec![Ident::new("check_account_update")]),
@@ -6370,6 +6542,7 @@ fn parse_create_after_update_trigger_with_condition() {
 fn parse_create_instead_of_delete_trigger() {
     let sql = "CREATE TRIGGER check_delete INSTEAD OF DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION check_account_deletes";
     let expected = Statement::CreateTrigger(CreateTrigger {
+        mysql_body: None,
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -6384,6 +6557,7 @@ fn parse_create_instead_of_delete_trigger() {
         trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
         condition: None,
         exec_body: Some(TriggerExecBody {
+            arguments: vec![],
             exec_type: TriggerExecBodyType::Function,
             func_desc: FunctionDesc {
                 name: ObjectName::from(vec![Ident::new("check_account_deletes")]),
@@ -6402,6 +6576,7 @@ fn parse_create_instead_of_delete_trigger() {
 fn parse_create_trigger_with_multiple_events_and_deferrable() {
     let sql = "CREATE CONSTRAINT TRIGGER check_multiple_events BEFORE INSERT OR UPDATE OR DELETE ON accounts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_account_changes";
     let expected = Statement::CreateTrigger(CreateTrigger {
+        mysql_body: None,
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -6420,6 +6595,7 @@ fn parse_create_trigger_with_multiple_events_and_deferrable() {
         trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
         condition: None,
         exec_body: Some(TriggerExecBody {
+            arguments: vec![],
             exec_type: TriggerExecBodyType::Function,
             func_desc: FunctionDesc {
                 name: ObjectName::from(vec![Ident::new("check_account_changes")]),
@@ -6442,6 +6618,7 @@ fn parse_create_trigger_with_multiple_events_and_deferrable() {
 fn parse_create_trigger_with_referencing() {
     let sql = "CREATE TRIGGER check_referencing BEFORE INSERT ON accounts REFERENCING NEW TABLE AS new_accounts OLD TABLE AS old_accounts FOR EACH ROW EXECUTE FUNCTION check_account_referencing";
     let expected = Statement::CreateTrigger(CreateTrigger {
+        mysql_body: None,
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -6467,6 +6644,7 @@ fn parse_create_trigger_with_referencing() {
         trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
         condition: None,
         exec_body: Some(TriggerExecBody {
+            arguments: vec![],
             exec_type: TriggerExecBodyType::Function,
             func_desc: FunctionDesc {
                 name: ObjectName::from(vec![Ident::new("check_account_referencing")]),
@@ -6636,6 +6814,18 @@ fn parse_trigger_related_functions() {
     assert_eq!(
         create_table,
         CreateTable {
+            unlogged: false,
+            of_type: None,
+            query_columns: vec![],
+            with_data: None,
+            mysql_partitioning: None,
+            elements: vec![
+                CreateTableElement::Column(0),
+                CreateTableElement::Column(1),
+                CreateTableElement::Column(2),
+                CreateTableElement::Column(3)
+            ],
+
             or_replace: false,
             temporary: false,
             external: false,
@@ -6724,6 +6914,7 @@ fn parse_trigger_related_functions() {
     assert_eq!(
         create_function,
         Statement::CreateFunction(CreateFunction {
+parsed_source: RoutineSourceProvenance::default(), mysql_body: None,
             or_alter: false,
             or_replace: false,
             temporary: false,
@@ -6764,6 +6955,7 @@ fn parse_trigger_related_functions() {
     assert_eq!(
         create_trigger,
         Statement::CreateTrigger(CreateTrigger {
+            mysql_body: None,
             or_alter: false,
             temporary: false,
             or_replace: false,
@@ -6778,10 +6970,11 @@ fn parse_trigger_related_functions() {
             trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
             condition: None,
             exec_body: Some(TriggerExecBody {
+                arguments: vec![],
                 exec_type: TriggerExecBodyType::Function,
                 func_desc: FunctionDesc {
                     name: ObjectName::from(vec![Ident::new("emp_stamp")]),
-                    args: Some(vec![]),
+                    args: None,
                 }
             }),
             statements_as: false,
@@ -7330,8 +7523,13 @@ fn parse_create_operator() {
     assert_eq!(
         pg().verified_stmt(sql),
         Statement::CreateOperator(CreateOperator {
+            left_arg_setof: false,
+            right_arg_setof: false,
             name: ObjectName::from(vec![Ident::new("myschema"), Ident::new("@@")]),
-            function: ObjectName::from(vec![Ident::new("myschema"), Ident::new("my_proc")]),
+            function: Some(ObjectName::from(vec![
+                Ident::new("myschema"),
+                Ident::new("my_proc")
+            ])),
             is_procedure: true,
             left_arg: Some(DataType::Timestamp(None, TimezoneInfo::WithTimeZone)),
             right_arg: Some(DataType::Varchar(Some(CharacterLength::IntegerLength {
@@ -7355,8 +7553,8 @@ fn parse_create_operator() {
                     Ident::new("myschema"),
                     Ident::new("join_func")
                 ]))),
-                OperatorOption::Hashes,
-                OperatorOption::Merges,
+                OperatorOption::Hashes(true),
+                OperatorOption::Merges(true),
             ],
         })
     );
@@ -7368,8 +7566,10 @@ fn parse_create_operator() {
         assert_eq!(
             pg().verified_stmt(&format!("CREATE OPERATOR {op_symbol} (FUNCTION = f)")),
             Statement::CreateOperator(CreateOperator {
+                left_arg_setof: false,
+                right_arg_setof: false,
                 name: ObjectName::from(vec![Ident::new(*op_symbol)]),
-                function: ObjectName::from(vec![Ident::new("f")]),
+                function: Some(ObjectName::from(vec![Ident::new("f")])),
                 is_procedure: false,
                 left_arg: None,
                 right_arg: None,
@@ -7686,12 +7886,12 @@ fn parse_alter_operator() {
 
     // Test ALTER OPERATOR ... SET with HASHES and MERGES (individually and combined)
     for (operator, options_sql, options_ast) in [
-        ("=", "HASHES", vec![OperatorOption::Hashes]),
-        ("<", "MERGES", vec![OperatorOption::Merges]),
+        ("=", "HASHES", vec![OperatorOption::Hashes(true)]),
+        ("<", "MERGES", vec![OperatorOption::Merges(true)]),
         (
             "<=",
             "HASHES, MERGES",
-            vec![OperatorOption::Hashes, OperatorOption::Merges],
+            vec![OperatorOption::Hashes(true), OperatorOption::Merges(true)],
         ),
     ] {
         let sql = format!(
@@ -7724,8 +7924,8 @@ fn parse_alter_operator() {
                 options: vec![
                     OperatorOption::Commutator(ObjectName::from(vec![Ident::new("+")])),
                     OperatorOption::Negator(ObjectName::from(vec![Ident::new("-")])),
-                    OperatorOption::Hashes,
-                    OperatorOption::Merges,
+                    OperatorOption::Hashes(true),
+                    OperatorOption::Merges(true),
                 ],
             },
         })
@@ -8895,7 +9095,8 @@ fn parse_create_table_partition_of_range() {
                 create_table.partition_of
             );
             match create_table.for_values {
-                Some(ForValues::From { from, to }) => {
+                Some(ForValues::From { from, to, token }) => {
+                    assert_eq!("FROM", token.0.token.to_string());
                     assert_eq!(1, from.len());
                     assert_eq!(1, to.len());
                     match &from[0] {
@@ -8931,8 +9132,12 @@ fn parse_create_table_partition_of_range_with_minvalue_maxvalue() {
                 create_table.partition_of
             );
             match create_table.for_values {
-                Some(ForValues::From { from, to }) => {
-                    assert_eq!(PartitionBoundValue::MinValue, from[0]);
+                Some(ForValues::From { from, to, token }) => {
+                    assert_eq!("FROM", token.0.token.to_string());
+                    assert_eq!(
+                        PartitionBoundValue::MinValue(AttachedToken::empty()),
+                        from[0]
+                    );
                     match &to[0] {
                         PartitionBoundValue::Expr(Expr::Value(v)) => {
                             assert_eq!("'2020-01-01'", v.to_string());
@@ -8951,14 +9156,15 @@ fn parse_create_table_partition_of_range_with_minvalue_maxvalue() {
         "CREATE TABLE orders_new PARTITION OF orders FOR VALUES FROM ('2024-01-01') TO (MAXVALUE)";
     match pg_and_generic().verified_stmt(sql) {
         Statement::CreateTable(create_table) => match create_table.for_values {
-            Some(ForValues::From { from, to }) => {
+            Some(ForValues::From { from, to, token }) => {
+                assert_eq!("FROM", token.0.token.to_string());
                 match &from[0] {
                     PartitionBoundValue::Expr(Expr::Value(v)) => {
                         assert_eq!("'2024-01-01'", v.to_string());
                     }
                     _ => panic!("Expected Expr value in from"),
                 }
-                assert_eq!(PartitionBoundValue::MaxValue, to[0]);
+                assert_eq!(PartitionBoundValue::MaxValue(AttachedToken::empty()), to[0]);
             }
             _ => panic!("Expected ForValues::From"),
         },
@@ -8978,7 +9184,8 @@ fn parse_create_table_partition_of_list() {
                 create_table.partition_of
             );
             match create_table.for_values {
-                Some(ForValues::In(values)) => {
+                Some(ForValues::In { values, token }) => {
+                    assert_eq!("IN", token.0.token.to_string());
                     assert_eq!(3, values.len());
                 }
                 _ => panic!("Expected ForValues::In"),
@@ -9000,7 +9207,12 @@ fn parse_create_table_partition_of_hash() {
                 create_table.partition_of
             );
             match create_table.for_values {
-                Some(ForValues::With { modulus, remainder }) => {
+                Some(ForValues::With {
+                    modulus,
+                    remainder,
+                    token,
+                }) => {
+                    assert_eq!("WITH", token.0.token.to_string());
                     assert_eq!(4, modulus);
                     assert_eq!(0, remainder);
                 }
@@ -9022,7 +9234,15 @@ fn parse_create_table_partition_of_default() {
                 Some(ObjectName::from(vec![Ident::new("orders")])),
                 create_table.partition_of
             );
-            assert_eq!(Some(ForValues::Default), create_table.for_values);
+            assert_eq!(
+                Some(ForValues::Default {
+                    token: AttachedToken::empty()
+                }),
+                create_table.for_values
+            );
+            if let Some(ForValues::Default { token }) = create_table.for_values {
+                assert_eq!("DEFAULT", token.0.token.to_string());
+            }
         }
         _ => panic!("Expected CreateTable"),
     }
@@ -9036,7 +9256,8 @@ fn parse_create_table_partition_of_multicolumn_range() {
         Statement::CreateTable(create_table) => {
             assert_eq!("sales_2023_q1", create_table.name.to_string());
             match create_table.for_values {
-                Some(ForValues::From { from, to }) => {
+                Some(ForValues::From { from, to, token }) => {
+                    assert_eq!("FROM", token.0.token.to_string());
                     assert_eq!(2, from.len());
                     assert_eq!(2, to.len());
                 }

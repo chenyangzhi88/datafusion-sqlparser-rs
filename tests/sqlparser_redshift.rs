@@ -136,6 +136,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,

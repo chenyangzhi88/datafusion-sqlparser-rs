@@ -22,8 +22,9 @@
 
 use sqlparser::ast::{
     ClusteredBy, CommentDef, CreateFunction, CreateFunctionBody, CreateFunctionUsing, CreateTable,
-    Expr, Function, FunctionArgumentList, FunctionArguments, Ident, ObjectName, OrderByExpr,
-    OrderByOptions, SelectItem, Set, Statement, TableFactor, UnaryOperator, Use, Value,
+    Expr, Function, FunctionArgumentList, FunctionArguments, FunctionOrigin, Ident, ObjectName,
+    OrderByExpr, OrderByOptions, SelectItem, Set, Statement, TableFactor, UnaryOperator, Use,
+    Value,
 };
 use sqlparser::dialect::{AnsiDialect, GenericDialect, HiveDialect};
 use sqlparser::parser::ParserError;
@@ -494,6 +495,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,

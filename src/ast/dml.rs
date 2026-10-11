@@ -26,15 +26,15 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::{
     ast::display_separated,
-    display_utils::{Indent, SpaceOrNewline, indented_list},
+    display_utils::{indented_list, Indent, SpaceOrNewline},
 };
 
 use super::{
+    display_comma_separated, helpers::attached_token::AttachedToken, query::InputFormatClause,
     Assignment, Expr, FromTable, Ident, InsertAliases, MysqlInsertPriority, ObjectName, OnInsert,
     OptimizerHint, OrderByExpr, Query, SelectInto, SelectItem, Setting, SqliteOnConflict,
     TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
-    Values, display_comma_separated, helpers::attached_token::AttachedToken,
-    query::InputFormatClause,
+    Values,
 };
 
 /// PostgreSQL identity-column input policy for an INSERT source.
@@ -103,6 +103,9 @@ impl Display for InsertOverriding {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct Insert {
+    /// Compiler-owned PostgreSQL INSERT analysis receipt. Parsing initializes
+    /// `None`; SQL display and source spans exclude this metadata.
+    pub postgres_insert_bindings: Option<String>,
     /// Token for the `INSERT` keyword (or its substitutes)
     pub insert_token: AttachedToken,
     /// Query optimizer hints
@@ -121,8 +124,8 @@ pub struct Insert {
     /// `table_name as foo` (for PostgreSQL)
     /// `table_name foo` (for Oracle)
     pub table_alias: Option<TableAliasWithoutColumns>,
-    /// COLUMNS
-    pub columns: Vec<ObjectName>,
+    /// Target columns, including PostgreSQL composite fields and array indirection.
+    pub columns: Vec<Expr>,
     /// PostgreSQL identity input policy, placed after the column list.
     pub overriding: Option<InsertOverriding>,
     /// Overwrite (Hive)

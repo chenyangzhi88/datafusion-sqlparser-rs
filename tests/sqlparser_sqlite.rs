@@ -425,6 +425,10 @@ fn parse_window_function_with_filter() {
         assert_eq!(
             select.projection,
             vec![SelectItem::UnnamedExpr(Expr::Function(Function {
+                mysql_literal_source: None,
+                origin: FunctionOrigin::Source,
+                from_first_last: None,
+
                 name: ObjectName::from(vec![Ident::new(func_name)]),
                 uses_odbc_syntax: false,
                 parameters: FunctionArguments::None,
@@ -477,6 +481,7 @@ fn parse_update_tuple_row_values() {
     assert_eq!(
         sqlite().verified_stmt("UPDATE x SET (a, b) = (1, 2)"),
         Statement::Update(Update {
+            postgres_target_inheritance: PostgresTargetInheritance::Default,
             optimizer_hints: vec![],
             or: None,
             assignments: vec![Assignment {
@@ -650,6 +655,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(!temporary);
@@ -696,6 +702,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(!temporary);
@@ -736,6 +743,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(!temporary);
@@ -776,6 +784,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(!temporary);
@@ -820,6 +829,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(!temporary);
@@ -861,6 +871,7 @@ fn test_create_trigger() {
             statements_as,
             statements: _,
             characteristics,
+            mysql_body: None,
         }) => {
             assert!(!or_alter);
             assert!(temporary);
