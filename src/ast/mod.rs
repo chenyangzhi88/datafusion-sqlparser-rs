@@ -17,6 +17,8 @@
 
 //! SQL Abstract Syntax Tree (AST) types
 #[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
     format,
@@ -24,6 +26,9 @@ use alloc::{
     vec,
     vec::Vec,
 };
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 use helpers::{
     attached_token::AttachedToken,
     stmt_data_loading::{FileStagingCommand, StageLoadSelectItemKind},
@@ -64,44 +69,52 @@ pub use self::ddl::{
     AlterFunction, AlterFunctionAction, AlterFunctionKind, AlterFunctionOperation,
     AlterIndexOperation, AlterOperator, AlterOperatorClass, AlterOperatorClassOperation,
     AlterOperatorFamily, AlterOperatorFamilyOperation, AlterOperatorOperation, AlterPolicy,
-    AlterPolicyOperation, AlterSchema, AlterSchemaOperation, AlterTable, AlterTableAlgorithm,
-    AlterTableLock, AlterTableOperation, AlterTableType, AlterType, AlterTypeAddValue,
-    AlterTypeAddValuePosition, AlterTypeOperation, AlterTypeRename, AlterTypeRenameValue,
-    ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef, ColumnOptions, ColumnPolicy,
-    ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation, CreateCollationDefinition,
-    CreateConnector, CreateDomain, CreateExtension, CreateFunction, CreateIndex, CreateOperator,
-    CreateOperatorClass, CreateOperatorFamily, CreatePolicy, CreatePolicyCommand, CreatePolicyType,
-    CreateTable, CreateTrigger, CreateView, Deduplicate, DeferrableInitial, DistStyle,
-    DropBehavior, DropExtension, DropFunction, DropOperator, DropOperatorClass, DropOperatorFamily,
-    DropOperatorSignature, DropPolicy, DropTrigger, ForValues, FunctionReturnType, GeneratedAs,
-    GeneratedExpressionMode, IdentityParameters, IdentityProperty, IdentityPropertyFormatKind,
-    IdentityPropertyKind, IdentityPropertyOrder, IndexColumn, IndexOption, IndexType,
-    KeyOrIndexDisplay, Msck, NullsDistinctOption, OperatorArgTypes, OperatorClassItem,
-    OperatorFamilyDropItem, OperatorFamilyItem, OperatorOption, OperatorPurpose, Owner, Partition,
-    PartitionBoundValue, ProcedureParam, ReferentialAction, RenameTableNameKind, ReplicaIdentity,
-    TagsColumnOption, TriggerObjectKind, Truncate, UserDefinedTypeCompositeAttributeDef,
-    UserDefinedTypeInternalLength, UserDefinedTypeRangeOption, UserDefinedTypeRepresentation,
-    UserDefinedTypeSqlDefinitionOption, UserDefinedTypeStorage, ViewColumnDef,
+    AlterPolicyOperation, AlterSchema, AlterSchemaOperation, AlterSchemaSetOperation, AlterTable,
+    AlterTableAlgorithm, AlterTableLock, AlterTableOperation, AlterTableSetOperation,
+    AlterTableType, AlterType, AlterTypeAddValue, AlterTypeAddValuePosition, AlterTypeOperation,
+    AlterTypeRename, AlterTypeRenameValue, ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef,
+    ColumnOptions, ColumnPolicy, ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation,
+    CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension, CreateFunction,
+    CreateIndex, CreateIndexKind, CreateOperator, CreateOperatorClass, CreateOperatorFamily,
+    CreatePolicy, CreatePolicyCommand, CreatePolicyType, CreateProcedure, CreateProcedureBody,
+    CreateTable, CreateTableElement, CreateTrigger, CreateView, Deduplicate, DeferrableInitial,
+    DistStyle, DropBehavior, DropExtension, DropFunction, DropOperator, DropOperatorClass,
+    DropOperatorFamily, DropOperatorSignature, DropPolicy, DropTrigger, ForValues,
+    FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters, IdentityProperty,
+    IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder, IndexColumn,
+    IndexOption, IndexType, KeyOrIndexDisplay, Msck, MySqlAlterTableComment,
+    MySqlExchangeValidation, MySqlKeyAlgorithm, MySqlPartitionBound, MySqlPartitionBy,
+    MySqlPartitionDefinition, MySqlPartitionMaintenance, MySqlPartitionMethod,
+    MySqlPartitionOption, MySqlPartitionSelection, MySqlPartitionValues, MySqlProgramBody,
+    MySqlSubpartitionBy, MySqlSubpartitionDefinition, MySqlSubpartitionMethod, NullsDistinctOption,
+    OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem, OperatorFamilyItem,
+    OperatorOption, OperatorPurpose, Owner, Partition, PartitionBoundValue, ReferentialAction,
+    RenameTableNameKind, ReplicaIdentity, TagsColumnOption, TriggerObjectKind, Truncate,
+    UserDefinedTypeCompositeAttributeDef, UserDefinedTypeInternalLength,
+    UserDefinedTypeRangeOption, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    UserDefinedTypeStorage, ViewCheckOption, ViewCheckOptionKind, ViewColumnDef,
 };
 pub use self::dml::{
-    Delete, Insert, Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr,
-    MergeInsertKind, MergeUpdateExpr, MultiTableInsertIntoClause, MultiTableInsertType,
-    MultiTableInsertValue, MultiTableInsertValues, MultiTableInsertWhenClause, OutputClause,
+    Delete, Insert, InsertOverriding, Merge, MergeAction, MergeClause, MergeClauseKind,
+    MergeInsertExpr, MergeInsertKind, MergeUpdateExpr, MultiTableInsertIntoClause,
+    MultiTableInsertType, MultiTableInsertValue, MultiTableInsertValues,
+    MultiTableInsertWhenClause, MySqlDeleteModifier, OutputClause, PostgresTargetInheritance,
     Update,
 };
 pub use self::operator::{BinaryOperator, UnaryOperator};
 pub use self::query::{
-    AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, Distinct, EmptyMatchesMode,
-    ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, ForClause,
-    ForJson, ForXml, FormatClause, GroupByExpr, GroupByWithModifier, IdentWithAlias,
-    IlikeSelectItem, InputFormatClause, Interpolate, InterpolateExpr, Join, JoinConstraint,
-    JoinOperator, JsonTableColumn, JsonTableColumnErrorHandling, JsonTableNamedColumn,
-    JsonTableNestedColumn, LateralView, LimitClause, LockClause, LockType, MatchRecognizePattern,
-    MatchRecognizeSymbol, Measure, NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset,
-    OffsetRows, OpenJsonTableColumn, OrderBy, OrderByExpr, OrderByKind, OrderByOptions,
-    PipeOperator, PivotValueSource, ProjectionSelect, Query, RenameSelectItem,
-    RepetitionQuantifier, ReplaceSelectElement, ReplaceSelectItem, RowsPerMatch, Select,
-    SelectFlavor, SelectInto, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers,
+    AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, DerivedTableOrigin, Distinct,
+    EmptyMatchesMode, ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy,
+    Fetch, ForClause, ForJson, ForXml, FormatClause, GroupByExpr, GroupByWithModifier,
+    IdentWithAlias, IlikeSelectItem, InputFormatClause, Interpolate, InterpolateExpr, Join,
+    JoinConstraint, JoinOperator, JsonTableColumn, JsonTableColumnErrorHandling,
+    JsonTableNamedColumn, JsonTableNestedColumn, LateralView, LimitClause, LockClause, LockType,
+    MatchRecognizePattern, MatchRecognizeSymbol, Measure, MySqlSelectIntoFile,
+    NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset, OffsetRows, OpenJsonTableColumn,
+    OrderBy, OrderByExpr, OrderByKind, OrderByOptions, PipeOperator, PivotValueSource,
+    ProjectionSelect, Query, RenameSelectItem, RepetitionQuantifier, ReplaceSelectElement,
+    ReplaceSelectItem, RowsFromItem, RowsPerMatch, Select, SelectFlavor, SelectInto,
+    SelectIntoFile, SelectIntoTarget, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers,
     SetExpr, SetOperator, SetQuantifier, Setting, SymbolDefinition, Table, TableAlias,
     TableAliasColumnDef, TableFactor, TableFunctionArgs, TableIndexHintForClause,
     TableIndexHintType, TableIndexHints, TableIndexType, TableSample, TableSampleBucket,
@@ -118,8 +131,10 @@ pub use self::trigger::{
 };
 
 pub use self::value::{
-    escape_double_quote_string, escape_quoted_string, DateTimeField, DollarQuotedString,
-    NormalizationForm, QuoteDelimitedString, TrimWhereField, Value, ValueWithSpan,
+    DateTimeField, DollarQuotedString, MySqlProjectionLiteral, MySqlText, MySqlTextRole,
+    MySqlTextSegment, NormalizationForm, QuoteDelimitedString, SqlCppLedger, SqlCppPiece,
+    SqlCppPieceRange, SqlSourceAdmission, SqlSourceOccurrence, SqlSourceOwner, TrimWhereField,
+    Value, ValueWithSpan, escape_double_quote_string, escape_quoted_string,
 };
 
 use crate::ast::helpers::key_value_options::KeyValueOptions;
@@ -138,8 +153,9 @@ mod dml;
 pub mod helpers;
 pub mod table_constraints;
 pub use table_constraints::{
-    CheckConstraint, ConstraintUsingIndex, ForeignKeyConstraint, FullTextOrSpatialConstraint,
-    IndexConstraint, PrimaryKeyConstraint, TableConstraint, UniqueConstraint,
+    CheckConstraint, ConstraintUsingIndex, ExcludeConstraint, ExcludeConstraintElement,
+    ForeignKeyConstraint, FullTextOrSpatialConstraint, IndexConstraint, PrimaryKeyConstraint,
+    TableConstraint, UniqueConstraint,
 };
 mod operator;
 mod query;
@@ -377,7 +393,20 @@ impl From<&str> for Ident {
 impl fmt::Display for Ident {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.quote_style {
-            Some(q) if q == '"' || q == '\'' || q == '`' => {
+            Some('"') => {
+                // Ident stores the decoded name. Every literal delimiter must
+                // be escaped, including consecutive quotes and quotes after
+                // backslashes (which have no escape role in SQL identifiers).
+                f.write_str("\"")?;
+                for (index, part) in self.value.split('"').enumerate() {
+                    if index != 0 {
+                        f.write_str("\"\"")?;
+                    }
+                    f.write_str(part)?;
+                }
+                f.write_str("\"")
+            }
+            Some(q) if q == '\'' || q == '`' => {
                 let escaped = value::escape_quoted_string(&self.value, q);
                 write!(f, "{q}{escaped}{q}")
             }
@@ -419,6 +448,9 @@ impl fmt::Display for ObjectName {
 pub enum ObjectNamePart {
     /// A single identifier part, e.g. `schema` or `table`.
     Identifier(Ident),
+    /// A MySQL user-variable target. The identifier contains the decoded name,
+    /// not a synthetic `@` prefix, and is never an ordinary object identifier.
+    UserVariable(Ident),
     /// A function that returns an identifier (dialect-specific).
     Function(ObjectNamePartFunction),
 }
@@ -428,7 +460,15 @@ impl ObjectNamePart {
     pub fn as_ident(&self) -> Option<&Ident> {
         match self {
             ObjectNamePart::Identifier(ident) => Some(ident),
-            ObjectNamePart::Function(_) => None,
+            ObjectNamePart::UserVariable(_) | ObjectNamePart::Function(_) => None,
+        }
+    }
+
+    /// Borrow the decoded name of a MySQL user-variable target.
+    pub fn as_user_variable(&self) -> Option<&Ident> {
+        match self {
+            Self::UserVariable(ident) => Some(ident),
+            _ => None,
         }
     }
 }
@@ -437,6 +477,7 @@ impl fmt::Display for ObjectNamePart {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ObjectNamePart::Identifier(ident) => write!(f, "{ident}"),
+            ObjectNamePart::UserVariable(ident) => value::fmt_user_variable(ident, f),
             ObjectNamePart::Function(func) => write!(f, "{func}"),
         }
     }
@@ -469,6 +510,11 @@ impl fmt::Display for ObjectNamePartFunction {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct Array {
+    /// Source tokens include empty arrays without affecting AST equality.
+    pub opening_token: AttachedToken,
+    /// Closing bracket, retained independently of semantic equality.
+    pub closing_token: AttachedToken,
+
     /// The list of expressions between brackets
     pub elem: Vec<Expr>,
 
@@ -749,6 +795,12 @@ impl fmt::Display for JsonPath {
 pub enum CastKind {
     /// The standard SQL cast syntax, e.g. `CAST(<expr> as <datatype>)`
     Cast,
+    /// MySQL's deprecated unary binary-string cast, e.g. `BINARY <expr>`.
+    ///
+    /// This remains distinct from [`CastKind::Cast`] so product layers can
+    /// emit MySQL's deprecation diagnostic without guessing from the target
+    /// type. Its semantic target is always [`DataType::Binary(None)`].
+    Binary,
     /// A cast that returns `NULL` on failure, e.g. `TRY_CAST(<expr> as <datatype>)`.
     ///
     /// See <https://docs.snowflake.com/en/sql-reference/functions/try_cast>.
@@ -844,6 +896,66 @@ impl fmt::Display for CaseWhen {
     }
 }
 
+/// Empty/error behavior for a MySQL `JSON_VALUE` expression.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum JsonValueClause {
+    /// Return SQL `NULL`.
+    Null,
+    /// Raise an error.
+    Error,
+    /// Return the supplied expression.
+    Default(Box<Expr>),
+}
+
+impl fmt::Display for JsonValueClause {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("NULL"),
+            Self::Error => f.write_str("ERROR"),
+            Self::Default(expr) => write!(f, "DEFAULT {expr}"),
+        }
+    }
+}
+
+/// MySQL `JSON_VALUE(json_doc, path [RETURNING type] ... ON EMPTY ... ON ERROR)`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonValueExpr {
+    /// JSON document expression.
+    pub json: Box<Expr>,
+    /// JSON path expression.
+    pub path: Box<Expr>,
+    /// Optional declared result type.
+    pub returning: Option<DataType>,
+    /// Behavior when the path has no match.
+    pub on_empty: Option<JsonValueClause>,
+    /// Behavior when evaluation fails.
+    pub on_error: Option<JsonValueClause>,
+}
+
+/// Quantifier for PostgreSQL pattern comparisons against an array.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum PatternQuantifier {
+    /// The pattern comparison succeeds for at least one array element.
+    Any,
+    /// The pattern comparison succeeds for every array element.
+    All,
+}
+
+impl fmt::Display for PatternQuantifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Any => "ANY",
+            Self::All => "ALL",
+        })
+    }
+}
+
 /// An SQL expression of any type.
 ///
 /// # Semantics / Type Checking
@@ -871,6 +983,9 @@ impl fmt::Display for CaseWhen {
 pub enum Expr {
     /// Identifier e.g. table name or column name
     Identifier(Ident),
+    /// A MySQL user variable, distinct from both a column and a parameter.
+    /// The identifier stores the decoded name without the source `@` marker.
+    UserVariable(Ident),
     /// Multi-part identifier, e.g. `table_alias.column` or `schema.table.col`
     CompoundIdentifier(Vec<Ident>),
     /// Multi-part expression access.
@@ -908,6 +1023,8 @@ pub enum Expr {
         /// The path to the data to extract.
         path: JsonPath,
     },
+    /// MySQL `JSON_VALUE` with typed return and explicit empty/error behavior.
+    JsonValue(JsonValueExpr),
     /// `IS FALSE` operator
     IsFalse(Box<Expr>),
     /// `IS NOT FALSE` operator
@@ -984,13 +1101,12 @@ pub enum Expr {
         /// Right operand.
         right: Box<Expr>,
     },
-    /// `[NOT] LIKE <pattern> [ESCAPE <escape_character>]`
+    /// `[NOT] LIKE [ANY|ALL] <pattern> [ESCAPE <escape_character>]`
     Like {
         /// `true` when `NOT` is present.
         negated: bool,
-        /// Snowflake supports the ANY keyword to match against a list of patterns
-        /// <https://docs.snowflake.com/en/sql-reference/functions/like_any>
-        any: bool,
+        /// Optional quantified comparison against an array of patterns.
+        quantifier: Option<PatternQuantifier>,
         /// Expression to match.
         expr: Box<Expr>,
         /// Pattern expression.
@@ -1002,9 +1118,8 @@ pub enum Expr {
     ILike {
         /// `true` when `NOT` is present.
         negated: bool,
-        /// Snowflake supports the ANY keyword to match against a list of patterns
-        /// <https://docs.snowflake.com/en/sql-reference/functions/like_any>
-        any: bool,
+        /// Optional quantified comparison against an array of patterns.
+        quantifier: Option<PatternQuantifier>,
         /// Expression to match.
         expr: Box<Expr>,
         /// Pattern expression.
@@ -1016,6 +1131,8 @@ pub enum Expr {
     SimilarTo {
         /// `true` when `NOT` is present.
         negated: bool,
+        /// Optional quantified comparison against an array of patterns.
+        quantifier: Option<PatternQuantifier>,
         /// Expression to test.
         expr: Box<Expr>,
         /// Pattern expression.
@@ -1075,6 +1192,10 @@ pub enum Expr {
         data_type: Option<DataType>,
         /// Optional target character encoding (e.g., `utf8mb4`).
         charset: Option<ObjectName>,
+        /// MySQL's deprecated trailing `BINARY` character-type attribute.
+        /// This changes the result collation to the target character set's
+        /// binary collation without changing the result into a binary string.
+        binary_attribute: bool,
         /// `true` when target precedes the value (MSSQL syntax).
         target_before_value: bool,
         /// How to translate the expression.
@@ -1332,7 +1453,7 @@ pub enum Expr {
         /// `(<col>, <col>, ...)`.
         columns: Vec<ObjectName>,
         /// `<expr>`.
-        match_value: ValueWithSpan,
+        match_value: Box<Expr>,
         /// `<search modifier>`
         opt_search_modifier: Option<SearchModifier>,
     },
@@ -1374,6 +1495,14 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Borrow the decoded name of a MySQL user variable.
+    pub fn as_user_variable(&self) -> Option<&Ident> {
+        match self {
+            Self::UserVariable(ident) => Some(ident),
+            _ => None,
+        }
+    }
+
     /// Creates a new [`Expr::Value`]
     pub fn value(value: impl Into<ValueWithSpan>) -> Self {
         Expr::Value(value.into())
@@ -1719,6 +1848,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Expr::Identifier(s) => write!(f, "{s}"),
+            Expr::UserVariable(ident) => value::fmt_user_variable(ident, f),
             Expr::Wildcard(_) => f.write_str("*"),
             Expr::QualifiedWildcard(prefix, _) => write!(f, "{prefix}.*"),
             Expr::CompoundIdentifier(s) => write!(f, "{}", display_separated(s, ".")),
@@ -1789,14 +1919,14 @@ impl fmt::Display for Expr {
                 expr,
                 pattern,
                 escape_char,
-                any,
+                quantifier,
             } => match escape_char {
                 Some(ch) => write!(
                     f,
                     "{} {}LIKE {}{} ESCAPE {}",
                     expr,
                     if *negated { "NOT " } else { "" },
-                    if *any { "ANY " } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern,
                     ch
                 ),
@@ -1805,7 +1935,7 @@ impl fmt::Display for Expr {
                     "{} {}LIKE {}{}",
                     expr,
                     if *negated { "NOT " } else { "" },
-                    if *any { "ANY " } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern
                 ),
             },
@@ -1814,14 +1944,14 @@ impl fmt::Display for Expr {
                 expr,
                 pattern,
                 escape_char,
-                any,
+                quantifier,
             } => match escape_char {
                 Some(ch) => write!(
                     f,
                     "{} {}ILIKE {}{} ESCAPE {}",
                     expr,
                     if *negated { "NOT " } else { "" },
-                    if *any { "ANY" } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern,
                     ch
                 ),
@@ -1830,7 +1960,7 @@ impl fmt::Display for Expr {
                     "{} {}ILIKE {}{}",
                     expr,
                     if *negated { "NOT " } else { "" },
-                    if *any { "ANY " } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern
                 ),
             },
@@ -1867,23 +1997,26 @@ impl fmt::Display for Expr {
             }
             Expr::SimilarTo {
                 negated,
+                quantifier,
                 expr,
                 pattern,
                 escape_char,
             } => match escape_char {
                 Some(ch) => write!(
                     f,
-                    "{} {}SIMILAR TO {} ESCAPE {}",
+                    "{} {}SIMILAR TO {}{} ESCAPE {}",
                     expr,
                     if *negated { "NOT " } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern,
                     ch
                 ),
                 _ => write!(
                     f,
-                    "{} {}SIMILAR TO {}",
+                    "{} {}SIMILAR TO {}{}",
                     expr,
                     if *negated { "NOT " } else { "" },
+                    quantifier.map_or_else(String::new, |value| format!("{value} ")),
                     pattern
                 ),
             },
@@ -1938,6 +2071,7 @@ impl fmt::Display for Expr {
                 target_before_value,
                 data_type,
                 charset,
+                binary_attribute,
                 styles,
             } => {
                 write!(f, "{}CONVERT(", if *is_try { "TRY_" } else { "" })?;
@@ -1956,6 +2090,9 @@ impl fmt::Display for Expr {
                 }?;
                 if !styles.is_empty() {
                     write!(f, ", {}", display_comma_separated(styles))?;
+                }
+                if *binary_attribute {
+                    write!(f, " BINARY")?;
                 }
                 write!(f, ")")
             }
@@ -1976,6 +2113,7 @@ impl fmt::Display for Expr {
                     }
                     write!(f, ")")
                 }
+                CastKind::Binary => write!(f, "BINARY {expr}"),
                 CastKind::TryCast => {
                     if let Some(format) = format {
                         write!(f, "TRY_CAST({expr} AS {data_type} FORMAT {format})")
@@ -2152,6 +2290,8 @@ impl fmt::Display for Expr {
                 }
                 if let Some(trim_char) = trim_what {
                     write!(f, "{trim_char} FROM {expr}")?;
+                } else if trim_where.is_some() {
+                    write!(f, "FROM {expr}")?;
                 } else {
                     write!(f, "{expr}")?;
                 }
@@ -2190,6 +2330,19 @@ impl fmt::Display for Expr {
             }
             Expr::JsonAccess { value, path } => {
                 write!(f, "{value}{path}")
+            }
+            Expr::JsonValue(json_value) => {
+                write!(f, "JSON_VALUE({}, {}", json_value.json, json_value.path)?;
+                if let Some(returning) = &json_value.returning {
+                    write!(f, " RETURNING {returning}")?;
+                }
+                if let Some(on_empty) = &json_value.on_empty {
+                    write!(f, " {on_empty} ON EMPTY")?;
+                }
+                if let Some(on_error) = &json_value.on_error {
+                    write!(f, " {on_error} ON ERROR")?;
+                }
+                f.write_str(")")
             }
             Expr::AtTimeZone {
                 timestamp,
@@ -2320,6 +2473,9 @@ impl fmt::Display for WindowSpec {
             } else {
                 write!(f, "{} {}", window_frame.units, window_frame.start_bound)?;
             }
+            if let Some(exclusion) = window_frame.exclusion {
+                write!(f, " EXCLUDE {exclusion}")?;
+            }
         }
         Ok(())
     }
@@ -2342,7 +2498,8 @@ pub struct WindowFrame {
     /// indicates the shorthand form (e.g. `ROWS 1 PRECEDING`), which must
     /// behave the same as `end_bound = WindowFrameBound::CurrentRow`.
     pub end_bound: Option<WindowFrameBound>,
-    // TBD: EXCLUDE
+    /// Rows excluded from this frame, without changing its bounds.
+    pub exclusion: Option<WindowFrameExclusion>,
 }
 
 impl Default for WindowFrame {
@@ -2354,7 +2511,54 @@ impl Default for WindowFrame {
             units: WindowFrameUnits::Range,
             start_bound: WindowFrameBound::Preceding(None),
             end_bound: None,
+            exclusion: None,
         }
+    }
+}
+
+/// The `EXCLUDE` clause specifying which rows to omit from a window frame.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum WindowFrameExclusion {
+    /// `EXCLUDE CURRENT ROW`: omit the current row, but not its peers.
+    CurrentRow,
+    /// `EXCLUDE GROUP`: omit the current row and all its peers.
+    Group,
+    /// `EXCLUDE TIES`: omit the current row's peers, but keep the current row.
+    Ties,
+    /// `EXCLUDE NO OTHERS`: omit no rows from the frame.
+    NoOthers,
+}
+
+impl fmt::Display for WindowFrameExclusion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::CurrentRow => "CURRENT ROW",
+            Self::Group => "GROUP",
+            Self::Ties => "TIES",
+            Self::NoOthers => "NO OTHERS",
+        })
+    }
+}
+
+/// The frame end from which `NTH_VALUE` counts rows.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum FromFirstLast {
+    /// `FROM FIRST`: count from the first row of the window frame.
+    First,
+    /// `FROM LAST`: count from the last row of the window frame.
+    Last,
+}
+
+impl fmt::Display for FromFirstLast {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::First => "FROM FIRST",
+            Self::Last => "FROM LAST",
+        })
     }
 }
 
@@ -2455,8 +2659,36 @@ impl fmt::Display for AddDropSync {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+/// Schema-scoped native SHOW forms with the same database/filter grammar.
+pub enum ShowSchemaMetadataKind {
+    /// SHOW TABLE STATUS.
+    TableStatus,
+    /// SHOW TRIGGERS.
+    Triggers,
+    /// SHOW EVENTS.
+    Events,
+    /// SHOW OPEN TABLES.
+    OpenTables,
+}
+
+impl fmt::Display for ShowSchemaMetadataKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::TableStatus => "TABLE STATUS",
+            Self::Triggers => "TRIGGERS",
+            Self::Events => "EVENTS",
+            Self::OpenTables => "OPEN TABLES",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Object kinds supported by `SHOW CREATE` statements.
 pub enum ShowCreateObject {
+    /// A database object for `SHOW CREATE DATABASE`.
+    Database,
     /// An event object for `SHOW CREATE EVENT`.
     Event,
     /// A function object for `SHOW CREATE FUNCTION`.
@@ -2474,6 +2706,7 @@ pub enum ShowCreateObject {
 impl fmt::Display for ShowCreateObject {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            ShowCreateObject::Database => f.write_str("DATABASE"),
             ShowCreateObject::Event => f.write_str("EVENT"),
             ShowCreateObject::Function => f.write_str("FUNCTION"),
             ShowCreateObject::Procedure => f.write_str("PROCEDURE"),
@@ -2885,6 +3118,31 @@ pub struct RaiseStatement {
     pub value: Option<RaiseStatementValue>,
 }
 
+/// A PostgreSQL anonymous code block.
+///
+/// ```sql
+/// DO [LANGUAGE language_name] code
+/// ```
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct DoStatement {
+    /// Procedural language. PostgreSQL defaults this to `plpgsql`.
+    pub language: Option<Ident>,
+    /// String or dollar-quoted source body.
+    pub body: ValueWithSpan,
+}
+
+impl fmt::Display for DoStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DO")?;
+        if let Some(language) = &self.language {
+            write!(f, " LANGUAGE {language}")?;
+        }
+        write!(f, " {}", self.body)
+    }
+}
+
 impl fmt::Display for RaiseStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let RaiseStatement { value } = self;
@@ -3243,6 +3501,18 @@ impl Display for FromTable {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Variants for the `SET` family of statements.
 pub enum Set {
+    /// PostgreSQL transaction-local constraint timing.
+    ///
+    /// ```sql
+    /// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
+    /// ```
+    SetConstraints {
+        /// `None` denotes `ALL`; otherwise these are the explicitly named
+        /// constraints in source order.
+        constraints: Option<Vec<ObjectName>>,
+        /// Whether the selected constraints become deferred.
+        deferred: bool,
+    },
     /// SQL Standard-style
     /// SET a = 1;
     /// `SET var = value` (standard SQL-style assignment).
@@ -3342,11 +3612,31 @@ pub enum Set {
         /// `true` when the `SESSION` keyword was used.
         session: bool,
     },
+    /// MySQL server-wide defaults for subsequent transactions.
+    SetGlobalTransaction {
+        /// Transaction modes (for example, isolation level or access mode).
+        modes: Vec<TransactionMode>,
+    },
 }
 
 impl Display for Set {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::SetConstraints {
+                constraints,
+                deferred,
+            } => {
+                f.write_str("SET CONSTRAINTS ")?;
+                match constraints {
+                    Some(constraints) => write!(f, "{}", display_comma_separated(constraints))?,
+                    None => f.write_str("ALL")?,
+                }
+                if *deferred {
+                    f.write_str(" DEFERRED")
+                } else {
+                    f.write_str(" IMMEDIATE")
+                }
+            }
             Self::ParenthesizedAssignments { variables, values } => write!(
                 f,
                 "SET ({}) = ({})",
@@ -3384,6 +3674,13 @@ impl Display for Set {
                 }
                 if let Some(snapshot_id) = snapshot {
                     write!(f, " SNAPSHOT {snapshot_id}")?;
+                }
+                Ok(())
+            }
+            Self::SetGlobalTransaction { modes } => {
+                write!(f, "SET GLOBAL TRANSACTION")?;
+                if !modes.is_empty() {
+                    write!(f, " {}", display_comma_separated(modes))?;
                 }
                 Ok(())
             }
@@ -3492,6 +3789,114 @@ pub struct Analyze {
     pub has_table_keyword: bool,
 }
 
+/// MySQL's logical, single-table histogram operation.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlHistogramAction {
+    /// Build a bounded sample, or install the supplied JSON literal.
+    Update {
+        /// Requested columns, in native result order.
+        columns: Vec<Ident>,
+        /// Maximum number of buckets; the native default is 100.
+        buckets: u64,
+        /// An actual literal expression, never a reparsed SQL fragment.
+        data: Option<Expr>,
+    },
+    /// Remove statistics for the requested columns.
+    Drop {
+        /// Requested columns.
+        columns: Vec<Ident>,
+    },
+}
+
+impl fmt::Display for MySqlHistogramAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update {
+                columns,
+                buckets,
+                data,
+            } => {
+                write!(
+                    f,
+                    "UPDATE HISTOGRAM ON {}",
+                    display_comma_separated(columns)
+                )?;
+                if let Some(data) = data {
+                    write!(f, " USING DATA {data}")
+                } else {
+                    write!(f, " WITH {buckets} BUCKETS")
+                }
+            }
+            Self::Drop { columns } => {
+                write!(f, "DROP HISTOGRAM ON {}", display_comma_separated(columns))
+            }
+        }
+    }
+}
+
+/// MySQL table-maintenance operation.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlTableMaintenanceOperation {
+    /// Recalculate table and index statistics with `ANALYZE TABLE`.
+    Analyze,
+    /// Check tables for errors with `CHECK TABLE`.
+    Check,
+    /// Reorganize table and index storage with `OPTIMIZE TABLE`.
+    Optimize,
+    /// Repair supported table storage with `REPAIR TABLE`.
+    Repair,
+}
+
+impl fmt::Display for MySqlTableMaintenanceOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Analyze => "ANALYZE",
+            Self::Check => "CHECK",
+            Self::Optimize => "OPTIMIZE",
+            Self::Repair => "REPAIR",
+        })
+    }
+}
+
+/// An option following a MySQL `CHECK TABLE` or `REPAIR TABLE` table list.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlCheckTableOption {
+    /// Check whether the table needs an upgrade.
+    ForUpgrade,
+    /// Check only the table's basic structure.
+    Quick,
+    /// Request the storage engine's fast check.
+    Fast,
+    /// Request the storage engine's medium check.
+    Medium,
+    /// Request the storage engine's extended check.
+    Extended,
+    /// Check only tables changed since the previous check.
+    Changed,
+    /// REPAIR's native definition-file option (not a storage repair promise).
+    UseFrm,
+}
+
+impl fmt::Display for MySqlCheckTableOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ForUpgrade => "FOR UPGRADE",
+            Self::Quick => "QUICK",
+            Self::Fast => "FAST",
+            Self::Medium => "MEDIUM",
+            Self::Extended => "EXTENDED",
+            Self::Changed => "CHANGED",
+            Self::UseFrm => "USE_FRM",
+        })
+    }
+}
+
 impl fmt::Display for Analyze {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ANALYZE")?;
@@ -3538,11 +3943,30 @@ impl fmt::Display for Analyze {
     visit(with = "visit_statement")
 )]
 pub enum Statement {
+    /// MySQL `HELP ident_or_text`. The mask retains its original grammar
+    /// node; it is neither an executable expression nor a prepared parameter.
+    Help {
+        /// A single identifier or native system-text literal.
+        mask: Expr,
+    },
     /// ```sql
     /// ANALYZE
     /// ```
     /// Analyze (Hive)
     Analyze(Analyze),
+    /// MySQL `ANALYZE|CHECK|OPTIMIZE|REPAIR TABLE table [, table ...]`.
+    MySqlTableMaintenance {
+        /// Maintenance command applied to every target table.
+        operation: MySqlTableMaintenanceOperation,
+        /// Optional binary-log suppression spelling on ANALYZE, OPTIMIZE or REPAIR.
+        location: Option<FlushLocation>,
+        /// Ordered list of tables handled by this statement.
+        tables: Vec<ObjectName>,
+        /// Options supplied to CHECK or REPAIR, in source order.
+        options: Vec<MySqlCheckTableOption>,
+        /// Optional logical histogram operation for `ANALYZE TABLE`.
+        histogram: Option<MySqlHistogramAction>,
+    },
     /// `SET` statements (session, transaction, timezone, etc.).
     Set(Set),
     /// ```sql
@@ -3569,6 +3993,14 @@ pub enum Statement {
     Install {
         /// Only for DuckDB
         extension_name: Ident,
+    },
+    /// MySQL INSTALL/UNINSTALL COMPONENT with literal component URNs.
+    /// This typed command does not grant permission to load an arbitrary DSO.
+    MySqlComponent {
+        /// True for INSTALL, false for UNINSTALL.
+        install: bool,
+        /// Original grammar's comma-separated literal URNs.
+        urns: Vec<String>,
     },
     /// ```sql
     /// LOAD
@@ -3599,6 +4031,8 @@ pub enum Statement {
     While(WhileStatement),
     /// A `RAISE` statement.
     Raise(RaiseStatement),
+    /// A PostgreSQL anonymous procedural block.
+    Do(DoStatement),
     /// ```sql
     /// CALL <function>
     /// ```
@@ -3783,15 +4217,19 @@ pub enum Statement {
     /// ALTER VIEW
     /// ```
     AlterView {
+        /// MySQL algorithm, definer, and security context.
+        params: Option<CreateViewParams>,
         /// View name being altered.
         #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
         name: ObjectName,
         /// Optional new column list for the view.
-        columns: Vec<Ident>,
+        columns: Vec<ViewColumnDef>,
         /// Replacement query for the view definition.
         query: Box<Query>,
         /// Additional WITH options for the view.
         with_options: Vec<SqlOption>,
+        /// MySQL row-validation policy.
+        check_option: Option<ViewCheckOption>,
     },
     /// ```sql
     /// ALTER FUNCTION
@@ -4044,6 +4482,9 @@ pub enum Statement {
     /// Note: this is a PostgreSQL-specific statement,
     /// but may also compatible with other SQL.
     Fetch {
+        /// True for PostgreSQL `MOVE`, which advances the cursor without
+        /// returning rows.
+        move_cursor: bool,
         /// Cursor name
         name: Ident,
         /// The fetch direction (e.g., `FORWARD`, `BACKWARD`).
@@ -4148,6 +4589,29 @@ pub enum Statement {
         show_options: ShowStatementOptions,
     },
     /// ```sql
+    /// SHOW [EXTENDED] INDEX/INDEXES/KEYS FROM table [FROM database] [WHERE expr]
+    /// ```
+    ShowIndexes {
+        /// Include native extended index information.
+        extended: bool,
+        /// The true one- or two-component table identifier.
+        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
+        table_name: ObjectName,
+        /// An explicit trailing database overrides a qualified table's database.
+        database: Option<Ident>,
+        /// Native SHOW INDEX accepts WHERE, not LIKE.
+        filter: Option<Expr>,
+    },
+    /// Native schema-scoped SHOW metadata; the database is not a SQL string marker.
+    ShowSchemaMetadata {
+        /// The metadata command requested by the user.
+        kind: ShowSchemaMetadataKind,
+        /// Optional real FROM/IN database identifier.
+        database: Option<Ident>,
+        /// Native LIKE or WHERE filter, preserving its AST source.
+        filter: Option<ShowStatementFilter>,
+    },
+    /// ```sql
     /// SHOW CATALOGS
     /// ```
     ShowCatalogs {
@@ -4177,6 +4641,19 @@ pub enum Statement {
     ShowProcessList {
         /// `true` when full process information was requested.
         full: bool,
+    },
+    /// MySQL's deprecated, session-local query profiler inspectors.
+    MySqlShowProfile {
+        /// SHOW PROFILES rather than a query's spans.
+        profiles: bool,
+        /// Native PROFILE_* bits; MEMORY does not invent any columns.
+        options: u32,
+        /// Zero selects the last retained query.
+        query_id: u32,
+        /// Native LIMIT atom, including its original parameter node.
+        limit: Option<Expr>,
+        /// Native offset atom.
+        offset: Option<Expr>,
     },
     /// ```sql
     /// SHOW SCHEMAS
@@ -4255,6 +4732,8 @@ pub enum Statement {
     StartTransaction {
         /// Transaction modes such as `ISOLATION LEVEL` or `READ WRITE`.
         modes: Vec<TransactionMode>,
+        /// MySQL `WITH CONSISTENT SNAPSHOT` transaction characteristic.
+        consistent_snapshot: Option<StartTransactionSnapshot>,
         /// `true` when this was parsed as `BEGIN` instead of `START`.
         begin: bool,
         /// Optional specific keyword used: `TRANSACTION` or `WORK`.
@@ -4297,6 +4776,10 @@ pub enum Statement {
         object_type: CommentObject,
         /// Name of the object the comment applies to.
         object_name: ObjectName,
+        /// Exact input signature for FUNCTION/PROCEDURE targets. `Some` also
+        /// distinguishes an explicitly empty `()` signature from non-routine
+        /// comment targets.
+        routine_arguments: Option<Vec<OperateFunctionArg>>,
         /// Optional comment text (None to remove comment).
         comment: Option<String>,
         /// An optional `IF EXISTS` clause. (Non-standard.)
@@ -4304,7 +4787,7 @@ pub enum Statement {
         if_exists: bool,
     },
     /// ```sql
-    /// COMMIT [ TRANSACTION | WORK ] [ AND [ NO ] CHAIN ]
+    /// COMMIT [ TRANSACTION | WORK ] [AND [NO] CHAIN | [NO] RELEASE]
     /// ```
     /// If `end` is false
     ///
@@ -4313,19 +4796,20 @@ pub enum Statement {
     /// ```
     /// If `end` is true
     Commit {
-        /// `true` when `AND [ NO ] CHAIN` was present.
-        chain: bool,
+        /// Explicit completion behavior, or `Default` when omitted.
+        completion: TransactionCompletion,
         /// `true` when this `COMMIT` was parsed as an `END` block terminator.
         end: bool,
         /// Optional transaction modifier for commit semantics.
         modifier: Option<TransactionModifier>,
     },
     /// ```sql
-    /// ROLLBACK [ TRANSACTION | WORK ] [ AND [ NO ] CHAIN ] [ TO [ SAVEPOINT ] savepoint_name ]
+    /// ROLLBACK [ TRANSACTION | WORK ] [AND [NO] CHAIN | [NO] RELEASE]
+    /// [ TO [ SAVEPOINT ] savepoint_name ]
     /// ```
     Rollback {
-        /// `true` when `AND [ NO ] CHAIN` was present.
-        chain: bool,
+        /// Explicit completion behavior, or `Default` when omitted.
+        completion: TransactionCompletion,
         /// Optional savepoint name to roll back to.
         savepoint: Option<Ident>,
     },
@@ -4438,18 +4922,7 @@ pub enum Statement {
     /// ```sql
     /// CREATE PROCEDURE
     /// ```
-    CreateProcedure {
-        /// `OR ALTER` flag.
-        or_alter: bool,
-        /// Procedure name.
-        name: ObjectName,
-        /// Optional procedure parameters.
-        params: Option<Vec<ProcedureParam>>,
-        /// Optional language identifier.
-        language: Option<Ident>,
-        /// Procedure body statements.
-        body: ConditionalStatements,
-    },
+    CreateProcedure(CreateProcedure),
     /// ```sql
     /// CREATE MACRO
     /// ```
@@ -4848,6 +5321,9 @@ pub enum Statement {
         /// Optional table format information.
         table_format: Option<HiveLoadDataFormat>,
     },
+    /// Native MySQL LOAD DATA/XML. This is not Hive's LOAD DATA INPATH.
+    /// Raw text stays in its owning production; SET expressions are visited.
+    MySqlLoadData(MySqlLoadData),
     /// ```sql
     /// Rename TABLE tbl_name TO new_tbl_name[, tbl_name2 TO new_tbl_name2] ...
     /// ```
@@ -5033,6 +5509,7 @@ impl fmt::Display for Statement {
     #[allow(clippy::cognitive_complexity)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Statement::Help { mask } => write!(f, "HELP {mask}"),
             Statement::Flush {
                 object_type,
                 location,
@@ -5132,12 +5609,17 @@ impl fmt::Display for Statement {
                 write!(f, "{}", display_separated(stmts, "; "))
             }
             Statement::Fetch {
+                move_cursor,
                 name,
                 direction,
                 position,
                 into,
             } => {
-                write!(f, "FETCH {direction} {position} {name}")?;
+                write!(
+                    f,
+                    "{} {direction} {position} {name}",
+                    if *move_cursor { "MOVE" } else { "FETCH" }
+                )?;
 
                 if let Some(into) = into {
                     write!(f, " INTO {into}")?;
@@ -5176,6 +5658,9 @@ impl fmt::Display for Statement {
                 write!(f, "{stmt}")
             }
             Statement::Raise(stmt) => {
+                write!(f, "{stmt}")
+            }
+            Statement::Do(stmt) => {
                 write!(f, "{stmt}")
             }
             Statement::AttachDatabase {
@@ -5221,10 +5706,44 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Analyze(analyze) => analyze.fmt(f),
+            Statement::MySqlTableMaintenance {
+                operation,
+                location,
+                tables,
+                options,
+                histogram,
+            } => {
+                write!(f, "{operation}")?;
+                if let Some(location) = location {
+                    write!(f, " {location}")?;
+                }
+                write!(f, " TABLE {}", display_comma_separated(tables))?;
+                for option in options {
+                    write!(f, " {option}")?;
+                }
+                if let Some(histogram) = histogram {
+                    write!(f, " {histogram}")?;
+                }
+                Ok(())
+            }
             Statement::Insert(insert) => insert.fmt(f),
             Statement::Install {
                 extension_name: name,
             } => write!(f, "INSTALL {name}"),
+            Statement::MySqlComponent { install, urns } => {
+                write!(
+                    f,
+                    "{} COMPONENT ",
+                    if *install { "INSTALL" } else { "UNINSTALL" }
+                )?;
+                for (ordinal, urn) in urns.iter().enumerate() {
+                    if ordinal != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "'{}'", urn.replace('\'', "''"))?;
+                }
+                Ok(())
+            }
 
             Statement::Load {
                 extension_name: name,
@@ -5394,32 +5913,7 @@ impl fmt::Display for Statement {
             Statement::CreateDomain(create_domain) => create_domain.fmt(f),
             Statement::CreateTrigger(create_trigger) => create_trigger.fmt(f),
             Statement::DropTrigger(drop_trigger) => drop_trigger.fmt(f),
-            Statement::CreateProcedure {
-                name,
-                or_alter,
-                params,
-                language,
-                body,
-            } => {
-                write!(
-                    f,
-                    "CREATE {or_alter}PROCEDURE {name}",
-                    or_alter = if *or_alter { "OR ALTER " } else { "" },
-                    name = name
-                )?;
-
-                if let Some(p) = params {
-                    if !p.is_empty() {
-                        write!(f, " ({})", display_comma_separated(p))?;
-                    }
-                }
-
-                if let Some(language) = language {
-                    write!(f, " LANGUAGE {language}")?;
-                }
-
-                write!(f, " AS {body}")
-            }
+            Statement::CreateProcedure(procedure) => procedure.fmt(f),
             Statement::CreateMacro {
                 or_replace,
                 temporary,
@@ -5444,6 +5938,7 @@ impl fmt::Display for Statement {
             }
             Statement::CreateView(create_view) => create_view.fmt(f),
             Statement::CreateTable(create_table) => create_table.fmt(f),
+            Statement::MySqlLoadData(load) => load.fmt(f),
             Statement::LoadData {
                 local,
                 inpath,
@@ -5554,19 +6049,29 @@ impl fmt::Display for Statement {
                 write!(f, "ALTER INDEX {name} {operation}")
             }
             Statement::AlterView {
+                params,
                 name,
                 columns,
                 query,
                 with_options,
+                check_option,
             } => {
-                write!(f, "ALTER VIEW {name}")?;
+                write!(f, "ALTER ")?;
+                if let Some(params) = params {
+                    params.fmt(f)?;
+                }
+                write!(f, "VIEW {name}")?;
                 if !with_options.is_empty() {
                     write!(f, " WITH ({})", display_comma_separated(with_options))?;
                 }
                 if !columns.is_empty() {
                     write!(f, " ({})", display_comma_separated(columns))?;
                 }
-                write!(f, " AS {query}")
+                write!(f, " AS {query}")?;
+                if let Some(check_option) = check_option {
+                    write!(f, " {check_option}")?;
+                }
+                Ok(())
             }
             Statement::AlterFunction(alter_function) => write!(f, "{alter_function}"),
             Statement::AlterType(AlterType { name, operation }) => {
@@ -5781,6 +6286,39 @@ impl fmt::Display for Statement {
                 )?;
                 Ok(())
             }
+            Statement::ShowSchemaMetadata {
+                kind,
+                database,
+                filter,
+            } => {
+                write!(f, "SHOW {kind}")?;
+                if let Some(database) = database {
+                    write!(f, " FROM {database}")?;
+                }
+                if let Some(filter) = filter {
+                    write!(f, " {filter}")?;
+                }
+                Ok(())
+            }
+            Statement::ShowIndexes {
+                extended,
+                table_name,
+                database,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "SHOW {}INDEX FROM {table_name}",
+                    if *extended { "EXTENDED " } else { "" }
+                )?;
+                if let Some(database) = database {
+                    write!(f, " FROM {database}")?;
+                }
+                if let Some(filter) = filter {
+                    write!(f, " WHERE {filter}")?;
+                }
+                Ok(())
+            }
             Statement::ShowDatabases {
                 terse,
                 history,
@@ -5813,6 +6351,48 @@ impl fmt::Display for Statement {
                     "SHOW {full}PROCESSLIST",
                     full = if *full { "FULL " } else { "" },
                 )?;
+                Ok(())
+            }
+            Statement::MySqlShowProfile {
+                profiles,
+                options,
+                query_id,
+                limit,
+                offset,
+            } => {
+                if *profiles {
+                    return write!(f, "SHOW PROFILES");
+                }
+                write!(f, "SHOW PROFILE")?;
+                if *options == u32::MAX {
+                    write!(f, " ALL")?;
+                } else {
+                    let mut separator = " ";
+                    for (mask, name) in [
+                        (1, "CPU"),
+                        (2, "MEMORY"),
+                        (4, "BLOCK IO"),
+                        (8, "CONTEXT SWITCHES"),
+                        (16, "PAGE FAULTS"),
+                        (32, "IPC"),
+                        (64, "SWAPS"),
+                        (65536, "SOURCE"),
+                    ] {
+                        if options & mask != 0 {
+                            write!(f, "{separator}{name}")?;
+                            separator = ", ";
+                        }
+                    }
+                }
+                if *query_id != 0 {
+                    write!(f, " FOR QUERY {query_id}")?;
+                }
+                if let Some(limit) = limit {
+                    write!(f, " LIMIT {limit}")?;
+                    if let Some(offset) = offset {
+                        write!(f, " OFFSET {offset}")?;
+                    }
+                }
                 Ok(())
             }
             Statement::ShowSchemas {
@@ -5889,6 +6469,7 @@ impl fmt::Display for Statement {
             Statement::ShowCharset(show_stm) => show_stm.fmt(f),
             Statement::StartTransaction {
                 modes,
+                consistent_snapshot,
                 begin: syntax_begin,
                 transaction,
                 modifier,
@@ -5911,6 +6492,12 @@ impl fmt::Display for Statement {
                 if !modes.is_empty() {
                     write!(f, " {}", display_comma_separated(modes))?;
                 }
+                if consistent_snapshot.is_some() {
+                    if !modes.is_empty() {
+                        write!(f, ",")?;
+                    }
+                    write!(f, " WITH CONSISTENT SNAPSHOT")?;
+                }
                 if !statements.is_empty() {
                     write!(f, " ")?;
                     format_statement_list(f, statements)?;
@@ -5927,7 +6514,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Commit {
-                chain,
+                completion,
                 end: end_syntax,
                 modifier,
             } => {
@@ -5936,20 +6523,17 @@ impl fmt::Display for Statement {
                     if let Some(modifier) = *modifier {
                         write!(f, " {modifier}")?;
                     }
-                    if *chain {
-                        write!(f, " AND CHAIN")?;
-                    }
+                    write!(f, "{completion}")?;
                 } else {
-                    write!(f, "COMMIT{}", if *chain { " AND CHAIN" } else { "" })?;
+                    write!(f, "COMMIT{completion}")?;
                 }
                 Ok(())
             }
-            Statement::Rollback { chain, savepoint } => {
-                write!(f, "ROLLBACK")?;
-
-                if *chain {
-                    write!(f, " AND CHAIN")?;
-                }
+            Statement::Rollback {
+                completion,
+                savepoint,
+            } => {
+                write!(f, "ROLLBACK{completion}")?;
 
                 if let Some(savepoint) = savepoint {
                     write!(f, " TO SAVEPOINT {savepoint}")?;
@@ -6057,6 +6641,7 @@ impl fmt::Display for Statement {
             Statement::Comment {
                 object_type,
                 object_name,
+                routine_arguments,
                 comment,
                 if_exists,
             } => {
@@ -6064,7 +6649,11 @@ impl fmt::Display for Statement {
                 if *if_exists {
                     write!(f, "IF EXISTS ")?
                 };
-                write!(f, "ON {object_type} {object_name} IS ")?;
+                write!(f, "ON {object_type} {object_name}")?;
+                if let Some(arguments) = routine_arguments {
+                    write!(f, "({})", display_comma_separated(arguments))?;
+                }
+                write!(f, " IS ")?;
                 if let Some(c) = comment {
                     write!(f, "'{c}'")
                 } else {
@@ -6669,6 +7258,26 @@ impl Display for BeginTransactionKind {
             BeginTransactionKind::Work => write!(f, "WORK"),
             BeginTransactionKind::Tran => write!(f, "TRAN"),
         }
+    }
+}
+
+/// Source tokens for MySQL `WITH CONSISTENT SNAPSHOT`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct StartTransactionSnapshot {
+    /// Source token for `WITH`.
+    pub with_token: AttachedToken,
+    /// Source token for `CONSISTENT`.
+    pub consistent_token: AttachedToken,
+    /// Source token for `SNAPSHOT`.
+    pub snapshot_token: AttachedToken,
+}
+
+impl StartTransactionSnapshot {
+    /// Return the source span from `WITH` through `SNAPSHOT`.
+    pub fn span(&self) -> Span {
+        self.with_token.0.span.union(&self.snapshot_token.0.span)
     }
 }
 
@@ -8042,13 +8651,34 @@ impl fmt::Display for TypedString {
     }
 }
 
+/// Provenance of a function call, independent of its printable SQL spelling.
+/// Parsers always create source calls. Only an AST producer can mark a lowered
+/// execution symbol; printing and parsing SQL cannot confer that authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum FunctionOrigin {
+    /// A call parsed from SQL; its spelling grants no execution authority.
+    #[default]
+    Source,
+    /// An execution call created by a trusted AST binder or lowerer.
+    Compiler,
+}
+
 /// A function call
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct Function {
+    /// Original literal grammar naming only, not an executable argument or a
+    /// serializable compiler credential. The inert wrapper retains the source
+    /// admission on clone; detached definitions must reissue their own fact.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub mysql_literal_source: Option<MySqlProjectionLiteral>,
     /// The function name (may be qualified).
     pub name: ObjectName,
+    /// Non-SQL provenance, retained when the AST is cloned or serialized.
+    pub origin: FunctionOrigin,
     /// Flags whether this function call uses the [ODBC syntax].
     ///
     /// Example:
@@ -8082,6 +8712,8 @@ pub struct Function {
     ///
     /// [Snowflake](https://docs.snowflake.com/en/sql-reference/functions/first_value)
     pub null_treatment: Option<NullTreatment>,
+    /// NTH_VALUE's origin, before NULL treatment and the OVER clause.
+    pub from_first_last: Option<FromFirstLast>,
     /// The `OVER` clause, indicating a window function call.
     pub over: Option<WindowType>,
     /// A clause used with certain aggregate functions to control the ordering
@@ -8114,6 +8746,9 @@ impl fmt::Display for Function {
             write!(f, " FILTER (WHERE {filter_cond})")?;
         }
 
+        if let Some(from_first_last) = self.from_first_last {
+            write!(f, " {from_first_last}")?;
+        }
         if let Some(null_treatment) = &self.null_treatment {
             write!(f, " {null_treatment}")?;
         }
@@ -8191,6 +8826,8 @@ impl fmt::Display for FunctionArgumentList {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Clauses that can appear inside a function argument list.
 pub enum FunctionArgumentClause {
+    /// MySQL character-set clause used by `CHAR(... USING charset)`.
+    UsingCharacterSet(Ident),
     /// Indicates how `NULL`s should be handled in the calculation, e.g. in `FIRST_VALUE` on [BigQuery].
     ///
     /// Syntax:
@@ -8238,6 +8875,9 @@ pub enum FunctionArgumentClause {
 impl fmt::Display for FunctionArgumentClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FunctionArgumentClause::UsingCharacterSet(charset) => {
+                write!(f, "USING {charset}")
+            }
             FunctionArgumentClause::IgnoreOrRespectNulls(null_treatment) => {
                 write!(f, "{null_treatment}")
             }
@@ -8520,6 +9160,36 @@ pub enum KillType {
     Mutation,
 }
 
+/// Explicit completion clause attached to COMMIT or ROLLBACK.
+#[derive(Debug, Copy, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum TransactionCompletion {
+    /// No explicit chaining or release clause.
+    #[default]
+    Default,
+    /// `AND CHAIN`, which begins another transaction after completion.
+    Chain,
+    /// `AND NO CHAIN`, which explicitly suppresses transaction chaining.
+    NoChain,
+    /// `RELEASE`, which disconnects the session after completion.
+    Release,
+    /// `NO RELEASE`, which explicitly keeps the session connected.
+    NoRelease,
+}
+
+impl fmt::Display for TransactionCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "",
+            Self::Chain => " AND CHAIN",
+            Self::NoChain => " AND NO CHAIN",
+            Self::Release => " RELEASE",
+            Self::NoRelease => " NO RELEASE",
+        })
+    }
+}
+
 impl fmt::Display for KillType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
@@ -8581,6 +9251,260 @@ pub struct HiveLoadDataFormat {
     pub serde: Expr,
     /// Input format expression.
     pub input_format: Expr,
+}
+
+/// Native sql_yacc.yy load_stmt. Absent options are not materialized defaults;
+/// the later LOAD consumer applies native defaults at its actual phase.
+/// This is a syntax description, not authorization for file, URL, LOCAL,
+/// bulk-load, table or partition access.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlLoadData {
+    /// Whether the source production was LOAD XML rather than LOAD DATA.
+    pub xml: bool,
+    /// Explicit lock-priority modifier, or its absent/default syntax state.
+    pub lock: MySqlLoadLock,
+    /// Whether the optional FROM keyword appeared before the source form.
+    pub from_keyword: bool,
+    /// Whether LOCAL was specified; permission and transport are consumer policy.
+    pub local: bool,
+    /// The actual INFILE or URL grammar spelling, without initiating any I/O.
+    pub source_type: MySqlLoadSourceType,
+    /// Source filename/URL literal with span and, for byte input, filesystem-role
+    /// text retaining its admitted original source and charset facts.
+    pub filename: ValueWithSpan,
+    /// Explicit COUNT value, or `None` when that clause was absent.
+    pub source_count: Option<u64>,
+    /// Whether IN PRIMARY KEY ORDER was explicitly requested.
+    pub primary_key_order: bool,
+    /// Duplicate-row clause; this records syntax, not a completed mutation policy.
+    pub duplicate: MySqlLoadDuplicate,
+    #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
+    /// Destination relation name; resolution and write permission are not implied.
+    pub table: ObjectName,
+    /// Explicit PARTITION names, preserving their identifier spelling and order.
+    pub partitions: Vec<Ident>,
+    /// Explicit CHARACTER SET expression, not an inferred default file charset.
+    pub character_set: Option<Expr>,
+    /// Optional XML ROWS IDENTIFIED BY literal, retaining its actual text role.
+    pub xml_rows_identified_by: Option<ValueWithSpan>,
+    /// Ordered explicit FIELDS/COLUMNS clauses; absent native defaults are omitted.
+    pub fields: Vec<MySqlLoadFieldOption>,
+    /// Ordered explicit LINES clauses, without materializing consumer defaults.
+    pub lines: Vec<MySqlLoadLineOption>,
+    /// Number and the actual LINES(false)/ROWS(true) grammar word.
+    pub ignore: Option<(u64, bool)>,
+    /// Explicit input list. `None` differs from an explicitly present empty list;
+    /// user-variable inputs are not table-column identities.
+    pub inputs: Option<Vec<MySqlLoadInput>>,
+    /// Actual SET assignments in source order, with their source/CPP provenance.
+    pub assignments: Vec<MySqlLoadAssignment>,
+    /// Whether BULK was present; this does not grant bulk or external access.
+    pub bulk: bool,
+}
+
+/// Native LOAD priority/locking syntax, before execution-layer lock selection.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadLock {
+    /// No explicit priority or concurrency modifier was supplied.
+    Default,
+    /// LOW_PRIORITY was explicitly supplied.
+    LowPriority,
+    /// CONCURRENT was explicitly supplied.
+    Concurrent,
+}
+/// Native LOAD source form; neither variant grants filesystem or network access.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadSourceType {
+    /// INFILE spelling, whose local/server-side interpretation is separate.
+    Infile,
+    /// URL spelling, retained as syntax without performing an external download.
+    Url,
+}
+/// Native LOAD duplicate-row clause, to be applied by the actual mutation owner.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadDuplicate {
+    /// Neither REPLACE nor IGNORE was supplied.
+    Error,
+    /// REPLACE was explicitly requested.
+    Replace,
+    /// IGNORE was explicitly requested.
+    Ignore,
+}
+/// One explicit native FIELDS/COLUMNS option, retaining its literal bytes and span.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadFieldOption {
+    /// TERMINATED BY literal before the reader's character-domain policy.
+    TerminatedBy(ValueWithSpan),
+    /// ENCLOSED BY clause, including whether enclosure is optional.
+    EnclosedBy {
+        /// Whether OPTIONALLY preceded ENCLOSED BY.
+        optionally: bool,
+        /// Actual enclosure literal; no byte-width or runtime default is inferred.
+        value: ValueWithSpan,
+    },
+    /// ESCAPED BY literal; an explicit empty value is not an omitted clause.
+    EscapedBy(ValueWithSpan),
+}
+/// One explicit native LINES option, retaining the original literal facts.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadLineOption {
+    /// STARTING BY line-prefix literal.
+    StartingBy(ValueWithSpan),
+    /// TERMINATED BY line-ending literal.
+    TerminatedBy(ValueWithSpan),
+}
+/// A native LOAD input slot before column resolution or user-variable admission.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlLoadInput {
+    /// Column target retaining its qualified identifier components.
+    Column(ObjectName),
+    /// Decoded user-variable identifier; its value does not include a synthetic
+    /// leading `@`, and native admission/name policy belongs to the consumer.
+    UserVariable(Ident),
+    /// TEXT_STRING_sys before the consumer's native name policy. No decoded
+    /// mirror is manufactured for unrepresentable raw system text.
+    RawUserVariable(MySqlText),
+}
+/// One native LOAD SET assignment and its optional original-source provenance.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlLoadAssignment {
+    /// Actual target and RHS expression, retaining the existing typed AST.
+    pub assignment: Assignment,
+    /// Original byte occurrence for byte-source parsing, absent for decoded input.
+    /// A deserialized range requires checked reattachment before byte access.
+    pub source_occurrence: Option<SqlSourceOccurrence>,
+    /// Half-open indices into the parsed statement's real CPP piece ledger,
+    /// not a regenerated RHS string or a separate byte allocation.
+    pub cpp_piece_range: Option<SqlCppPieceRange>,
+}
+
+impl Display for MySqlLoadInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column(name) => name.fmt(f),
+            Self::UserVariable(name) => write!(f, "@{name}"),
+            Self::RawUserVariable(name) => write!(f, "@{name}"),
+        }
+    }
+}
+impl Display for MySqlLoadFieldOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TerminatedBy(value) => write!(f, "TERMINATED BY {value}"),
+            Self::EnclosedBy { optionally, value } => write!(
+                f,
+                "{}ENCLOSED BY {value}",
+                if *optionally { "OPTIONALLY " } else { "" }
+            ),
+            Self::EscapedBy(value) => write!(f, "ESCAPED BY {value}"),
+        }
+    }
+}
+impl Display for MySqlLoadLineOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StartingBy(value) => write!(f, "STARTING BY {value}"),
+            Self::TerminatedBy(value) => write!(f, "TERMINATED BY {value}"),
+        }
+    }
+}
+impl Display for MySqlLoadData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LOAD {}", if self.xml { "XML" } else { "DATA" })?;
+        match self.lock {
+            MySqlLoadLock::Default => {}
+            MySqlLoadLock::LowPriority => write!(f, " LOW_PRIORITY")?,
+            MySqlLoadLock::Concurrent => write!(f, " CONCURRENT")?,
+        }
+        if self.from_keyword {
+            write!(f, " FROM")?;
+        }
+        if self.local {
+            write!(f, " LOCAL")?;
+        }
+        write!(
+            f,
+            " {} {}",
+            if matches!(self.source_type, MySqlLoadSourceType::Infile) {
+                "INFILE"
+            } else {
+                "URL"
+            },
+            self.filename
+        )?;
+        if let Some(count) = self.source_count {
+            write!(f, " COUNT {count}")?;
+        }
+        if self.primary_key_order {
+            write!(f, " IN PRIMARY KEY ORDER")?;
+        }
+        match self.duplicate {
+            MySqlLoadDuplicate::Error => {}
+            MySqlLoadDuplicate::Replace => write!(f, " REPLACE")?,
+            MySqlLoadDuplicate::Ignore => write!(f, " IGNORE")?,
+        }
+        write!(f, " INTO TABLE {}", self.table)?;
+        if !self.partitions.is_empty() {
+            write!(
+                f,
+                " PARTITION ({})",
+                display_comma_separated(&self.partitions)
+            )?;
+        }
+        if let Some(cs) = &self.character_set {
+            write!(f, " CHARACTER SET {cs}")?;
+        }
+        if let Some(value) = &self.xml_rows_identified_by {
+            write!(f, " ROWS IDENTIFIED BY {value}")?;
+        }
+        if !self.fields.is_empty() {
+            write!(f, " FIELDS")?;
+        }
+        for field in &self.fields {
+            write!(f, " {field}")?;
+        }
+        if !self.lines.is_empty() {
+            write!(f, " LINES")?;
+        }
+        for line in &self.lines {
+            write!(f, " {line}")?;
+        }
+        if let Some((count, rows)) = self.ignore {
+            write!(f, " IGNORE {count} {}", if rows { "ROWS" } else { "LINES" })?;
+        }
+        if let Some(inputs) = &self.inputs {
+            write!(f, " ({})", display_comma_separated(inputs))?;
+        }
+        if !self.assignments.is_empty() {
+            write!(f, " SET ")?;
+            for (index, item) in self.assignments.iter().enumerate() {
+                if index > 0 {
+                    write!(f, ", ")?;
+                }
+                item.assignment.fmt(f)?;
+            }
+        }
+        if self.bulk {
+            write!(f, " ALGORITHM = BULK")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -8882,6 +9806,9 @@ impl fmt::Display for SqlOption {
                 }
                 CommentDef::WithoutEq(comment) => {
                     write!(f, "COMMENT '{comment}'")
+                }
+                CommentDef::MySql { has_eq, text } => {
+                    write!(f, "COMMENT {}{text}", if *has_eq { "= " } else { "" })
                 }
             },
             SqlOption::NamedParenthesizedList(value) => {
@@ -9255,6 +10182,7 @@ pub enum CopySource {
     /// Copy from a table with optional column list.
     Table {
         /// The name of the table to copy from.
+        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
         table_name: ObjectName,
         /// A list of column names to copy. Empty list means that all columns
         /// are copied.
@@ -10168,6 +11096,8 @@ pub enum CreateFunctionBody {
     ///
     /// [MsSql]: https://learn.microsoft.com/en-us/sql/t-sql/statements/create-function-transact-sql
     AsBeginEnd(BeginEndStatements),
+    /// PostgreSQL SQL-standard routine body, bound when the routine is created.
+    BeginAtomic(BeginEndStatements),
     /// Function body expression using the 'RETURN' keyword.
     ///
     /// Example:
@@ -10675,12 +11605,20 @@ pub enum CommentDef {
     WithEq(String),
     /// Comment variant that omits the `=` when displayed.
     WithoutEq(String),
+    /// TEXT_STRING_sys retained before its actual consumer conversion policy.
+    MySql {
+        /// Whether the original COMMENT clause included an equals sign.
+        has_eq: bool,
+        /// Admitted system-role text before the comment consumer's conversion.
+        text: MySqlText,
+    },
 }
 
 impl Display for CommentDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment) => write!(f, "{comment}"),
+            CommentDef::MySql { text, .. } => text.fmt(f),
         }
     }
 }
@@ -11811,19 +12749,63 @@ pub enum CreateTableLikeKind {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Controls whether defaults are included when creating a table FROM/LILE another.
-pub enum CreateTableLikeDefaults {
-    /// Include default values from the source table.
-    Including,
-    /// Exclude default values from the source table.
-    Excluding,
+/// One PostgreSQL `CREATE TABLE ... LIKE` copy category.
+pub enum CreateTableLikeOptionKind {
+    /// Copy comments on copied columns, constraints, and indexes.
+    Comments,
+    /// Copy per-column compression methods.
+    Compression,
+    /// Copy `CHECK` constraints.
+    Constraints,
+    /// Copy column default expressions.
+    Defaults,
+    /// Copy generated-column expressions.
+    Generated,
+    /// Copy identity-column properties with new owned sequences.
+    Identity,
+    /// Copy indexes and their associated primary-key and unique constraints.
+    Indexes,
+    /// Copy per-column statistics targets.
+    Statistics,
+    /// Copy per-column storage modes.
+    Storage,
+    /// Select every copy category.
+    All,
 }
 
-impl fmt::Display for CreateTableLikeDefaults {
+impl fmt::Display for CreateTableLikeOptionKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::Comments => "COMMENTS",
+            Self::Compression => "COMPRESSION",
+            Self::Constraints => "CONSTRAINTS",
+            Self::Defaults => "DEFAULTS",
+            Self::Generated => "GENERATED",
+            Self::Identity => "IDENTITY",
+            Self::Indexes => "INDEXES",
+            Self::Statistics => "STATISTICS",
+            Self::Storage => "STORAGE",
+            Self::All => "ALL",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+/// One ordered `INCLUDING` or `EXCLUDING` clause on a table-like definition.
+pub enum CreateTableLikeOption {
+    /// Include the selected category.
+    Including(CreateTableLikeOptionKind),
+    /// Exclude the selected category.
+    Excluding(CreateTableLikeOptionKind),
+}
+
+impl fmt::Display for CreateTableLikeOption {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            CreateTableLikeDefaults::Including => write!(f, "INCLUDING DEFAULTS"),
-            CreateTableLikeDefaults::Excluding => write!(f, "EXCLUDING DEFAULTS"),
+            Self::Including(kind) => write!(f, "INCLUDING {kind}"),
+            Self::Excluding(kind) => write!(f, "EXCLUDING {kind}"),
         }
     }
 }
@@ -11835,15 +12817,15 @@ impl fmt::Display for CreateTableLikeDefaults {
 pub struct CreateTableLike {
     /// The source table name to copy the schema from.
     pub name: ObjectName,
-    /// Optional behavior controlling whether defaults are copied.
-    pub defaults: Option<CreateTableLikeDefaults>,
+    /// Ordered copy options. Later clauses override earlier `INCLUDING ALL`.
+    pub options: Vec<CreateTableLikeOption>,
 }
 
 impl fmt::Display for CreateTableLike {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "LIKE {}", self.name)?;
-        if let Some(defaults) = &self.defaults {
-            write!(f, " {defaults}")?;
+        for option in &self.options {
+            write!(f, " {option}")?;
         }
         Ok(())
     }
@@ -11997,10 +12979,33 @@ pub struct OptimizerHint {
     pub style: OptimizerHintStyle,
 }
 
-/// The commentary style of an [optimizer hint](OptimizerHint)
+/// A parsed instruction from the existing native hint consumer. These are
+/// declaration facts, not another hint executor or a Source capability.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlHintDirective {
+    /// Native SET_VAR name and its already parsed literal Item.
+    Variable(String, Expr),
+    /// Native MAX_EXECUTION_TIME integer instruction.
+    MaxExecutionTime(u64),
+    /// Native first-valid name of the original query block. Copies borrow
+    /// this same immutable spelling; it is not a query-block identifier issuer.
+    QueryBlockName(String),
+    /// Native table/index range instruction with its actual optional QB name.
+    NoRangeOptimization {
+        /// Actual optional QB name, from the original @ token.
+        query_block: Option<String>,
+        /// Actual table alias token in the selected query block.
+        table: String,
+        /// Actual requested index tokens; empty means all keys.
+        indexes: Vec<String>,
+    },
+}
+
+/// The commentary style of an [optimizer hint](OptimizerHint)
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum OptimizerHintStyle {
     /// A hint corresponding to a single line comment,
     /// e.g. `--+ LEADING(v.e v.d t)`
@@ -12011,6 +13016,183 @@ pub enum OptimizerHintStyle {
     /// A hint corresponding to a multi line comment,
     /// e.g. `/*+ LEADING(v.e v.d t) */`
     MultiLine,
+    /// Original admitted native comment, not yet an executable hint program.
+    MySqlSource(SqlSourceOccurrence),
+    /// Bound state of the same original comment. Typed prefix and conversion
+    /// leases belong to its one consumer; client collation is an Item fact.
+    MySqlBoundSource {
+        /// The original checked comment in its admitted packet owner.
+        source: SqlSourceOccurrence,
+        /// The original comment occurrence, not a rendered/system-text copy.
+        text: SqlSourceOccurrence,
+        /// Captured native client charset's default collation identifier.
+        client_collation: u16,
+        /// Captured lexical mode used by the original native hint scanner.
+        ansi_quotes: bool,
+        /// Original consumer's immutable typed prefix, shared by cache/copies.
+        directives: Arc<Vec<MySqlHintDirective>>,
+        /// Reached grammar condition, already issued by the original Source.
+        syntax: Arc<Vec<(usize, String)>>,
+        /// Original Source budget leases for this immutable typed program.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        admission: Option<SqlSourceAdmission>,
+        /// Known instruction lacking an executable consumer; not a fake hint.
+        unsupported: Option<Arc<str>>,
+    },
+    /// Parsed native range-access instruction attached to its original query
+    /// block. An empty index list applies to all of the selected table's keys.
+    /// This is a bind-time instruction, not a second unparsed hint comment.
+    MySqlNoRangeOptimization {
+        /// First-valid QB_NAME from this original target SELECT's typed
+        /// comment owner. This is display/resolution context, not authority.
+        query_block_name: Option<(Arc<Vec<MySqlHintDirective>>, usize)>,
+        /// Original range and named-QB allocation leases. These are physical
+        /// custody, not logical comparison facts or serialized authority.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source_admissions: (Option<SqlSourceAdmission>, Option<SqlSourceAdmission>),
+        /// Public table alias in this query block.
+        table: String,
+        /// Native index names, including PRIMARY when explicitly selected.
+        indexes: Vec<String>,
+        /// Only the fresh Source binding may publish unresolved-name warnings.
+        /// Rebinding EXECUTE and the final lowerer consume the same policy only.
+        resolve_conditions: bool,
+    },
+    /// A typed MySQL modifier between `DELETE` and its target list.
+    MySqlDeleteModifier(MySqlDeleteModifier),
+}
+
+// Allocation leases are not logical facts or serialization authority. The
+// original Source occurrence itself deserializes detached and must reattach.
+impl OptimizerHintStyle {
+    fn ordinal(&self) -> u8 {
+        match self {
+            Self::SingleLine { .. } => 0,
+            Self::MultiLine => 1,
+            Self::MySqlSource(_) => 2,
+            Self::MySqlBoundSource { .. } => 3,
+            Self::MySqlNoRangeOptimization { .. } => 4,
+            Self::MySqlDeleteModifier(_) => 5,
+        }
+    }
+}
+impl PartialEq for OptimizerHintStyle {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for OptimizerHintStyle {}
+impl PartialOrd for OptimizerHintStyle {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OptimizerHintStyle {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use OptimizerHintStyle as S;
+        let order = self.ordinal().cmp(&other.ordinal());
+        if !order.is_eq() {
+            return order;
+        }
+        match (self, other) {
+            (S::SingleLine { prefix: a }, S::SingleLine { prefix: b }) => a.cmp(b),
+            (S::MySqlSource(a), S::MySqlSource(b)) => a.cmp(b),
+            (
+                S::MySqlBoundSource {
+                    source: a,
+                    text: b,
+                    client_collation: c,
+                    ansi_quotes: d,
+                    directives: e,
+                    syntax: f,
+                    unsupported: g,
+                    ..
+                },
+                S::MySqlBoundSource {
+                    source: h,
+                    text: i,
+                    client_collation: j,
+                    ansi_quotes: k,
+                    directives: l,
+                    syntax: m,
+                    unsupported: n,
+                    ..
+                },
+            ) => (a, b, c, d, e, f, g).cmp(&(h, i, j, k, l, m, n)),
+            (
+                S::MySqlNoRangeOptimization {
+                    query_block_name: n,
+                    table: a,
+                    indexes: b,
+                    resolve_conditions: c,
+                    ..
+                },
+                S::MySqlNoRangeOptimization {
+                    query_block_name: o,
+                    table: d,
+                    indexes: e,
+                    resolve_conditions: f,
+                    ..
+                },
+            ) => (n, a, b, c).cmp(&(o, d, e, f)),
+            (S::MySqlDeleteModifier(a), S::MySqlDeleteModifier(b)) => a.cmp(b),
+            _ => core::cmp::Ordering::Equal,
+        }
+    }
+}
+impl core::hash::Hash for OptimizerHintStyle {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        use core::hash::Hash;
+        self.ordinal().hash(state);
+        match self {
+            Self::SingleLine { prefix } => prefix.hash(state),
+            Self::MultiLine => (),
+            Self::MySqlSource(source) => source.hash(state),
+            Self::MySqlBoundSource {
+                source,
+                text,
+                client_collation,
+                ansi_quotes,
+                directives,
+                syntax,
+                unsupported,
+                ..
+            } => (
+                source,
+                text,
+                client_collation,
+                ansi_quotes,
+                directives,
+                syntax,
+                unsupported,
+            )
+                .hash(state),
+            Self::MySqlNoRangeOptimization {
+                query_block_name,
+                table,
+                indexes,
+                resolve_conditions,
+                ..
+            } => (query_block_name, table, indexes, resolve_conditions).hash(state),
+            Self::MySqlDeleteModifier(value) => value.hash(state),
+        }
+    }
+}
+
+// These fields were Source/primitive metadata before typed handoff. The
+// compiled hint literals remain in their original program, not ordinary query
+// Expr children to be rebound or made mutable by a copied AST visitor.
+#[cfg(feature = "visitor")]
+impl Visit for OptimizerHintStyle {
+    fn visit<V: Visitor>(&self, _visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        core::ops::ControlFlow::Continue(())
+    }
+}
+#[cfg(feature = "visitor")]
+impl VisitMut for OptimizerHintStyle {
+    fn visit<V: VisitorMut>(&mut self, _visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        core::ops::ControlFlow::Continue(())
+    }
 }
 
 impl fmt::Display for OptimizerHint {
@@ -12028,6 +13210,18 @@ impl fmt::Display for OptimizerHint {
                 f.write_str("+")?;
                 f.write_str(&self.text)?;
                 f.write_str("*/")
+            }
+            OptimizerHintStyle::MySqlDeleteModifier(modifier) => modifier.fmt(f),
+            OptimizerHintStyle::MySqlNoRangeOptimization { table, indexes, .. } => {
+                f.write_str("/*+ NO_RANGE_OPTIMIZATION(")?;
+                write!(f, "`{}`", table.replace('`', "``"))?;
+                for index in indexes {
+                    write!(f, " `{}`", index.replace('`', "``"))?;
+                }
+                f.write_str(") */")
+            }
+            OptimizerHintStyle::MySqlSource(_) | OptimizerHintStyle::MySqlBoundSource { .. } => {
+                f.write_str("/* native MySQL hint source */")
             }
         }
     }
@@ -12377,6 +13571,10 @@ impl From<ResetStatement> for Statement {
         Self::Reset(r)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod central_tests;
 
 #[cfg(test)]
 mod tests {

@@ -150,7 +150,9 @@ impl Parser<'_> {
     /// ```
     pub fn parse_alter_user(&mut self) -> Result<AlterUser, ParserError> {
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
+        // This service decodes raw account text only for MySqlDialect;
+        // Snowflake and all other dialects retain parse_identifier unchanged.
+        let name = self.parse_account_identifier()?;
         let _ = self.parse_keyword(Keyword::WITH);
         let rename_to = if self.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
             Some(self.parse_identifier()?)

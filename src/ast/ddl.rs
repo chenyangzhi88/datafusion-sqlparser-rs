@@ -36,23 +36,23 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::value::escape_single_quote_string;
 use crate::ast::{
-    display_comma_separated, display_separated,
-    table_constraints::{
-        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
-        UniqueConstraint,
-    },
-    ArgMode, AttachedToken, CommentDef, ConditionalStatements, CreateFunctionBody,
+    AttachedToken, BeginEndStatements, CommentDef, ConditionalStatements, CreateFunctionBody,
     CreateFunctionUsing, CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr,
     FileFormat, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
     FunctionDeterminismSpecifier, FunctionParallel, FunctionSecurity, HiveDistributionStyle,
     HiveFormat, HiveIOFormat, HiveRowFormat, HiveSetLocation, Ident, InitializeKind,
-    MySQLColumnPosition, ObjectName, OnCommit, OneOrManyWithParens, OperateFunctionArg,
+    MySQLColumnPosition, MySqlText, ObjectName, OnCommit, OneOrManyWithParens, OperateFunctionArg,
     OrderByExpr, ProjectionSelect, Query, RefreshModeKind, ResetConfig, RowAccessPolicy,
     SequenceOptions, Spanned, SqlOption, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod,
-    TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
+    TriggerReferencing, Value, ValueWithSpan, WrappedCollection, display_comma_separated,
+    display_separated,
+    table_constraints::{
+        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
+        UniqueConstraint,
+    },
 };
-use crate::display_utils::{DisplayCommaSeparated, Indent, NewLine, SpaceOrNewline};
+use crate::display_utils::{Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
 use crate::tokenizer::{Span, Token};
 
@@ -116,6 +116,606 @@ impl fmt::Display for ReplicaIdentity {
             ReplicaIdentity::Full => f.write_str("FULL"),
             ReplicaIdentity::Default => f.write_str("DEFAULT"),
             ReplicaIdentity::Index(idx) => write!(f, "USING INDEX {idx}"),
+        }
+    }
+}
+
+/// MySQL's versioned hash algorithm for `PARTITION BY KEY`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlKeyAlgorithm {
+    /// MySQL KEY hashing algorithm 1.
+    Algorithm1,
+    /// MySQL KEY hashing algorithm 2.
+    Algorithm2,
+}
+
+impl fmt::Display for MySqlKeyAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Algorithm1 => "1",
+            Self::Algorithm2 => "2",
+        })
+    }
+}
+
+impl MySqlKeyAlgorithm {
+    /// Numeric algorithm identifier used by MySQL metadata and routing.
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::Algorithm1 => 1,
+            Self::Algorithm2 => 2,
+        }
+    }
+}
+
+/// A name set accepted by MySQL partition maintenance statements.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionSelection {
+    /// Every partition.
+    All,
+    /// One or more partition identifiers.
+    Names(Vec<Ident>),
+}
+
+impl fmt::Display for MySqlPartitionSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("ALL"),
+            Self::Names(names) => display_comma_separated(names).fmt(f),
+        }
+    }
+}
+
+/// Validation clause of `ALTER TABLE ... EXCHANGE PARTITION`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlExchangeValidation {
+    /// MySQL's default validation behavior (no explicit clause).
+    Default,
+    /// `WITH VALIDATION`.
+    With,
+    /// `WITHOUT VALIDATION`.
+    Without,
+}
+
+/// One bound inside a MySQL RANGE/LIST partition definition.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionBound {
+    /// A regular SQL expression, including NULL.
+    Expr(Expr),
+    /// The RANGE sentinel above every finite value.
+    MaxValue,
+}
+
+impl fmt::Display for MySqlPartitionBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Expr(expression) => expression.fmt(f),
+            Self::MaxValue => f.write_str("MAXVALUE"),
+        }
+    }
+}
+
+/// Boundary form in a MySQL partition definition.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionValues {
+    /// RANGE / RANGE COLUMNS upper bound.
+    LessThan(Vec<MySqlPartitionBound>),
+    /// LIST / LIST COLUMNS values. Each inner vector is one scalar or tuple.
+    In(Vec<Vec<MySqlPartitionBound>>),
+}
+
+impl fmt::Display for MySqlPartitionValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LessThan(values) => {
+                write!(f, "VALUES LESS THAN ({})", display_comma_separated(values))
+            }
+            Self::In(values) => {
+                f.write_str("VALUES IN (")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    if value.len() == 1 {
+                        value[0].fmt(f)?;
+                    } else {
+                        write!(f, "({})", display_comma_separated(value))?;
+                    }
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+/// A named logical MySQL partition and its typed boundary.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlPartitionDefinition {
+    /// Partition identifier.
+    pub name: Ident,
+    /// RANGE or LIST boundary clause; HASH and KEY definitions omit it.
+    pub values: Option<MySqlPartitionValues>,
+    /// Storage and metadata options attached to this partition.
+    pub options: Vec<MySqlPartitionOption>,
+    /// Explicit leaf definitions when the table is subpartitioned.
+    pub subpartitions: Vec<MySqlSubpartitionDefinition>,
+}
+
+impl fmt::Display for MySqlPartitionDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PARTITION {}", self.name)?;
+        if let Some(values) = &self.values {
+            write!(f, " {values}")?;
+        }
+        for option in &self.options {
+            write!(f, " {option}")?;
+        }
+        if !self.subpartitions.is_empty() {
+            write!(f, " ({})", display_comma_separated(&self.subpartitions))?;
+        }
+        Ok(())
+    }
+}
+
+/// A typed option accepted by MySQL partition and subpartition definitions.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionOption {
+    /// `[STORAGE] ENGINE [=] engine_name`.
+    Engine {
+        /// Whether the optional `STORAGE` keyword was present.
+        storage: bool,
+        /// Storage engine name.
+        engine: Ident,
+    },
+    /// `COMMENT [=] 'text'`.
+    Comment(ValueWithSpan),
+    /// `DATA DIRECTORY [=] 'path'`.
+    DataDirectory(ValueWithSpan),
+    /// `INDEX DIRECTORY [=] 'path'`.
+    IndexDirectory(ValueWithSpan),
+    /// `MAX_ROWS [=] n`.
+    MaxRows(u64),
+    /// `MIN_ROWS [=] n`.
+    MinRows(u64),
+    /// `TABLESPACE [=] name`.
+    Tablespace(Ident),
+    /// `NODEGROUP [=] n`.
+    Nodegroup(u64),
+}
+
+impl fmt::Display for MySqlPartitionOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine { storage, engine } => write!(
+                f,
+                "{}ENGINE = {engine}",
+                if *storage { "STORAGE " } else { "" }
+            ),
+            Self::Comment(value) => write!(f, "COMMENT = {value}"),
+            Self::DataDirectory(value) => write!(f, "DATA DIRECTORY = {value}"),
+            Self::IndexDirectory(value) => write!(f, "INDEX DIRECTORY = {value}"),
+            Self::MaxRows(value) => write!(f, "MAX_ROWS = {value}"),
+            Self::MinRows(value) => write!(f, "MIN_ROWS = {value}"),
+            Self::Tablespace(value) => write!(f, "TABLESPACE = {value}"),
+            Self::Nodegroup(value) => write!(f, "NODEGROUP = {value}"),
+        }
+    }
+}
+
+/// One explicitly named MySQL subpartition leaf.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlSubpartitionDefinition {
+    /// Subpartition identifier.
+    pub name: Ident,
+    /// Storage and metadata options attached to this leaf.
+    pub options: Vec<MySqlPartitionOption>,
+}
+
+impl fmt::Display for MySqlSubpartitionDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SUBPARTITION {}", self.name)?;
+        for option in &self.options {
+            write!(f, " {option}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The top-level method and typed routing input of `PARTITION BY`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionMethod {
+    /// `RANGE(expr)`.
+    Range {
+        /// Scalar expression used to choose the range partition.
+        expression: Expr,
+    },
+    /// `RANGE COLUMNS(column, ...)`.
+    RangeColumns {
+        /// Ordered columns compared with each range boundary tuple.
+        columns: Vec<Ident>,
+    },
+    /// `LIST(expr)`.
+    List {
+        /// Scalar expression matched against the listed values.
+        expression: Expr,
+    },
+    /// `LIST COLUMNS(column, ...)`.
+    ListColumns {
+        /// Ordered columns matched against each listed value tuple.
+        columns: Vec<Ident>,
+    },
+    /// `[LINEAR] HASH(expr)`.
+    Hash {
+        /// Whether MySQL's linear-hash partition numbering is requested.
+        linear: bool,
+        /// Scalar expression whose result is hashed.
+        expression: Expr,
+    },
+    /// `[LINEAR] KEY [ALGORITHM = 1|2] (column, ...)`.
+    Key {
+        /// Whether MySQL's linear-key partition numbering is requested.
+        linear: bool,
+        /// Explicit MySQL key-hash algorithm, or `None` for the server default.
+        algorithm: Option<MySqlKeyAlgorithm>,
+        /// Ordered key columns; an empty list asks MySQL to use the primary key.
+        columns: Vec<Ident>,
+    },
+}
+
+impl MySqlPartitionMethod {
+    /// Return the effective KEY algorithm. MySQL 8.0 defaults an omitted
+    /// `ALGORITHM` clause to algorithm 2.
+    pub const fn effective_key_algorithm(&self) -> Option<MySqlKeyAlgorithm> {
+        match self {
+            Self::Key { algorithm, .. } => Some(match algorithm {
+                Some(algorithm) => *algorithm,
+                None => MySqlKeyAlgorithm::Algorithm2,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MySqlPartitionMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Range { expression } => write!(f, "RANGE ({expression})"),
+            Self::RangeColumns { columns } => {
+                write!(f, "RANGE COLUMNS ({})", display_comma_separated(columns))
+            }
+            Self::List { expression } => write!(f, "LIST ({expression})"),
+            Self::ListColumns { columns } => {
+                write!(f, "LIST COLUMNS ({})", display_comma_separated(columns))
+            }
+            Self::Hash { linear, expression } => write!(
+                f,
+                "{}HASH ({expression})",
+                if *linear { "LINEAR " } else { "" }
+            ),
+            Self::Key {
+                linear,
+                algorithm,
+                columns,
+            } => {
+                if *linear {
+                    f.write_str("LINEAR ")?;
+                }
+                f.write_str("KEY")?;
+                if let Some(algorithm) = algorithm {
+                    write!(f, " ALGORITHM = {algorithm}")?;
+                }
+                write!(f, " ({})", display_comma_separated(columns))
+            }
+        }
+    }
+}
+
+/// A HASH or KEY method usable below a RANGE/LIST partition.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlSubpartitionMethod {
+    /// `[LINEAR] HASH(expr)`.
+    Hash {
+        /// Whether MySQL's linear-hash subpartition numbering is requested.
+        linear: bool,
+        /// Scalar expression whose result selects the subpartition.
+        expression: Expr,
+    },
+    /// `[LINEAR] KEY [ALGORITHM = 1|2] (column, ...)`.
+    Key {
+        /// Whether MySQL's linear-key subpartition numbering is requested.
+        linear: bool,
+        /// Explicit MySQL key-hash algorithm, or `None` for the server default.
+        algorithm: Option<MySqlKeyAlgorithm>,
+        /// Ordered key columns; an empty list asks MySQL to use the primary key.
+        columns: Vec<Ident>,
+    },
+}
+
+impl MySqlSubpartitionMethod {
+    /// Return the effective KEY algorithm, including MySQL's algorithm 2
+    /// default when the clause was omitted.
+    pub const fn effective_key_algorithm(&self) -> Option<MySqlKeyAlgorithm> {
+        match self {
+            Self::Key { algorithm, .. } => Some(match algorithm {
+                Some(algorithm) => *algorithm,
+                None => MySqlKeyAlgorithm::Algorithm2,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MySqlSubpartitionMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hash { linear, expression } => write!(
+                f,
+                "{}HASH ({expression})",
+                if *linear { "LINEAR " } else { "" }
+            ),
+            Self::Key {
+                linear,
+                algorithm,
+                columns,
+            } => {
+                if *linear {
+                    f.write_str("LINEAR ")?;
+                }
+                f.write_str("KEY")?;
+                if let Some(algorithm) = algorithm {
+                    write!(f, " ALGORITHM = {algorithm}")?;
+                }
+                write!(f, " ({})", display_comma_separated(columns))
+            }
+        }
+    }
+}
+
+/// Optional second routing level of a MySQL partition declaration.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlSubpartitionBy {
+    /// HASH or KEY leaf routing method.
+    pub method: MySqlSubpartitionMethod,
+    /// Optional number of leaves below every top-level partition.
+    pub subpartitions: Option<u64>,
+}
+
+impl fmt::Display for MySqlSubpartitionBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SUBPARTITION BY {}", self.method)?;
+        if let Some(subpartitions) = self.subpartitions {
+            write!(f, " SUBPARTITIONS {subpartitions}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete typed payload of MySQL `CREATE TABLE` or `ALTER TABLE` partitioning.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlPartitionBy {
+    /// Top-level routing method and its expression or column list.
+    pub method: MySqlPartitionMethod,
+    /// Optional declared number of top-level partitions.
+    pub partitions: Option<u64>,
+    /// Optional second routing level.
+    pub subpartition: Option<MySqlSubpartitionBy>,
+    /// Explicit logical partition definitions.
+    pub definitions: Vec<MySqlPartitionDefinition>,
+}
+
+impl fmt::Display for MySqlPartitionBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PARTITION BY {}", self.method)?;
+        if let Some(partitions) = self.partitions {
+            write!(f, " PARTITIONS {partitions}")?;
+        }
+        if let Some(subpartition) = &self.subpartition {
+            write!(f, " {subpartition}")?;
+        }
+        if !self.definitions.is_empty() {
+            write!(f, " ({})", display_comma_separated(&self.definitions))?;
+        }
+        Ok(())
+    }
+}
+
+/// Typed MySQL partition operation carried by an `ALTER TABLE` statement.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlPartitionMaintenance {
+    /// Replace table partitioning with one complete typed declaration.
+    PartitionBy(MySqlPartitionBy),
+    /// `ADD PARTITION (...)` with typed partition definitions.
+    Add {
+        /// New logical partition definitions.
+        definitions: Vec<MySqlPartitionDefinition>,
+    },
+    /// `ADD PARTITION PARTITIONS n` for HASH/KEY partitioning.
+    AddCount {
+        /// Number of logical partitions to append.
+        count: u64,
+    },
+    /// `COALESCE PARTITION n`.
+    Coalesce {
+        /// Number of HASH/KEY partitions to remove and redistribute.
+        count: u64,
+    },
+    /// `DROP PARTITION p0, p1`.
+    Drop {
+        /// Ordered partition names to remove.
+        names: Vec<Ident>,
+    },
+    /// `EXCHANGE PARTITION p WITH TABLE t [WITH|WITHOUT VALIDATION]`.
+    Exchange {
+        /// Partition to exchange.
+        partition: Ident,
+        /// Non-partitioned table to exchange with.
+        table: ObjectName,
+        /// Explicit or default validation behavior.
+        validation: MySqlExchangeValidation,
+    },
+    /// `REORGANIZE PARTITION ... INTO (...)`.
+    Reorganize {
+        /// Existing partition names replaced atomically.
+        names: Vec<Ident>,
+        /// Replacement logical partition definitions.
+        definitions: Vec<MySqlPartitionDefinition>,
+    },
+    /// `ANALYZE PARTITION ...`.
+    Analyze(MySqlPartitionSelection),
+    /// `CHECK PARTITION ...`.
+    Check(MySqlPartitionSelection),
+    /// `OPTIMIZE PARTITION ...`.
+    Optimize(MySqlPartitionSelection),
+    /// `REBUILD PARTITION ...`.
+    Rebuild(MySqlPartitionSelection),
+    /// `REPAIR PARTITION ...`.
+    Repair(MySqlPartitionSelection),
+    /// `TRUNCATE PARTITION ...`.
+    Truncate(MySqlPartitionSelection),
+    /// `REMOVE PARTITIONING`.
+    RemovePartitioning,
+}
+
+impl MySqlPartitionMaintenance {
+    /// Return the effective KEY algorithm. MySQL 8.0 defaults an omitted
+    /// `ALGORITHM` clause to algorithm 2.
+    pub const fn effective_key_algorithm(&self) -> Option<MySqlKeyAlgorithm> {
+        match self {
+            Self::PartitionBy(partitioning) => partitioning.method.effective_key_algorithm(),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MySqlPartitionMaintenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartitionBy(partitioning) => partitioning.fmt(f),
+            Self::Coalesce { count } => write!(f, "COALESCE PARTITION {count}"),
+            Self::Add { definitions } => {
+                write!(
+                    f,
+                    "ADD PARTITION ({})",
+                    display_comma_separated(definitions)
+                )
+            }
+            Self::AddCount { count } => write!(f, "ADD PARTITION PARTITIONS {count}"),
+            Self::Drop { names } => {
+                write!(f, "DROP PARTITION {}", display_comma_separated(names))
+            }
+            Self::Exchange {
+                partition,
+                table,
+                validation,
+            } => {
+                write!(f, "EXCHANGE PARTITION {partition} WITH TABLE {table}")?;
+                match validation {
+                    MySqlExchangeValidation::Default => Ok(()),
+                    MySqlExchangeValidation::With => f.write_str(" WITH VALIDATION"),
+                    MySqlExchangeValidation::Without => f.write_str(" WITHOUT VALIDATION"),
+                }
+            }
+            Self::Reorganize { names, definitions } => write!(
+                f,
+                "REORGANIZE PARTITION {} INTO ({})",
+                display_comma_separated(names),
+                display_comma_separated(definitions)
+            ),
+            Self::Analyze(selection) => write!(f, "ANALYZE PARTITION {selection}"),
+            Self::Check(selection) => write!(f, "CHECK PARTITION {selection}"),
+            Self::Optimize(selection) => write!(f, "OPTIMIZE PARTITION {selection}"),
+            Self::Rebuild(selection) => write!(f, "REBUILD PARTITION {selection}"),
+            Self::Repair(selection) => write!(f, "REPAIR PARTITION {selection}"),
+            Self::Truncate(selection) => write!(f, "TRUNCATE PARTITION {selection}"),
+            Self::RemovePartitioning => f.write_str("REMOVE PARTITIONING"),
+        }
+    }
+}
+
+/// Operations sharing the existing `AlterTableOperation::SetOptionsParens`
+/// carrier while retaining a distinct typed MySQL grammar identity.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterTableSetOperation {
+    /// Portable `SET (...)` options.
+    Options(Vec<SqlOption>),
+    /// MySQL table defaults changed without rewriting existing character data.
+    MySqlDefaultCharacterSet {
+        /// New default character set.
+        charset: Ident,
+        /// Optional default collation.
+        collation: Option<Ident>,
+    },
+    /// MySQL conversion of existing character columns and table defaults.
+    MySqlConvertToCharacterSet {
+        /// Destination character set.
+        charset: Ident,
+        /// Optional destination collation.
+        collation: Option<Ident>,
+    },
+    /// MySQL logical partition metadata operation.
+    MySqlPartition(MySqlPartitionMaintenance),
+}
+
+impl AlterTableSetOperation {
+    /// Preserve the collection interface used by span consumers for portable
+    /// `SET (...)` options.
+    pub fn iter(&self) -> core::slice::Iter<'_, SqlOption> {
+        match self {
+            Self::Options(options) => options.iter(),
+            _ => [].iter(),
+        }
+    }
+}
+
+impl fmt::Display for AlterTableSetOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Options(options) => {
+                write!(f, "SET ({})", display_comma_separated(options))
+            }
+            Self::MySqlDefaultCharacterSet { charset, collation } => {
+                write!(f, "DEFAULT CHARACTER SET = {charset}")?;
+                if let Some(collation) = collation {
+                    write!(f, " COLLATE = {collation}")?;
+                }
+                Ok(())
+            }
+            Self::MySqlConvertToCharacterSet { charset, collation } => {
+                write!(f, "CONVERT TO CHARACTER SET {charset}")?;
+                if let Some(collation) = collation {
+                    write!(f, " COLLATE {collation}")?;
+                }
+                Ok(())
+            }
+            Self::MySqlPartition(operation) => operation.fmt(f),
         }
     }
 }
@@ -430,6 +1030,13 @@ pub enum AlterTableOperation {
         /// Operation to apply to the column.
         op: AlterColumnOperation,
     },
+    /// MySQL `ALTER INDEX index_name { VISIBLE | INVISIBLE }`.
+    AlterIndexVisibility {
+        /// Index whose optimizer visibility changes.
+        name: Ident,
+        /// `true` for `VISIBLE`, `false` for `INVISIBLE`.
+        visible: bool,
+    },
     /// 'SWAP WITH <table_name>'
     ///
     /// Note: this is Snowflake specific <https://docs.snowflake.com/en/sql-reference/sql/alter-table>
@@ -532,7 +1139,7 @@ pub enum AlterTableOperation {
     /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-altertable.html)
     SetOptionsParens {
         /// Parenthesized options supplied to `SET (...)`.
-        options: Vec<SqlOption>,
+        options: AlterTableSetOperation,
     },
 }
 
@@ -803,6 +1410,11 @@ impl fmt::Display for AlterTableOperation {
             AlterTableOperation::AlterColumn { column_name, op } => {
                 write!(f, "ALTER COLUMN {column_name} {op}")
             }
+            AlterTableOperation::AlterIndexVisibility { name, visible } => write!(
+                f,
+                "ALTER INDEX {name} {}",
+                if *visible { "VISIBLE" } else { "INVISIBLE" }
+            ),
             AlterTableOperation::DisableRowLevelSecurity => {
                 write!(f, "DISABLE ROW LEVEL SECURITY")
             }
@@ -1041,9 +1653,7 @@ impl fmt::Display for AlterTableOperation {
             AlterTableOperation::ValidateConstraint { name } => {
                 write!(f, "VALIDATE CONSTRAINT {name}")
             }
-            AlterTableOperation::SetOptionsParens { options } => {
-                write!(f, "SET ({})", display_comma_separated(options))
-            }
+            AlterTableOperation::SetOptionsParens { options } => options.fmt(f),
         }
     }
 }
@@ -1278,6 +1888,26 @@ pub enum AlterColumnOperation {
     },
     /// `DROP DEFAULT`
     DropDefault,
+    /// `SET STATISTICS signed_integer`.
+    SetStatistics {
+        /// Requested target. PostgreSQL uses `-1` to restore the server default.
+        target: i32,
+    },
+    /// `SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN | DEFAULT }`.
+    SetStorage {
+        /// Requested storage mode or `DEFAULT`.
+        storage: Ident,
+    },
+    /// `SET COMPRESSION { PGLZ | LZ4 | DEFAULT }`.
+    SetCompression {
+        /// Requested compression method or `DEFAULT`.
+        method: Ident,
+    },
+    /// MySQL `SET VISIBLE` or `SET INVISIBLE`.
+    SetVisibility {
+        /// Whether the column is visible.
+        visible: bool,
+    },
     /// `[SET DATA] TYPE <data_type> [USING <expr>]`
     SetDataType {
         /// Target data type for the column.
@@ -1297,6 +1927,26 @@ pub enum AlterColumnOperation {
         /// Optional sequence options for identity generation.
         sequence_options: Option<Vec<SequenceOptions>>,
     },
+    /// `SET GENERATED { ALWAYS | BY DEFAULT }`
+    SetGenerated {
+        /// New identity generation policy.
+        generated_as: GeneratedAs,
+    },
+    /// `SET sequence_option [...]` for an identity's owned sequence.
+    SetSequenceOptions {
+        /// Sequence properties to update.
+        sequence_options: Vec<SequenceOptions>,
+    },
+    /// `RESTART [ [ WITH ] restart ]` for an identity's owned sequence.
+    RestartIdentity {
+        /// Explicit restart value, or `None` to use the sequence start value.
+        restart_with: Option<Expr>,
+    },
+    /// `DROP IDENTITY [ IF EXISTS ]`
+    DropIdentity {
+        /// Suppress the error when the column is not an identity.
+        if_exists: bool,
+    },
 }
 
 impl fmt::Display for AlterColumnOperation {
@@ -1309,6 +1959,18 @@ impl fmt::Display for AlterColumnOperation {
             }
             AlterColumnOperation::DropDefault => {
                 write!(f, "DROP DEFAULT")
+            }
+            AlterColumnOperation::SetStatistics { target } => {
+                write!(f, "SET STATISTICS {target}")
+            }
+            AlterColumnOperation::SetStorage { storage } => {
+                write!(f, "SET STORAGE {storage}")
+            }
+            AlterColumnOperation::SetCompression { method } => {
+                write!(f, "SET COMPRESSION {method}")
+            }
+            AlterColumnOperation::SetVisibility { visible } => {
+                write!(f, "SET {}", if *visible { "VISIBLE" } else { "INVISIBLE" })
             }
             AlterColumnOperation::SetDataType {
                 data_type,
@@ -1343,6 +2005,32 @@ impl fmt::Display for AlterColumnOperation {
                     }
 
                     write!(f, " )")?;
+                }
+                Ok(())
+            }
+            AlterColumnOperation::SetGenerated { generated_as } => match generated_as {
+                GeneratedAs::Always => write!(f, "SET GENERATED ALWAYS"),
+                GeneratedAs::ByDefault => write!(f, "SET GENERATED BY DEFAULT"),
+                GeneratedAs::ExpStored => unreachable!("stored expressions are not identities"),
+            },
+            AlterColumnOperation::SetSequenceOptions { sequence_options } => {
+                write!(f, "SET")?;
+                for option in sequence_options {
+                    write!(f, "{option}")?;
+                }
+                Ok(())
+            }
+            AlterColumnOperation::RestartIdentity { restart_with } => {
+                write!(f, "RESTART")?;
+                if let Some(value) = restart_with {
+                    write!(f, " WITH {value}")?;
+                }
+                Ok(())
+            }
+            AlterColumnOperation::DropIdentity { if_exists } => {
+                write!(f, "DROP IDENTITY")?;
+                if *if_exists {
+                    write!(f, " IF EXISTS")?;
                 }
                 Ok(())
             }
@@ -1459,6 +2147,11 @@ pub enum IndexOption {
     Using(IndexType),
     /// `COMMENT 'string'`: Specifies a comment for the index.
     Comment(String),
+    /// `WITH PARSER parser_name`: MySQL FULLTEXT parser selection.
+    Parser(Ident),
+    /// MySQL optimizer visibility. Invisible indexes remain maintained and
+    /// can still be selected by an explicit index hint.
+    Visibility(bool),
 }
 
 impl fmt::Display for IndexOption {
@@ -1466,8 +2159,25 @@ impl fmt::Display for IndexOption {
         match self {
             Self::Using(index_type) => write!(f, "USING {index_type}"),
             Self::Comment(s) => write!(f, "COMMENT '{s}'"),
+            Self::Parser(parser) => write!(f, "WITH PARSER {parser}"),
+            Self::Visibility(true) => write!(f, "VISIBLE"),
+            Self::Visibility(false) => write!(f, "INVISIBLE"),
         }
     }
+}
+
+/// MySQL spelling that introduces a standalone index declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CreateIndexKind {
+    /// Ordinary secondary or unique index.
+    #[default]
+    Ordinary,
+    /// MySQL `FULLTEXT` index.
+    FullText,
+    /// MySQL `SPATIAL` index.
+    Spatial,
 }
 
 /// [PostgreSQL] unique index nulls handling option: `[ NULLS [ NOT ] DISTINCT ]`
@@ -1498,31 +2208,126 @@ impl fmt::Display for NullsDistinctOption {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// A parameter of a stored procedure or function declaration.
-pub struct ProcedureParam {
-    /// Parameter name.
-    pub name: Ident,
-    /// Parameter data type.
-    pub data_type: DataType,
-    /// Optional mode (`IN`, `OUT`, `INOUT`, etc.).
-    pub mode: Option<ArgMode>,
-    /// Optional default expression for the parameter.
-    pub default: Option<Expr>,
+/// Dialect-specific executable body of a procedure definition.
+pub enum CreateProcedureBody {
+    /// PostgreSQL string body introduced by `AS`.
+    PostgresAs {
+        /// The routine source expression, normally a quoted string.
+        body: Expr,
+        /// Optional C-language link symbol.
+        link_symbol: Option<Expr>,
+    },
+    /// PostgreSQL SQL-standard routine body.
+    PostgresBeginAtomic(BeginEndStatements),
+    /// SQL/PSM-style statement block used by MySQL and SQL Server dialects.
+    Statements(ConditionalStatements),
 }
 
-impl fmt::Display for ProcedureParam {
+/// MySQL CREATE header facts and the original body occurrence. This is source
+/// syntax, not a bound program, an execution instance, or a credential. A raw
+/// parser issues the body range only after the caller's PSM grammar consumed
+/// that same token frontier. Deserialization leaves its byte owner detached.
+#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlProgramBody {
+    /// Original client bytes in the one admitted CREATE source owner.
+    pub source: Option<crate::ast::SqlSourceOccurrence>,
+    /// Contributions in that CREATE parse's single CPP ledger.
+    pub cpp: Option<crate::ast::SqlCppPieceRange>,
+    /// Explicit CREATE DEFINER account; absence means the actual creator.
+    pub definer: Option<crate::ast::GranteeName>,
+    /// Native IF NOT EXISTS header clause.
+    pub if_not_exists: bool,
+    /// Native DETERMINISTIC / NOT DETERMINISTIC declaration, if supplied.
+    pub deterministic: Option<bool>,
+    /// Native SQL data-access characteristic, if supplied.
+    pub data_access: Option<String>,
+    /// Native COMMENT expression before system-text binding.
+    pub comment: Option<Expr>,
+    /// Trigger order: true for FOLLOWS, false for PRECEDES.
+    pub ordering: Option<(bool, Ident)>,
+    /// Native CHARACTER SET / COLLATE suffixes in parameter order. The
+    /// actual type and member literals remain in each parameter's DataType.
+    pub parameter_type_modifiers: Vec<String>,
+    /// Native RETURNS character modifiers; its DataType stays in the header.
+    pub return_type_modifiers: Option<String>,
+}
+
+impl fmt::Display for CreateProcedureBody {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(mode) = &self.mode {
-            if let Some(default) = &self.default {
-                write!(f, "{mode} {} {} = {}", self.name, self.data_type, default)
-            } else {
-                write!(f, "{mode} {} {}", self.name, self.data_type)
+        match self {
+            Self::PostgresAs { body, link_symbol } => {
+                write!(f, "AS {body}")?;
+                if let Some(link_symbol) = link_symbol {
+                    write!(f, ", {link_symbol}")?;
+                }
+                Ok(())
             }
-        } else if let Some(default) = &self.default {
-            write!(f, "{} {} = {}", self.name, self.data_type, default)
-        } else {
-            write!(f, "{} {}", self.name, self.data_type)
+            Self::PostgresBeginAtomic(body) => {
+                write!(f, "BEGIN ATOMIC ")?;
+                crate::ast::format_statement_list(f, &body.statements)?;
+                write!(f, " END")
+            }
+            Self::Statements(body) => write!(f, "AS {body}"),
         }
+    }
+}
+
+/// Typed `CREATE PROCEDURE` definition. Function-only attributes and a return
+/// type are deliberately absent from this AST.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct CreateProcedure {
+    /// MySQL saved-body source/header facts; never a portable body substitute.
+    pub mysql_body: Option<MySqlProgramBody>,
+    /// `CREATE OR ALTER`, used by SQL Server dialects.
+    pub or_alter: bool,
+    /// `CREATE OR REPLACE`, used by PostgreSQL.
+    pub or_replace: bool,
+    /// Procedure name.
+    pub name: ObjectName,
+    /// IN/OUT/INOUT/VARIADIC parameters, including defaults.
+    pub args: Vec<OperateFunctionArg>,
+    /// Optional procedural language.
+    pub language: Option<Ident>,
+    /// SECURITY DEFINER or SECURITY INVOKER.
+    pub security: Option<FunctionSecurity>,
+    /// PostgreSQL per-routine configuration.
+    pub set_params: Vec<FunctionDefinitionSetParam>,
+    /// Executable body in the dialect's native representation.
+    pub body: Option<CreateProcedureBody>,
+}
+
+impl fmt::Display for CreateProcedure {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CREATE ")?;
+        if self.or_alter {
+            write!(f, "OR ALTER ")?;
+        }
+        if self.or_replace {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(
+            f,
+            "PROCEDURE {}({})",
+            self.name,
+            display_comma_separated(&self.args)
+        )?;
+        if let Some(language) = &self.language {
+            write!(f, " LANGUAGE {language}")?;
+        }
+        if let Some(security) = &self.security {
+            write!(f, " {security}")?;
+        }
+        for set_param in &self.set_params {
+            write!(f, " {set_param}")?;
+        }
+        if let Some(body) = &self.body {
+            write!(f, " {body}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1937,6 +2742,8 @@ pub enum ColumnOption {
     Collation(ObjectName),
     /// `COMMENT '<text>'` column option
     Comment(String),
+    /// MySQL's actual TEXT_STRING_sys source; not a decoded comment mirror.
+    MySqlComment(MySqlText),
     /// `ON UPDATE <expr>` column option
     OnUpdate(Expr),
     /// `Generated`s are modifiers that follow a column definition in a `CREATE
@@ -2001,6 +2808,11 @@ pub enum ColumnOption {
     /// ```
     /// [MySQL]: https://dev.mysql.com/doc/refman/8.4/en/invisible-columns.html
     Invisible,
+    /// MySQL specific: Column is explicitly visible via `SELECT *`.
+    ///
+    /// MySQL applies repeated visibility attributes in declaration order, so
+    /// this must remain distinct from the absence of an `INVISIBLE` option.
+    Visible,
 }
 
 impl From<UniqueConstraint> for ColumnOption {
@@ -2084,6 +2896,7 @@ impl fmt::Display for ColumnOption {
             CharacterSet(n) => write!(f, "CHARACTER SET {n}"),
             Collation(n) => write!(f, "COLLATE {n}"),
             Comment(v) => write!(f, "COMMENT '{}'", escape_single_quote_string(v)),
+            MySqlComment(v) => write!(f, "COMMENT {v}"),
             OnUpdate(expr) => write!(f, "ON UPDATE {expr}"),
             Generated {
                 generated_as,
@@ -2149,6 +2962,9 @@ impl fmt::Display for ColumnOption {
             }
             Invisible => {
                 write!(f, "INVISIBLE")
+            }
+            Visible => {
+                write!(f, "VISIBLE")
             }
         }
     }
@@ -2272,11 +3088,7 @@ impl ConstraintCharacteristics {
     fn enforced_text(&self) -> Option<&'static str> {
         self.enforced.map(
             |enforced| {
-                if enforced {
-                    "ENFORCED"
-                } else {
-                    "NOT ENFORCED"
-                }
+                if enforced { "ENFORCED" } else { "NOT ENFORCED" }
             },
         )
     }
@@ -2804,6 +3616,8 @@ impl fmt::Display for ClusteredBy {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct CreateIndex {
+    /// MySQL standalone INDEX/FULLTEXT INDEX/SPATIAL INDEX kind.
+    pub kind: CreateIndexKind,
     /// index name
     pub name: Option<ObjectName>,
     #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
@@ -2843,8 +3657,13 @@ impl fmt::Display for CreateIndex {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "CREATE {unique}INDEX {concurrently}{if_not_exists}",
+            "CREATE {unique}{kind}INDEX {concurrently}{if_not_exists}",
             unique = if self.unique { "UNIQUE " } else { "" },
+            kind = match self.kind {
+                CreateIndexKind::Ordinary => "",
+                CreateIndexKind::FullText => "FULLTEXT ",
+                CreateIndexKind::Spatial => "SPATIAL ",
+            },
             concurrently = if self.concurrently {
                 "CONCURRENTLY "
             } else {
@@ -2861,9 +3680,9 @@ impl fmt::Display for CreateIndex {
         }
         write!(f, "ON {}", self.table_name)?;
         if let Some(value) = &self.using {
-            write!(f, " USING {value} ")?;
+            write!(f, " USING {value}")?;
         }
-        write!(f, "({})", display_comma_separated(&self.columns))?;
+        write!(f, " ({})", display_comma_separated(&self.columns))?;
         if !self.include.is_empty() {
             write!(f, " INCLUDE ({})", display_comma_separated(&self.include))?;
         }
@@ -2890,10 +3709,22 @@ impl fmt::Display for CreateIndex {
     }
 }
 
-/// CREATE TABLE statement.
+/// One source-ordered item in a parenthesized `CREATE TABLE` definition.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CreateTableElement {
+    /// Ordinal into the owning CreateTable's canonical columns vector.
+    Column(usize),
+    /// Ordinal into the owning CreateTable's canonical constraints vector.
+    Constraint(usize),
+    /// A PostgreSQL `LIKE` definition merged at this source position.
+    Like(crate::ast::CreateTableLike),
+}
+
+/// CREATE TABLE statement.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateTable {
     /// `OR REPLACE` clause
     pub or_replace: bool,
@@ -2917,12 +3748,14 @@ pub struct CreateTable {
     /// <https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#create_snapshot_table_statement>
     pub snapshot: bool,
     /// Table name
-    #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
     pub name: ObjectName,
     /// Column definitions
     pub columns: Vec<ColumnDef>,
     /// Table constraints
     pub constraints: Vec<TableConstraint>,
+    /// Source order of the parenthesized table definition. PostgreSQL uses
+    /// this to merge `LIKE`, explicit columns and constraints in order.
+    pub elements: Vec<CreateTableElement>,
     /// Hive-specific distribution style
     pub hive_distribution: HiveDistributionStyle,
     /// Hive-specific formats like `ROW FORMAT DELIMITED` or `ROW FORMAT SERDE 'serde_class' WITH SERDEPROPERTIES (...)`
@@ -2943,8 +3776,8 @@ pub struct CreateTable {
     pub clone: Option<ObjectName>,
     /// Table version (for systems that support versioned tables)
     pub version: Option<TableVersion>,
-    /// For Hive dialect, the table comment is after the column definitions without `=`,
-    /// so the `comment` field is optional and different than the comment field in the general options list.
+    /// Canonical table COMMENT (including MySQL plain options, last clause wins).
+    /// Hive places the clause after the column definitions without `=`.
     /// [Hive](https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL#LanguageManualDDL-CreateTable)
     pub comment: Option<CommentDef>,
     /// ClickHouse "ON COMMIT" clause:
@@ -2963,6 +3796,8 @@ pub struct CreateTable {
     /// BigQuery: A partition expression for the table.
     /// <https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#partition_expression>
     pub partition_by: Option<Box<Expr>>,
+    /// MySQL's complete typed partition declaration, independent of portable PARTITION BY.
+    pub mysql_partitioning: Option<MySqlPartitionBy>,
     /// BigQuery: Table clustering column list.
     /// <https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#table_option_list>
     /// Snowflake: Table clustering list which contains base column, expressions on base columns.
@@ -2979,7 +3814,6 @@ pub struct CreateTable {
     /// PostgreSQL `PARTITION OF` clause to create a partition of a parent table.
     /// Contains the parent table name.
     /// <https://www.postgresql.org/docs/current/sql-createtable.html>
-    #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
     pub partition_of: Option<ObjectName>,
     /// PostgreSQL partition bound specification for PARTITION OF.
     /// <https://www.postgresql.org/docs/current/sql-createtable.html>
@@ -3062,8 +3896,261 @@ pub struct CreateTable {
     pub backup: Option<bool>,
 }
 
+impl CreateTable {
+    /// Validate the source-order relationship before semantic admission. Each
+    /// kind's canonical vector retains its declaration order: no allocation,
+    /// duplicate definitions, omitted owners, or guessed name matching.
+    pub fn validate_source_order(&self) -> Result<(), &'static str> {
+        Self::validate_definition_order(
+            &self.elements,
+            self.columns.len(),
+            self.constraints.len(),
+        )?;
+        if let CreateTableOptions::Plain(options) = &self.table_options {
+            if options
+                .iter()
+                .any(|option| matches!(option, SqlOption::Comment(_)))
+            {
+                return Err("CREATE TABLE COMMENT must have one canonical owner");
+            }
+        }
+        Ok(())
+    }
+
+    /// The same validation for an admitted definition passed to a DDL consumer.
+    pub fn validate_definition_order(
+        elements: &[CreateTableElement],
+        column_count: usize,
+        constraint_count: usize,
+    ) -> Result<(), &'static str> {
+        let mut column = 0;
+        let mut constraint = 0;
+        for element in elements {
+            match element {
+                CreateTableElement::Column(ordinal) => {
+                    if *ordinal >= column_count {
+                        return Err("CREATE TABLE column ordinal is out of range");
+                    }
+                    if *ordinal != column {
+                        return Err("CREATE TABLE column source order is duplicated or incomplete");
+                    }
+                    column += 1;
+                }
+                CreateTableElement::Constraint(ordinal) => {
+                    if *ordinal >= constraint_count {
+                        return Err("CREATE TABLE constraint ordinal is out of range");
+                    }
+                    if *ordinal != constraint {
+                        return Err(
+                            "CREATE TABLE constraint source order is duplicated or incomplete",
+                        );
+                    }
+                    constraint += 1;
+                }
+                CreateTableElement::Like(_) => {}
+            }
+        }
+        if column != column_count || constraint != constraint_count {
+            return Err("CREATE TABLE source order omits a canonical definition");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "visitor")]
+impl crate::ast::Visit for CreateTable {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
+    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        self.or_replace.visit(visitor)?;
+        self.temporary.visit(visitor)?;
+        self.external.visit(visitor)?;
+        self.dynamic.visit(visitor)?;
+        self.global.visit(visitor)?;
+        self.if_not_exists.visit(visitor)?;
+        self.transient.visit(visitor)?;
+        self.volatile.visit(visitor)?;
+        self.iceberg.visit(visitor)?;
+        self.snapshot.visit(visitor)?;
+        visitor.pre_visit_relation(&self.name)?;
+        self.name.visit(visitor)?;
+        visitor.post_visit_relation(&self.name)?;
+        // Public malformed ASTs have no generic Visitor::Break to construct.
+        // Real parser/admission/DDL/Display paths reject them first. A direct
+        // visitor still reaches each actual owner without panic or fake order.
+        if self.validate_source_order().is_ok() {
+            for element in &self.elements {
+                match element {
+                    CreateTableElement::Column(ordinal) => self.columns[*ordinal].visit(visitor)?,
+                    CreateTableElement::Constraint(ordinal) => {
+                        self.constraints[*ordinal].visit(visitor)?
+                    }
+                    CreateTableElement::Like(like) => like.visit(visitor)?,
+                }
+            }
+        } else {
+            self.columns.visit(visitor)?;
+            self.constraints.visit(visitor)?;
+            for element in &self.elements {
+                if let CreateTableElement::Like(like) = element {
+                    like.visit(visitor)?;
+                }
+            }
+        }
+        self.hive_distribution.visit(visitor)?;
+        self.hive_formats.visit(visitor)?;
+        self.table_options.visit(visitor)?;
+        self.file_format.visit(visitor)?;
+        self.location.visit(visitor)?;
+        self.query.visit(visitor)?;
+        self.without_rowid.visit(visitor)?;
+        self.like.visit(visitor)?;
+        self.clone.visit(visitor)?;
+        self.version.visit(visitor)?;
+        self.comment.visit(visitor)?;
+        self.on_commit.visit(visitor)?;
+        self.on_cluster.visit(visitor)?;
+        self.primary_key.visit(visitor)?;
+        self.order_by.visit(visitor)?;
+        self.partition_by.visit(visitor)?;
+        self.mysql_partitioning.visit(visitor)?;
+        self.cluster_by.visit(visitor)?;
+        self.clustered_by.visit(visitor)?;
+        self.inherits.visit(visitor)?;
+        if let Some(value) = &self.partition_of {
+            visitor.pre_visit_relation(value)?;
+            value.visit(visitor)?;
+            visitor.post_visit_relation(value)?;
+        }
+        self.for_values.visit(visitor)?;
+        self.strict.visit(visitor)?;
+        self.copy_grants.visit(visitor)?;
+        self.enable_schema_evolution.visit(visitor)?;
+        self.change_tracking.visit(visitor)?;
+        self.data_retention_time_in_days.visit(visitor)?;
+        self.max_data_extension_time_in_days.visit(visitor)?;
+        self.default_ddl_collation.visit(visitor)?;
+        self.with_aggregation_policy.visit(visitor)?;
+        self.with_row_access_policy.visit(visitor)?;
+        self.with_storage_lifecycle_policy.visit(visitor)?;
+        self.with_tags.visit(visitor)?;
+        self.external_volume.visit(visitor)?;
+        self.base_location.visit(visitor)?;
+        self.catalog.visit(visitor)?;
+        self.catalog_sync.visit(visitor)?;
+        self.storage_serialization_policy.visit(visitor)?;
+        self.target_lag.visit(visitor)?;
+        self.warehouse.visit(visitor)?;
+        self.refresh_mode.visit(visitor)?;
+        self.initialize.visit(visitor)?;
+        self.require_user.visit(visitor)?;
+        self.diststyle.visit(visitor)?;
+        self.distkey.visit(visitor)?;
+        self.sortkey.visit(visitor)?;
+        self.backup.visit(visitor)?;
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg(feature = "visitor")]
+impl crate::ast::VisitMut for CreateTable {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
+    fn visit<V: crate::ast::VisitorMut>(
+        &mut self,
+        visitor: &mut V,
+    ) -> core::ops::ControlFlow<V::Break> {
+        self.or_replace.visit(visitor)?;
+        self.temporary.visit(visitor)?;
+        self.external.visit(visitor)?;
+        self.dynamic.visit(visitor)?;
+        self.global.visit(visitor)?;
+        self.if_not_exists.visit(visitor)?;
+        self.transient.visit(visitor)?;
+        self.volatile.visit(visitor)?;
+        self.iceberg.visit(visitor)?;
+        self.snapshot.visit(visitor)?;
+        visitor.pre_visit_relation(&mut self.name)?;
+        self.name.visit(visitor)?;
+        visitor.post_visit_relation(&mut self.name)?;
+        // Public malformed ASTs have no generic Visitor::Break to construct.
+        // Real parser/admission/DDL/Display paths reject them first. A direct
+        // visitor still reaches each actual owner without panic or fake order.
+        if self.validate_source_order().is_ok() {
+            for element in &mut self.elements {
+                match element {
+                    CreateTableElement::Column(ordinal) => self.columns[*ordinal].visit(visitor)?,
+                    CreateTableElement::Constraint(ordinal) => {
+                        self.constraints[*ordinal].visit(visitor)?
+                    }
+                    CreateTableElement::Like(like) => like.visit(visitor)?,
+                }
+            }
+        } else {
+            self.columns.visit(visitor)?;
+            self.constraints.visit(visitor)?;
+            for element in &mut self.elements {
+                if let CreateTableElement::Like(like) = element {
+                    like.visit(visitor)?;
+                }
+            }
+        }
+        self.hive_distribution.visit(visitor)?;
+        self.hive_formats.visit(visitor)?;
+        self.table_options.visit(visitor)?;
+        self.file_format.visit(visitor)?;
+        self.location.visit(visitor)?;
+        self.query.visit(visitor)?;
+        self.without_rowid.visit(visitor)?;
+        self.like.visit(visitor)?;
+        self.clone.visit(visitor)?;
+        self.version.visit(visitor)?;
+        self.comment.visit(visitor)?;
+        self.on_commit.visit(visitor)?;
+        self.on_cluster.visit(visitor)?;
+        self.primary_key.visit(visitor)?;
+        self.order_by.visit(visitor)?;
+        self.partition_by.visit(visitor)?;
+        self.mysql_partitioning.visit(visitor)?;
+        self.cluster_by.visit(visitor)?;
+        self.clustered_by.visit(visitor)?;
+        self.inherits.visit(visitor)?;
+        if let Some(value) = &mut self.partition_of {
+            visitor.pre_visit_relation(value)?;
+            value.visit(visitor)?;
+            visitor.post_visit_relation(value)?;
+        }
+        self.for_values.visit(visitor)?;
+        self.strict.visit(visitor)?;
+        self.copy_grants.visit(visitor)?;
+        self.enable_schema_evolution.visit(visitor)?;
+        self.change_tracking.visit(visitor)?;
+        self.data_retention_time_in_days.visit(visitor)?;
+        self.max_data_extension_time_in_days.visit(visitor)?;
+        self.default_ddl_collation.visit(visitor)?;
+        self.with_aggregation_policy.visit(visitor)?;
+        self.with_row_access_policy.visit(visitor)?;
+        self.with_storage_lifecycle_policy.visit(visitor)?;
+        self.with_tags.visit(visitor)?;
+        self.external_volume.visit(visitor)?;
+        self.base_location.visit(visitor)?;
+        self.catalog.visit(visitor)?;
+        self.catalog_sync.visit(visitor)?;
+        self.storage_serialization_policy.visit(visitor)?;
+        self.target_lag.visit(visitor)?;
+        self.warehouse.visit(visitor)?;
+        self.refresh_mode.visit(visitor)?;
+        self.initialize.visit(visitor)?;
+        self.require_user.visit(visitor)?;
+        self.diststyle.visit(visitor)?;
+        self.distkey.visit(visitor)?;
+        self.sortkey.visit(visitor)?;
+        self.backup.visit(visitor)?;
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
 impl fmt::Display for CreateTable {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.validate_source_order().map_err(|_| fmt::Error)?;
         // We want to allow the following options
         // Empty column list, allowed by PostgreSQL:
         //   `CREATE TABLE t ()`
@@ -3077,16 +4164,15 @@ impl fmt::Display for CreateTable {
             or_replace = if self.or_replace { "OR REPLACE " } else { "" },
             external = if self.external { "EXTERNAL " } else { "" },
             snapshot = if self.snapshot { "SNAPSHOT " } else { "" },
-            global = self.global
-                .map(|global| {
-                    if global {
-                        "GLOBAL "
-                    } else {
-                        "LOCAL "
-                    }
-                })
+            global = self
+                .global
+                .map(|global| { if global { "GLOBAL " } else { "LOCAL " } })
                 .unwrap_or(""),
-            if_not_exists = if self.if_not_exists { "IF NOT EXISTS " } else { "" },
+            if_not_exists = if self.if_not_exists {
+                "IF NOT EXISTS "
+            } else {
+                ""
+            },
             temporary = if self.temporary { "TEMPORARY " } else { "" },
             transient = if self.transient { "TRANSIENT " } else { "" },
             volatile = if self.volatile { "VOLATILE " } else { "" },
@@ -3101,15 +4187,24 @@ impl fmt::Display for CreateTable {
         if let Some(on_cluster) = &self.on_cluster {
             write!(f, " ON CLUSTER {on_cluster}")?;
         }
-        if !self.columns.is_empty() || !self.constraints.is_empty() {
+        if !self.elements.is_empty() {
             f.write_str(" (")?;
             NewLine.fmt(f)?;
-            Indent(DisplayCommaSeparated(&self.columns)).fmt(f)?;
-            if !self.columns.is_empty() && !self.constraints.is_empty() {
-                f.write_str(",")?;
-                SpaceOrNewline.fmt(f)?;
+            for (index, element) in self.elements.iter().enumerate() {
+                if index != 0 {
+                    f.write_char(',')?;
+                    SpaceOrNewline.fmt(f)?;
+                }
+                match element {
+                    CreateTableElement::Column(ordinal) => {
+                        Indent(&self.columns[*ordinal]).fmt(f)?
+                    }
+                    CreateTableElement::Constraint(ordinal) => {
+                        Indent(&self.constraints[*ordinal]).fmt(f)?
+                    }
+                    CreateTableElement::Like(like) => Indent(like).fmt(f)?,
+                }
             }
-            Indent(DisplayCommaSeparated(&self.constraints)).fmt(f)?;
             NewLine.fmt(f)?;
             f.write_str(")")?;
         } else if self.query.is_none()
@@ -3129,7 +4224,18 @@ impl fmt::Display for CreateTable {
         // Hive table comment should be after column definitions, please refer to:
         // [Hive](https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL#LanguageManualDDL-CreateTable)
         if let Some(comment) = &self.comment {
-            write!(f, " COMMENT '{comment}'")?;
+            match comment {
+                CommentDef::WithEq(value) => {
+                    write!(f, " COMMENT = '{}'", escape_single_quote_string(value))?
+                }
+                CommentDef::WithoutEq(value) => {
+                    write!(f, " COMMENT '{}'", escape_single_quote_string(value))?
+                }
+                CommentDef::MySql { has_eq, text } => {
+                    f.write_str(if *has_eq { " COMMENT = " } else { " COMMENT " })?;
+                    text.fmt(f)?;
+                }
+            }
         }
 
         // Only for SQLite
@@ -3377,7 +4483,12 @@ impl fmt::Display for CreateTable {
             write!(f, " SORTKEY({})", display_comma_separated(sortkey))?;
         }
         if let Some(query) = &self.query {
+            if let Some(partitioning) = &self.mysql_partitioning {
+                write!(f, " {partitioning}")?;
+            }
             write!(f, " AS {query}")?;
+        } else if let Some(partitioning) = &self.mysql_partitioning {
+            write!(f, " {partitioning}")?;
         }
         Ok(())
     }
@@ -3551,6 +4662,8 @@ pub enum FunctionReturnType {
     ///
     /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-createfunction.html)
     SetOf(DataType),
+    /// `RETURNS TABLE(column_name type, ...)`
+    Table(Vec<OperateFunctionArg>),
 }
 
 impl fmt::Display for FunctionReturnType {
@@ -3558,6 +4671,9 @@ impl fmt::Display for FunctionReturnType {
         match self {
             FunctionReturnType::DataType(data_type) => write!(f, "{data_type}"),
             FunctionReturnType::SetOf(data_type) => write!(f, "SETOF {data_type}"),
+            FunctionReturnType::Table(columns) => {
+                write!(f, "TABLE({})", display_comma_separated(columns))
+            }
         }
     }
 }
@@ -3567,6 +4683,8 @@ impl fmt::Display for FunctionReturnType {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// CREATE FUNCTION statement
 pub struct CreateFunction {
+    /// MySQL saved-body source/header facts; never an evaluated function body.
+    pub mysql_body: Option<MySqlProgramBody>,
     /// True if this is a `CREATE OR ALTER FUNCTION` statement
     ///
     /// [MsSql](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-function-transact-sql?view=sql-server-ver16#or-alter)
@@ -3698,6 +4816,11 @@ impl fmt::Display for CreateFunction {
         if let Some(CreateFunctionBody::Return(function_body)) = &self.function_body {
             write!(f, " RETURN {function_body}")?;
         }
+        if let Some(CreateFunctionBody::BeginAtomic(body)) = &self.function_body {
+            write!(f, " BEGIN ATOMIC ")?;
+            super::format_statement_list(f, &body.statements)?;
+            write!(f, " END")?;
+        }
         if let Some(CreateFunctionBody::AsReturnExpr(function_body)) = &self.function_body {
             write!(f, " AS RETURN {function_body}")?;
         }
@@ -3816,7 +4939,7 @@ pub enum AlterSchemaOperation {
     /// Set options for the schema.
     SetOptionsParens {
         /// The options to set.
-        options: Vec<SqlOption>,
+        options: AlterSchemaSetOperation,
     },
     /// Rename the schema.
     Rename {
@@ -3844,11 +4967,70 @@ impl fmt::Display for AlterSchemaOperation {
                 Ok(())
             }
             AlterSchemaOperation::DropReplica { replica } => write!(f, "DROP REPLICA {replica}"),
-            AlterSchemaOperation::SetOptionsParens { options } => {
-                write!(f, "SET OPTIONS ({})", display_comma_separated(options))
-            }
+            AlterSchemaOperation::SetOptionsParens { options } => options.fmt(f),
             AlterSchemaOperation::Rename { name } => write!(f, "RENAME TO {name}"),
             AlterSchemaOperation::OwnerTo { owner } => write!(f, "OWNER TO {owner}"),
+        }
+    }
+}
+
+/// Typed payloads carried by `AlterSchemaOperation::SetOptionsParens`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterSchemaSetOperation {
+    /// Portable `SET OPTIONS (...)` values.
+    Options(Vec<SqlOption>),
+    /// MySQL database character defaults and the ALTER-only read-only option.
+    MySqlDatabaseDefaults {
+        /// Optional default character set.
+        character_set: Option<Ident>,
+        /// Optional default collation.
+        collation: Option<Ident>,
+        /// Explicit READ ONLY clause, normalized to false for 0 or DEFAULT.
+        read_only: Option<bool>,
+    },
+}
+
+impl AlterSchemaSetOperation {
+    /// Preserve the collection interface used by span consumers for portable
+    /// schema options.
+    pub fn iter(&self) -> core::slice::Iter<'_, SqlOption> {
+        match self {
+            Self::Options(options) => options.iter(),
+            Self::MySqlDatabaseDefaults { .. } => [].iter(),
+        }
+    }
+}
+
+impl fmt::Display for AlterSchemaSetOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Options(options) => {
+                write!(f, "SET OPTIONS ({})", display_comma_separated(options))
+            }
+            Self::MySqlDatabaseDefaults {
+                character_set,
+                collation,
+                read_only,
+            } => {
+                if let Some(character_set) = character_set {
+                    write!(f, "DEFAULT CHARACTER SET = {character_set}")?;
+                }
+                if let Some(collation) = collation {
+                    if character_set.is_some() {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "DEFAULT COLLATE = {collation}")?;
+                }
+                if let Some(read_only) = read_only {
+                    if character_set.is_some() || collation.is_some() {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "READ ONLY = {}", u8::from(*read_only))?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -3881,8 +5063,9 @@ impl fmt::Display for RenameTableNameKind {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// An `ALTER SCHEMA` (`Statement::AlterSchema`) statement.
 pub struct AlterSchema {
-    /// The schema name to alter.
-    pub name: ObjectName,
+    /// The schema name, or None for MySQL's actual current-database form.
+    /// Portable dialects always parse an explicit name.
+    pub name: Option<ObjectName>,
     /// Whether `IF EXISTS` was specified.
     pub if_exists: bool,
     /// The list of operations to perform on the schema.
@@ -3891,13 +5074,30 @@ pub struct AlterSchema {
 
 impl fmt::Display for AlterSchema {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ALTER SCHEMA ")?;
+        let mysql_database = self.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                AlterSchemaOperation::SetOptionsParens {
+                    options: AlterSchemaSetOperation::MySqlDatabaseDefaults { .. }
+                }
+            )
+        });
+        write!(
+            f,
+            "ALTER {} ",
+            if mysql_database { "DATABASE" } else { "SCHEMA" }
+        )?;
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write!(f, "{}", self.name)?;
-        for operation in &self.operations {
-            write!(f, " {operation}")?;
+        if let Some(name) = &self.name {
+            write!(f, "{name}")?;
+        }
+        for (ordinal, operation) in self.operations.iter().enumerate() {
+            if self.name.is_some() || ordinal != 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{operation}")?;
         }
 
         Ok(())
@@ -3950,6 +5150,8 @@ impl Display for TriggerObjectKind {
 /// Postgres: <https://www.postgresql.org/docs/current/sql-createtrigger.html>
 /// SQL Server: <https://learn.microsoft.com/en-us/sql/t-sql/statements/create-trigger-transact-sql>
 pub struct CreateTrigger {
+    /// MySQL saved-body source/header facts from the actual CREATE occurrence.
+    pub mysql_body: Option<MySqlProgramBody>,
     /// True if this is a `CREATE OR ALTER TRIGGER` statement
     ///
     /// [MsSql](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-trigger-transact-sql?view=sql-server-ver16#arguments)
@@ -4054,6 +5256,7 @@ pub struct CreateTrigger {
 impl Display for CreateTrigger {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let CreateTrigger {
+            mysql_body: _,
             or_alter,
             temporary,
             or_replace,
@@ -4287,6 +5490,52 @@ impl Spanned for Msck {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+/// Explicit scope of a MySQL view `CHECK OPTION`.
+pub enum ViewCheckOptionKind {
+    /// Apply the check recursively through referenced views.
+    Cascaded,
+    /// Apply the check only to the view being created.
+    Local,
+}
+
+impl fmt::Display for ViewCheckOptionKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Cascaded => f.write_str("CASCADED"),
+            Self::Local => f.write_str("LOCAL"),
+        }
+    }
+}
+
+/// MySQL `WITH [CASCADED | LOCAL] CHECK OPTION`, including its source bounds.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ViewCheckOption {
+    /// Explicit `CASCADED` or `LOCAL` scope.
+    pub kind: ViewCheckOptionKind,
+    /// Source token for `WITH`.
+    pub with_token: AttachedToken,
+    /// Source token for the final `OPTION` keyword.
+    pub option_token: AttachedToken,
+}
+
+impl ViewCheckOption {
+    /// Return the source span from `WITH` through `OPTION`.
+    pub fn span(&self) -> Span {
+        self.with_token.0.span.union(&self.option_token.0.span)
+    }
+}
+
+impl fmt::Display for ViewCheckOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "WITH {} CHECK OPTION", self.kind)
+    }
+}
+
 /// CREATE VIEW statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -4341,6 +5590,8 @@ pub struct CreateView {
     pub to: Option<ObjectName>,
     /// MySQL: Optional parameters for the view algorithm, definer, and security context
     pub params: Option<CreateViewParams>,
+    /// MySQL view row-validation policy.
+    pub check_option: Option<ViewCheckOption>,
 }
 
 impl fmt::Display for CreateView {
@@ -4406,6 +5657,9 @@ impl fmt::Display for CreateView {
         self.query.fmt(f)?;
         if self.with_no_schema_binding {
             write!(f, " WITH NO SCHEMA BINDING")?;
+        }
+        if let Some(check_option) = &self.check_option {
+            write!(f, " {check_option}")?;
         }
         Ok(())
     }
@@ -4657,6 +5911,32 @@ pub enum AlterTableType {
     External,
 }
 
+/// MySQL table comment option, including its source bounds.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlAlterTableComment {
+    /// Decoded comment text without surrounding string delimiters.
+    pub value: ValueWithSpan,
+    /// Source token for `COMMENT`.
+    pub comment_token: AttachedToken,
+    /// Source token containing the comment string literal.
+    pub value_token: AttachedToken,
+}
+
+impl MySqlAlterTableComment {
+    /// Return the source span covering the complete comment option.
+    pub fn span(&self) -> Span {
+        self.comment_token.0.span.union(&self.value_token.0.span)
+    }
+}
+
+impl fmt::Display for MySqlAlterTableComment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "COMMENT = {}", self.value)
+    }
+}
+
 /// ALTER TABLE statement
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -4671,6 +5951,8 @@ pub struct AlterTable {
     pub only: bool,
     /// List of `ALTER TABLE` operations to apply.
     pub operations: Vec<AlterTableOperation>,
+    /// MySQL table comment option.
+    pub comment: Option<MySqlAlterTableComment>,
     /// Optional Hive `SET LOCATION` clause for the alter operation.
     pub location: Option<HiveSetLocation>,
     /// ClickHouse dialect supports `ON CLUSTER` clause for ALTER TABLE
@@ -4703,6 +5985,12 @@ impl fmt::Display for AlterTable {
             write!(f, "ON CLUSTER {cluster} ")?;
         }
         write!(f, "{}", display_comma_separated(&self.operations))?;
+        if let Some(comment) = &self.comment {
+            if !self.operations.is_empty() {
+                write!(f, ", ")?;
+            }
+            write!(f, "{comment}")?;
+        }
         if let Some(loc) = &self.location {
             write!(f, " {loc}")?
         }
@@ -5359,7 +6647,7 @@ impl Spanned for AlterOperatorClass {
     }
 }
 
-/// `ALTER FUNCTION` / `ALTER AGGREGATE` statement.
+/// `ALTER FUNCTION` / `ALTER PROCEDURE` / `ALTER AGGREGATE` statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -5387,6 +6675,8 @@ pub struct AlterFunction {
 pub enum AlterFunctionKind {
     /// `FUNCTION`
     Function,
+    /// `PROCEDURE`
+    Procedure,
     /// `AGGREGATE`
     Aggregate,
 }
@@ -5395,6 +6685,7 @@ impl fmt::Display for AlterFunctionKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Function => write!(f, "FUNCTION"),
+            Self::Procedure => write!(f, "PROCEDURE"),
             Self::Aggregate => write!(f, "AGGREGATE"),
         }
     }
@@ -5424,7 +6715,7 @@ pub enum AlterFunctionOperation {
         /// Extension name.
         extension_name: ObjectName,
     },
-    /// `action [ ... ] [ RESTRICT ]` (function only).
+    /// `action [ ... ] [ RESTRICT ]`.
     Actions {
         /// One or more function actions.
         actions: Vec<AlterFunctionAction>,
@@ -5470,7 +6761,7 @@ impl fmt::Display for AlterFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ALTER {} ", self.kind)?;
         match self.kind {
-            AlterFunctionKind::Function => {
+            AlterFunctionKind::Function | AlterFunctionKind::Procedure => {
                 write!(f, "{} ", self.function)?;
             }
             AlterFunctionKind::Aggregate => {

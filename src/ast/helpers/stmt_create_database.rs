@@ -382,7 +382,7 @@ mod tests {
     #[test]
     pub fn test_from_invalid_statement() {
         let stmt = Statement::Commit {
-            chain: false,
+            completion: Default::default(),
             end: false,
             modifier: None,
         };

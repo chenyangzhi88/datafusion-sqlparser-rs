@@ -16,12 +16,983 @@
 // under the License.
 
 #[cfg(not(feature = "std"))]
-use alloc::string::String;
+use alloc::{string::String, sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use core::{
     fmt,
     ops::{Deref, DerefMut},
 };
+
+/// Opaque lifetime of an allocation admitted by the caller's existing budget.
+/// It has no SQL, compiler, credential or charset authority.
+#[derive(Clone)]
+pub struct SqlSourceAdmission {
+    #[cfg(feature = "std")]
+    guard: Arc<dyn Send + Sync>,
+}
+
+impl SqlSourceAdmission {
+    #[cfg(feature = "std")]
+    /// Retains the caller's existing allocation lease without granting SQL authority.
+    /// The lease is released when its final shared guard is dropped.
+    pub fn new<T: Send + Sync + 'static>(guard: Arc<T>) -> Self {
+        Self { guard }
+    }
+
+    #[cfg(not(feature = "std"))]
+    /// Creates the no-std admission token; the caller remains responsible for
+    /// accounting and retaining any external allocation lease.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl fmt::Debug for SqlSourceAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SqlSourceAdmission")
+    }
+}
+
+/// The one immutable original byte allocation and its actual admission lease.
+/// Adopted Vec capacity, not just its length, must be admitted before this call.
+pub struct SqlSourceOwner {
+    bytes: Vec<u8>,
+    admission: SqlSourceAdmission,
+}
+
+impl SqlSourceOwner {
+    /// Adopts one immutable byte allocation and its already acquired lease.
+    /// The caller must admit the Vec's capacity and shared-owner header before
+    /// calling; this constructor does not reserve memory or validate SQL.
+    pub fn adopt(bytes: Vec<u8>, admission: SqlSourceAdmission) -> Arc<Self> {
+        Arc::new(Self { bytes, admission })
+    }
+
+    /// Shared physical owner header, excluding the separately admitted Vec capacity.
+    pub fn owner_allocation_bytes() -> usize {
+        core::mem::size_of::<Self>() + 2 * core::mem::size_of::<usize>()
+    }
+
+    /// Borrows original bytes without decoding or producing compiler values.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the adopted Vec capacity, including unused admitted storage.
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Creates an attached, half-open byte occurrence retaining this owner.
+    /// Rejects reversed or out-of-bounds ranges; an empty in-bounds range is valid.
+    pub fn occurrence(
+        self: &Arc<Self>,
+        range: core::ops::Range<usize>,
+    ) -> Result<SqlSourceOccurrence, String> {
+        if range.start > range.end || range.end > self.bytes.len() {
+            return Err("SQL source occurrence is outside its admitted owner".into());
+        }
+        Ok(SqlSourceOccurrence {
+            owner: Some(self.clone()),
+            start: range.start,
+            end: range.end,
+            canonical_digest: None,
+        })
+    }
+}
+
+impl fmt::Debug for SqlSourceOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqlSourceOwner")
+            .field("length", &self.bytes.len())
+            .field("capacity", &self.bytes.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Checked original byte range. Serialized occurrences contain ONLY ranges;
+/// catalog readers must explicitly reattach their one admitted source owner.
+/// No serialized reservation, duplicated entire SQL or implicit rebinding.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct SqlSourceOccurrence {
+    #[cfg_attr(feature = "serde", serde(skip))]
+    owner: Option<Arc<SqlSourceOwner>>,
+    start: usize,
+    end: usize,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    canonical_digest: Option<crate::tokenizer::MySqlCanonicalDigestReceipt>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for SqlSourceOccurrence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Transport {
+            start: usize,
+            end: usize,
+        }
+        let value = Transport::deserialize(deserializer)?;
+        if value.start > value.end {
+            return Err(serde::de::Error::custom(
+                "invalid detached SQL source range",
+            ));
+        }
+        Ok(Self {
+            owner: None,
+            start: value.start,
+            end: value.end,
+            canonical_digest: None,
+        })
+    }
+}
+
+impl SqlSourceOccurrence {
+    /// Borrows facts sealed by this occurrence's successful raw statement
+    /// grammar. They are not serialized, inherited by subranges, or an
+    /// execution/PSI publication credential; consumers still validate the
+    /// original owner, occurrence, parse role and current controls.
+    pub fn canonical_digest(&self) -> Option<&crate::tokenizer::MySqlCanonicalDigestReceipt> {
+        self.canonical_digest.as_ref()
+    }
+
+    pub(crate) fn attach_canonical_digest(
+        &mut self,
+        digest: crate::tokenizer::MySqlCanonicalDigestReceipt,
+    ) {
+        self.canonical_digest = Some(digest);
+    }
+
+    /// Returns the half-open offsets into the original owner's byte allocation.
+    /// Detached offsets alone do not establish source admission or byte identity.
+    pub fn range(&self) -> core::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    /// Borrows the attached owner, or returns `None` after range-only deserialization.
+    pub fn owner(&self) -> Option<&Arc<SqlSourceOwner>> {
+        self.owner.as_ref()
+    }
+
+    /// Borrows the checked original byte slice, failing for a detached occurrence.
+    pub fn bytes(&self) -> Result<&[u8], String> {
+        self.owner
+            .as_ref()
+            .and_then(|owner| owner.bytes.get(self.range()))
+            .ok_or_else(|| "SQL source occurrence requires checked owner reattachment".into())
+    }
+
+    /// Attaches this range after checking it against the supplied owner.
+    /// The catalog caller must supply the matching original source and its
+    /// admission; bounds checking does not compare historical SQL contents.
+    pub fn reattach(&mut self, owner: &Arc<SqlSourceOwner>) -> Result<(), String> {
+        let checked = owner.occurrence(self.range())?;
+        *self = checked;
+        Ok(())
+    }
+
+    /// Creates a checked sub-occurrence using offsets relative to this slice.
+    /// Requires attachment and rejects out-of-bounds ranges or offset overflow.
+    pub fn slice(&self, relative: core::ops::Range<usize>) -> Result<Self, String> {
+        let bytes = self.bytes()?;
+        if relative.start > relative.end || relative.end > bytes.len() {
+            return Err("SQL source subrange is outside its occurrence".into());
+        }
+        let start = self
+            .start
+            .checked_add(relative.start)
+            .ok_or_else(|| String::from("SQL source offset overflow"))?;
+        let end = self
+            .start
+            .checked_add(relative.end)
+            .ok_or_else(|| String::from("SQL source offset overflow"))?;
+        self.owner
+            .as_ref()
+            .ok_or_else(|| String::from("SQL source has no owner"))?
+            .occurrence(start..end)
+    }
+}
+
+impl PartialEq for SqlSourceOccurrence {
+    fn eq(&self, other: &Self) -> bool {
+        self.range() == other.range()
+    }
+}
+impl Eq for SqlSourceOccurrence {}
+impl PartialOrd for SqlSourceOccurrence {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SqlSourceOccurrence {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.start, self.end).cmp(&(other.start, other.end))
+    }
+}
+impl core::hash::Hash for SqlSourceOccurrence {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&(self.start, self.end), state);
+    }
+}
+
+/// Real source character bytes, not a Rust decoded mirror or Compiler value.
+/// An unchanged literal borrows the original owner; genuinely unescaped bytes
+/// have their own caller-admitted allocation. Original occurrence stays exact.
+#[derive(Clone, Debug)]
+pub struct MySqlText {
+    semantic: MySqlTextSemantic,
+    segments: MySqlTextSegments,
+    role: MySqlTextRole,
+}
+
+/// Native grammar role, not a conversion result or source-to-Compiler grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum MySqlTextRole {
+    /// Literal semantic bytes before the consuming expression's charset policy.
+    Literal,
+    /// TEXT_STRING_sys bytes before the actual system-text consumer conversion.
+    System,
+    /// File-name bytes whose filesystem conversion and access policy belong to
+    /// the consumer; this role does not authorize reading or writing a file.
+    FileSystem,
+    /// Text from a grammar role requiring native character validation by its
+    /// consumer; the role itself does not certify conversion has taken place.
+    Validated,
+    /// Projection-alias bytes before native alias/name policy is applied.
+    Alias,
+}
+
+/// One actual literal reduction, indexing the sole semantic byte buffer.
+/// Original source and introducer facts are not inferred from concatenated text.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct MySqlTextSegment {
+    semantic_start: usize,
+    semantic_end: usize,
+    source: SqlSourceOccurrence,
+    charset: String,
+    quote: char,
+    introducer: Option<String>,
+    binary_literal: Option<crate::tokenizer::MySqlHexLiteralKind>,
+}
+
+impl MySqlTextSegment {
+    /// Records one literal reduction over a shared semantic byte buffer.
+    /// Checks range ordering, attached original source, nonempty charset and
+    /// quote syntax. The enclosing text checks the complete buffer partition.
+    /// `introducer` is the actual source fact, not a deduction from byte contents.
+    pub fn new(
+        semantic_range: core::ops::Range<usize>,
+        source: SqlSourceOccurrence,
+        charset: String,
+        quote: char,
+        introducer: Option<String>,
+    ) -> Result<Self, String> {
+        if semantic_range.start > semantic_range.end
+            || charset.is_empty()
+            || !matches!(quote, '\'' | '"' | '`' | '\0')
+        {
+            return Err("invalid MySQL literal segment facts".into());
+        }
+        source.bytes()?;
+        Ok(Self {
+            semantic_start: semantic_range.start,
+            semantic_end: semantic_range.end,
+            source,
+            charset,
+            quote,
+            introducer,
+            binary_literal: None,
+        })
+    }
+    /// Returns this segment's half-open offsets in the sole semantic buffer.
+    pub fn semantic_range(&self) -> core::ops::Range<usize> {
+        self.semantic_start..self.semantic_end
+    }
+    /// Borrows the exact original source occurrence for this literal reduction.
+    pub fn source(&self) -> &SqlSourceOccurrence {
+        &self.source
+    }
+    /// Returns the source charset fact supplied for this segment, not a decoded
+    /// UTF-8 classification of its semantic bytes.
+    pub fn charset(&self) -> &str {
+        &self.charset
+    }
+    /// Returns the literal delimiter; `\0` denotes the unquoted role.
+    pub fn quote(&self) -> char {
+        self.quote
+    }
+    /// Returns the explicit source introducer, if the literal had one.
+    pub fn introducer(&self) -> Option<&str> {
+        self.introducer.as_deref()
+    }
+    fn semantic_key(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        &str,
+        char,
+        Option<&str>,
+        Option<crate::tokenizer::MySqlHexLiteralKind>,
+    ) {
+        (
+            self.semantic_start,
+            self.semantic_end,
+            &self.charset,
+            self.quote,
+            self.introducer(),
+            self.binary_literal,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MySqlTextSegments {
+    Single([MySqlTextSegment; 1]),
+    /// Caller admits Vec capacity, segment string capacities and owner header
+    /// before allocating. This lease follows the same immutable text entity.
+    Adjacent(Arc<MySqlTextSegmentOwner>),
+}
+
+#[derive(Clone, Debug)]
+struct MySqlTextSegmentOwner {
+    parts: Vec<MySqlTextSegment>,
+    admission: Option<SqlSourceAdmission>,
+}
+
+fn check_mysql_text_segments(parts: &[MySqlTextSegment], length: usize) -> Result<(), String> {
+    if parts.is_empty() {
+        return Err("MySQL text has no literal segment".into());
+    }
+    let mut end = 0;
+    let mut source_end = 0;
+    for part in parts {
+        if part.semantic_start != end
+            || part.semantic_end < end
+            || part.semantic_end > length
+            || part.charset.is_empty()
+            || !matches!(part.quote, '\'' | '"' | '`' | '\0')
+            || part.source.start > part.source.end
+            || part.source.start < source_end
+        {
+            return Err("MySQL text segments do not partition its semantic buffer".into());
+        }
+        end = part.semantic_end;
+        source_end = part.source.end;
+    }
+    if end != length {
+        return Err("MySQL text segments leave unclaimed bytes".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+enum MySqlTextSemantic {
+    Admitted(SqlSourceOccurrence),
+    /// Same semantic owner after the actual native declaration adapter bound
+    /// its connection/binary byte domain. Original occurrence remains in segments.
+    Declaration(SqlSourceOccurrence),
+    /// A decoded catalog transport value, not admitted execution source.
+    Detached(Vec<u8>),
+    /// Durable declaration facts without runtime Source/admission proof.
+    DetachedDeclaration(Vec<u8>),
+}
+
+impl MySqlText {
+    /// Same admitted semantic allocation of an actual lexer identifier.
+    /// Borrowing it does not clone segment strings or grant parser authority.
+    pub(crate) fn canonical_identifier_occurrence(&self) -> Option<&SqlSourceOccurrence> {
+        match &self.semantic {
+            MySqlTextSemantic::Admitted(source) | MySqlTextSemantic::Declaration(source) => {
+                Some(source)
+            }
+            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_) => None,
+        }
+    }
+
+    /// Header for the one shared adjacent-segment allocation, in addition to
+    /// Vec and String capacities charged by its builder/catalog caller.
+    pub fn segment_owner_allocation_bytes() -> usize {
+        core::mem::size_of::<MySqlTextSegmentOwner>() + 2 * core::mem::size_of::<usize>()
+    }
+    /// Constructs a single-segment literal from attached semantic and original
+    /// source occurrences. Unescaped bytes may borrow the original owner;
+    /// transformed bytes must already have their own admitted owner.
+    pub fn from_occurrence(
+        semantic: SqlSourceOccurrence,
+        source: SqlSourceOccurrence,
+        charset: String,
+        quote: char,
+        introducer: Option<String>,
+    ) -> Result<Self, String> {
+        let length = semantic.bytes()?.len();
+        let segment = MySqlTextSegment::new(0..length, source, charset, quote, introducer)?;
+        Ok(Self {
+            semantic: MySqlTextSemantic::Admitted(semantic),
+            segments: MySqlTextSegments::Single([segment]),
+            role: MySqlTextRole::Literal,
+        })
+    }
+    /// Combines adjacent literal reductions without copying their semantic bytes.
+    /// Segments must exactly partition that buffer in order and share one attached
+    /// original source owner. The caller admits segment/string capacities and
+    /// the shared-owner header before transferring `parts` and its lease.
+    pub fn from_segments(
+        semantic: SqlSourceOccurrence,
+        parts: Vec<MySqlTextSegment>,
+        admission: SqlSourceAdmission,
+    ) -> Result<Self, String> {
+        check_mysql_text_segments(&parts, semantic.bytes()?.len())?;
+        let owner = parts[0]
+            .source
+            .owner()
+            .ok_or_else(|| String::from("detached literal source"))?;
+        for part in &parts {
+            part.source.bytes()?;
+            if !part
+                .source
+                .owner()
+                .is_some_and(|other| Arc::ptr_eq(owner, other))
+            {
+                return Err("adjacent literals do not share their actual source owner".into());
+            }
+        }
+        Ok(Self {
+            semantic: MySqlTextSemantic::Admitted(semantic),
+            segments: MySqlTextSegments::Adjacent(Arc::new(MySqlTextSegmentOwner {
+                parts,
+                admission: Some(admission),
+            })),
+            role: MySqlTextRole::Literal,
+        })
+    }
+    /// Bind this actual single declaration reduction. A grammar role alone
+    /// cannot call the bound-state reader; the adapter supplies admitted
+    /// semantic bytes and the matching original owner before replacement.
+    pub fn bind_declaration(
+        &mut self,
+        semantic: SqlSourceOccurrence,
+        charset: String,
+        expected: &Arc<SqlSourceOwner>,
+    ) -> Result<(), String> {
+        if self.segments().len() != 1 || self.introducer().is_some() {
+            return Err("declaration requires one unintroduced literal".into());
+        }
+        let source = self.source().clone();
+        if !source
+            .owner()
+            .is_some_and(|owner| Arc::ptr_eq(owner, expected))
+        {
+            return Err("declaration belongs to a foreign original Source".into());
+        }
+        source.bytes()?;
+        let length = semantic.bytes()?.len();
+        let mut part = MySqlTextSegment::new(0..length, source, charset, self.quote(), None)?;
+        part.binary_literal = self.binary_literal();
+        self.segments = MySqlTextSegments::Single([part]);
+        self.semantic = MySqlTextSemantic::Declaration(semantic);
+        Ok(())
+    }
+    /// Actual admitted declaration state; detached serde facts and with_role
+    /// do not confer this proof. Used only inside native datatype declarations.
+    pub fn declaration_bytes(&self) -> Result<&[u8], String> {
+        let MySqlTextSemantic::Declaration(semantic) = &self.semantic else {
+            return Err("native declaration is not adapter-bound".into());
+        };
+        if self.segments().len() != 1 || self.introducer().is_some() {
+            return Err("invalid native declaration grammar".into());
+        }
+        self.source().bytes()?;
+        semantic.bytes()
+    }
+    /// Reports durable declaration grammar facts without granting admission.
+    pub fn is_declaration(&self) -> bool {
+        matches!(
+            self.semantic,
+            MySqlTextSemantic::Declaration(_) | MySqlTextSemantic::DetachedDeclaration(_)
+        )
+    }
+
+    /// Records only the actual lexer binary production consumed by native
+    /// text_string grammar. The original source occurrence remains unchanged.
+    pub fn with_binary_literal(
+        mut self,
+        kind: crate::tokenizer::MySqlHexLiteralKind,
+    ) -> Result<Self, String> {
+        let MySqlTextSegments::Single(parts) = &mut self.segments else {
+            return Err("binary declaration cannot be an adjacent literal".into());
+        };
+        if parts[0].charset != "binary" || parts[0].introducer.is_some() {
+            return Err("binary declaration has an incompatible source domain".into());
+        }
+        parts[0].binary_literal = Some(kind);
+        Ok(self)
+    }
+    /// Actual HEX_NUM/BIN_NUM lexical provenance, never inferred from displayed text.
+    pub fn binary_literal(&self) -> Option<crate::tokenizer::MySqlHexLiteralKind> {
+        self.segments()[0].binary_literal
+    }
+    /// Mark already admitted binary semantic bytes in the original owner.
+    pub fn bind_binary_declaration(
+        &mut self,
+        expected: &Arc<SqlSourceOwner>,
+    ) -> Result<(), String> {
+        if self.binary_literal().is_none() || self.charset() != "binary" {
+            return Err("declaration has no actual binary lexical production".into());
+        }
+        if !self
+            .source()
+            .owner()
+            .is_some_and(|owner| Arc::ptr_eq(owner, expected))
+        {
+            return Err("binary declaration belongs to a foreign original Source".into());
+        }
+        self.source().bytes()?;
+        let old = core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
+        self.semantic = match old {
+            MySqlTextSemantic::Admitted(value) | MySqlTextSemantic::Declaration(value) => {
+                MySqlTextSemantic::Declaration(value)
+            }
+            other => {
+                self.semantic = other;
+                return Err("binary declaration requires runtime admission".into());
+            }
+        };
+        Ok(())
+    }
+
+    /// Returns the native grammar role, independently of conversion or admission.
+    pub fn role(&self) -> MySqlTextRole {
+        self.role
+    }
+    /// Assigns the grammar role without decoding bytes or granting compiler,
+    /// filesystem or execution capabilities.
+    pub fn with_role(mut self, role: MySqlTextRole) -> Self {
+        self.role = role;
+        self
+    }
+    /// Borrows the checked ordered reductions indexing the sole semantic buffer.
+    pub fn segments(&self) -> &[MySqlTextSegment] {
+        match &self.segments {
+            MySqlTextSegments::Single(parts) => parts,
+            MySqlTextSegments::Adjacent(owner) => &owner.parts,
+        }
+    }
+    /// Borrows one segment's semantic bytes, rejecting a detached value or an
+    /// invalid ordinal/range rather than inventing a decoded fallback.
+    pub fn segment_bytes(&self, ordinal: usize) -> Result<&[u8], String> {
+        let part = self
+            .segments()
+            .get(ordinal)
+            .ok_or_else(|| String::from("literal segment ordinal is out of range"))?;
+        self.bytes()?
+            .get(part.semantic_range())
+            .ok_or_else(|| String::from("literal segment is outside semantic bytes"))
+    }
+    /// Borrows admitted semantic bytes; deserialized transport bytes require
+    /// explicit catalog reattachment and admission before they are accessible.
+    pub fn bytes(&self) -> Result<&[u8], String> {
+        match &self.semantic {
+            MySqlTextSemantic::Admitted(value) | MySqlTextSemantic::Declaration(value) => {
+                value.bytes()
+            }
+            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_) => {
+                Err("MySQL text requires catalog admission".into())
+            }
+        }
+    }
+    fn semantic_bytes(&self) -> &[u8] {
+        match &self.semantic {
+            MySqlTextSemantic::Admitted(value) | MySqlTextSemantic::Declaration(value) => {
+                value.bytes().expect("constructed checked text")
+            }
+            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedDeclaration(bytes) => {
+                bytes
+            }
+        }
+    }
+    /// Borrows the first literal's original occurrence. For adjacent literals,
+    /// inspect [`Self::segments`] for every contributing original range.
+    pub fn source(&self) -> &SqlSourceOccurrence {
+        self.segments()[0].source()
+    }
+    /// Returns the first segment's charset fact. Adjacent reductions retain
+    /// their individual charsets in [`Self::segments`].
+    pub fn charset(&self) -> &str {
+        self.segments()[0].charset()
+    }
+    /// Returns the first segment's delimiter, not a rendered whole-text quote.
+    pub fn quote(&self) -> char {
+        self.segments()[0].quote()
+    }
+    /// Returns the first segment's explicit source introducer, if present.
+    pub fn introducer(&self) -> Option<&str> {
+        self.segments()[0].introducer()
+    }
+    /// Records an introducer on a single reduction before adjacent concatenation.
+    /// Rejects already combined segments so their source facts are not rewritten.
+    pub fn with_introducer(mut self, introducer: String) -> Result<Self, String> {
+        match &mut self.segments {
+            MySqlTextSegments::Single(parts) => parts[0].introducer = Some(introducer),
+            MySqlTextSegments::Adjacent(_) => {
+                return Err("introducer must precede adjacent literal reduction".into());
+            }
+        }
+        Ok(self)
+    }
+    /// Exact retained transport capacities and possible shared-owner clone
+    /// headers needed by catalog reattachment. This reports allocation cost,
+    /// not source or compiler authority; overflow is explicit.
+    pub fn semantic_allocation_bytes(&self) -> Option<usize> {
+        let semantic = match &self.semantic {
+            MySqlTextSemantic::Admitted(_) | MySqlTextSemantic::Declaration(_) => 0,
+            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedDeclaration(bytes) => {
+                bytes
+                    .capacity()
+                    .checked_add(SqlSourceOwner::owner_allocation_bytes())?
+            }
+        };
+        let segment = match &self.segments {
+            MySqlTextSegments::Single(_) => 0,
+            MySqlTextSegments::Adjacent(owner) => owner
+                .parts
+                .capacity()
+                .checked_mul(core::mem::size_of::<MySqlTextSegment>())?
+                .checked_add(Self::segment_owner_allocation_bytes())?,
+        };
+        self.segments()
+            .iter()
+            .try_fold(semantic.checked_add(segment)?, |cost, part| {
+                cost.checked_add(part.charset.capacity())?
+                    .checked_add(part.introducer.as_ref().map_or(0, String::capacity))
+            })
+    }
+
+    /// Reattaches detached original ranges and admits the semantic transport bytes.
+    /// Checks segment partition and source bounds. The caller must provide the
+    /// matching original source and pre-admit semantic capacity plus any cloned
+    /// segment/string storage; leases are retained with the resulting owners.
+    /// Serialized roles/ranges never restore compiler or execution authority.
+    pub fn reattach(
+        &mut self,
+        owner: &Arc<SqlSourceOwner>,
+        semantic_admission: SqlSourceAdmission,
+    ) -> Result<(), String> {
+        check_mysql_text_segments(self.segments(), self.semantic_bytes().len())?;
+        for part in self.segments() {
+            owner.occurrence(part.source.range())?;
+        }
+        match &mut self.segments {
+            MySqlTextSegments::Single(parts) => parts[0].source.reattach(owner)?,
+            MySqlTextSegments::Adjacent(parts_owner) => {
+                // Reattachment caller admits the new segment container/string
+                // capacities before this potential catalog-transport clone.
+                let parts_owner = Arc::make_mut(parts_owner);
+                for part in &mut parts_owner.parts {
+                    part.source.reattach(owner)?;
+                }
+                parts_owner.admission = Some(semantic_admission.clone());
+            }
+        }
+        if matches!(
+            &self.semantic,
+            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_)
+        ) {
+            let old =
+                core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
+            let (bytes, declaration) = match old {
+                MySqlTextSemantic::Detached(bytes) => (bytes, false),
+                MySqlTextSemantic::DetachedDeclaration(bytes) => (bytes, true),
+                _ => unreachable!(),
+            };
+            let length = bytes.len();
+            let semantic = SqlSourceOwner::adopt(bytes, semantic_admission);
+            let occurrence = semantic.occurrence(0..length)?;
+            self.semantic = if declaration {
+                MySqlTextSemantic::Declaration(occurrence)
+            } else {
+                MySqlTextSemantic::Admitted(occurrence)
+            };
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for MySqlText {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for MySqlText {}
+impl PartialOrd for MySqlText {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MySqlText {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.semantic_bytes(), self.role)
+            .cmp(&(other.semantic_bytes(), other.role))
+            .then_with(|| {
+                self.segments()
+                    .iter()
+                    .map(MySqlTextSegment::semantic_key)
+                    .cmp(other.segments().iter().map(MySqlTextSegment::semantic_key))
+            })
+    }
+}
+impl core::hash::Hash for MySqlText {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(
+            &(self.semantic_bytes(), self.role, self.segments().len()),
+            state,
+        );
+        for segment in self.segments() {
+            core::hash::Hash::hash(&segment.semantic_key(), state);
+        }
+    }
+}
+
+impl fmt::Display for MySqlText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Display is presentation only. It must never manufacture a lossy,
+        // hex or sentinel source string for bytes that do not fit fmt::str.
+        // Preflight every contribution before emitting any prefix. source()
+        // remains the first segment for native Item result-name semantics.
+        for segment in self.segments() {
+            core::str::from_utf8(segment.source().bytes().map_err(|_| fmt::Error)?)
+                .map_err(|_| fmt::Error)?;
+        }
+        for (ordinal, segment) in self.segments().iter().enumerate() {
+            if ordinal != 0 {
+                f.write_str(" ")?;
+            }
+            let bytes = segment.source().bytes().map_err(|_| fmt::Error)?;
+            f.write_str(core::str::from_utf8(bytes).map_err(|_| fmt::Error)?)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for MySqlText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("MySqlText", 4)?;
+        state.serialize_field("bytes", self.semantic_bytes())?;
+        state.serialize_field("segments", self.segments())?;
+        state.serialize_field("role", &self.role)?;
+        state.serialize_field("declaration", &self.is_declaration())?;
+        state.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for MySqlText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Transport {
+            bytes: Vec<u8>,
+            segments: Vec<MySqlTextSegment>,
+            role: MySqlTextRole,
+            declaration: bool,
+        }
+        let value = Transport::deserialize(deserializer)?;
+        check_mysql_text_segments(&value.segments, value.bytes.len())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            semantic: if value.declaration {
+                MySqlTextSemantic::DetachedDeclaration(value.bytes)
+            } else {
+                MySqlTextSemantic::Detached(value.bytes)
+            },
+            segments: MySqlTextSegments::Adjacent(Arc::new(MySqlTextSegmentOwner {
+                parts: value.segments,
+                admission: None,
+            })),
+            role: value.role,
+        })
+    }
+}
+
+#[cfg(feature = "visitor")]
+macro_rules! source_visit_noop {
+    ($($ty:ty),* $(,)?) => {$ (
+        impl crate::ast::Visit for $ty {
+            fn visit<V: crate::ast::Visitor>(&self, _: &mut V) -> core::ops::ControlFlow<V::Break> { core::ops::ControlFlow::Continue(()) }
+        }
+        impl crate::ast::VisitMut for $ty {
+            fn visit<V: crate::ast::VisitorMut>(&mut self, _: &mut V) -> core::ops::ControlFlow<V::Break> { core::ops::ControlFlow::Continue(()) }
+        }
+    )*};
+}
+#[cfg(feature = "visitor")]
+source_visit_noop!(
+    SqlSourceOccurrence,
+    SqlCppPieceRange,
+    SqlCppLedger,
+    MySqlProjectionLiteral
+);
+
+/// A projection's original grammar naming fact, not a second executable
+/// literal. Visitors must not rewrite/evaluate it along with the VALUE Item.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct MySqlProjectionLiteral(MySqlText);
+
+impl MySqlProjectionLiteral {
+    /// Retains the original literal grammar node for projection naming only.
+    /// This does not evaluate or bind its VALUE, or acquire source admission.
+    pub fn new(text: MySqlText) -> Self {
+        Self(text)
+    }
+    /// Borrows the original literal segments and their shared source owner.
+    pub fn text(&self) -> &MySqlText {
+        &self.0
+    }
+}
+
+#[cfg(feature = "visitor")]
+impl crate::ast::Visit for MySqlText {
+    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        visitor.pre_visit_mysql_text(self)?;
+        visitor.post_visit_mysql_text(self)
+    }
+}
+#[cfg(feature = "visitor")]
+impl crate::ast::VisitMut for MySqlText {
+    fn visit<V: crate::ast::VisitorMut>(
+        &mut self,
+        visitor: &mut V,
+    ) -> core::ops::ControlFlow<V::Break> {
+        visitor.pre_visit_mysql_text(self)?;
+        visitor.post_visit_mysql_text(self)
+    }
+}
+
+/// Indices into the single CPP piece ledger returned with a parsed statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SqlCppPieceRange {
+    /// Inclusive piece index in the containing parsed statement's CPP ledger.
+    pub start: usize,
+    /// Exclusive piece index; offsets index pieces, not source or rendered bytes.
+    pub end: usize,
+}
+
+/// A native CPP contribution, not rendered Expr text or duplicated SQL.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SqlCppPiece {
+    /// Exact bytes contributed by an attached original source occurrence.
+    Source(SqlSourceOccurrence),
+    /// One space inserted by the native CPP comment/token boundary policy.
+    /// It has no fabricated original-byte occurrence.
+    Space,
+}
+
+/// One shared immutable physical CPP ledger. Projection nodes retain this
+/// same owner, never a per-projection copy of the ledger or original SQL.
+/// Catalog serialization deliberately does not preserve runtime admission.
+#[derive(Clone, Debug)]
+pub struct SqlCppLedger(Arc<SqlCppLedgerOwner>);
+
+#[derive(Debug)]
+struct SqlCppLedgerOwner {
+    pieces: Vec<SqlCppPiece>,
+    source_charset: &'static str,
+    connection_charset: &'static str,
+    _admissions: Vec<SqlSourceAdmission>,
+    _container: SqlSourceAdmission,
+    _owner: SqlSourceAdmission,
+}
+
+impl SqlCppLedger {
+    /// Returns the shared ledger header and Arc counter allocation size.
+    /// The piece and admission Vec allocations require their own caller leases.
+    pub fn owner_allocation_bytes() -> usize {
+        core::mem::size_of::<SqlCppLedgerOwner>() + 2 * core::mem::size_of::<usize>()
+    }
+
+    /// Adopt the original admitted Vec allocations. `owner` covers this
+    /// shared header; the original leases cover pieces and retained admissions.
+    pub fn adopt(
+        pieces: Vec<SqlCppPiece>,
+        admissions: Vec<SqlSourceAdmission>,
+        container: SqlSourceAdmission,
+        owner: SqlSourceAdmission,
+        source_charset: &'static str,
+        connection_charset: &'static str,
+    ) -> Self {
+        Self(Arc::new(SqlCppLedgerOwner {
+            pieces,
+            source_charset,
+            connection_charset,
+            _admissions: admissions,
+            _container: container,
+            _owner: owner,
+        }))
+    }
+
+    /// Borrows a checked half-open range of original CPP contributions.
+    /// Returns an error if the range is reversed or outside this ledger.
+    pub fn pieces(&self, range: SqlCppPieceRange) -> Result<&[SqlCppPiece], String> {
+        range.pieces(&self.0.pieces)
+    }
+
+    /// Tests the actual shared ledger owner, not semantic piece equality.
+    pub fn has_same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Borrows every contribution from this single shared immutable ledger.
+    pub fn all_pieces(&self) -> &[SqlCppPiece] {
+        &self.0.pieces
+    }
+    /// Returns the original byte source charset recorded by the adopting caller.
+    pub fn source_charset(&self) -> &'static str {
+        self.0.source_charset
+    }
+    /// Returns the connection charset recorded for this parse's CPP conversion.
+    pub fn connection_charset(&self) -> &'static str {
+        self.0.connection_charset
+    }
+}
+
+impl PartialEq for SqlCppLedger {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.pieces == other.0.pieces
+    }
+}
+impl Eq for SqlCppLedger {}
+impl PartialOrd for SqlCppLedger {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SqlCppLedger {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.pieces.cmp(&other.0.pieces)
+    }
+}
+impl core::hash::Hash for SqlCppLedger {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.0.pieces, state);
+    }
+}
+
+impl SqlCppPieceRange {
+    /// Borrows the checked half-open piece slice from the matching statement
+    /// ledger, failing when the range is reversed or outside that ledger.
+    pub fn pieces<'a>(&self, ledger: &'a [SqlCppPiece]) -> Result<&'a [SqlCppPiece], String> {
+        ledger
+            .get(self.start..self.end)
+            .ok_or_else(|| "CPP range is outside its statement ledger".into())
+    }
+}
 
 #[cfg(feature = "bigdecimal")]
 use bigdecimal::BigDecimal;
@@ -137,6 +1108,8 @@ impl DerefMut for ValueWithSpan {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum Value {
+    /// A real MySQL byte-source literal; never compiler-created capability.
+    MySqlText(MySqlText),
     /// Numeric literal
     #[cfg(not(feature = "bigdecimal"))]
     Number(String, bool),
@@ -261,6 +1234,7 @@ impl fmt::Display for ValueWithSpan {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Value::MySqlText(v) => v.fmt(f),
             Value::Number(v, l) => write!(f, "{}{long}", v, long = if *l { "L" } else { "" }),
             Value::DoubleQuotedString(v) => write!(f, "\"{}\"", escape_double_quote_string(v)),
             Value::SingleQuotedString(v) => write!(f, "'{}'", escape_single_quote_string(v)),
@@ -597,6 +1571,27 @@ impl fmt::Display for EscapeQuotedString<'_> {
 /// literal that uses `quote` as the delimiter.
 pub fn escape_quoted_string(string: &str, quote: char) -> EscapeQuotedString<'_> {
     EscapeQuotedString { string, quote }
+}
+
+/// Preserve bare variable spelling when it can be parsed as one name.
+/// Constructed names need quoting for SQL delimiters or empty dotted components.
+pub(super) fn fmt_user_variable(ident: &Ident, f: &mut fmt::Formatter) -> fmt::Result {
+    if ident.quote_style.is_some()
+        || ident.value.split('.').all(|component| {
+            !component.is_empty()
+                && component.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '$')
+                        || (!character.is_ascii()
+                            && !character.is_whitespace()
+                            && !character.is_control())
+                })
+        })
+    {
+        write!(f, "@{ident}")
+    } else {
+        write!(f, "@`{}`", escape_quoted_string(&ident.value, '`'))
+    }
 }
 
 /// Convenience wrapper for escaping strings for single-quoted literals (`'`).

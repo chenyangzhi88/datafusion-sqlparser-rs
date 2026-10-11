@@ -175,6 +175,7 @@ pub mod dialect;
 pub use dialect::derive_dialect;
 mod display_utils;
 pub mod keywords;
+pub mod mysql_keywords;
 pub mod parser;
 pub mod tokenizer;
 

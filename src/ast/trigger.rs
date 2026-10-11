@@ -170,15 +170,15 @@ pub struct TriggerExecBody {
     pub exec_type: TriggerExecBodyType,
     /// Description of the function/procedure to execute.
     pub func_desc: FunctionDesc,
+    /// PostgreSQL trigger arguments are SQL expressions, not routine type
+    /// declarations. Semantic analysis restricts them to string constants.
+    pub arguments: Vec<Expr>,
 }
 
 impl fmt::Display for TriggerExecBody {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{exec_type} {func_desc}",
-            exec_type = self.exec_type,
-            func_desc = self.func_desc
-        )
+        write!(f, "{} {}(", self.exec_type, self.func_desc.name)?;
+        write!(f, "{}", display_comma_separated(&self.arguments))?;
+        f.write_str(")")
     }
 }

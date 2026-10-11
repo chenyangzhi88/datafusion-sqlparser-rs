@@ -440,6 +440,8 @@ pub fn call(function: &str, args: impl IntoIterator<Item = Expr>) -> Expr {
     Expr::Function(Function {
         name: ObjectName::from(vec![Ident::new(function)]),
         uses_odbc_syntax: false,
+        mysql_literal_source: None,
+        origin: crate::ast::FunctionOrigin::Source,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
@@ -451,6 +453,7 @@ pub fn call(function: &str, args: impl IntoIterator<Item = Expr>) -> Expr {
         }),
         filter: None,
         null_treatment: None,
+        from_first_last: None,
         over: None,
         within_group: vec![],
     })

@@ -17,9 +17,9 @@
 
 use crate::{
     ast::{
-        ddl::AlterSchema, query::SelectItemQualifiedWildcardKind, AlterSchemaOperation, AlterTable,
-        ColumnOptions, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreateView,
-        ExportData, Owner, TypedString,
+        AlterSchemaOperation, AlterTable, ColumnOptions, CreateOperator, CreateOperatorClass,
+        CreateOperatorFamily, CreateView, ExportData, Owner, TypedString, ddl::AlterSchema,
+        query::SelectItemQualifiedWildcardKind,
     },
     tokenizer::TokenWithSpan,
 };
@@ -28,26 +28,27 @@ use core::iter;
 use crate::tokenizer::Span;
 
 use super::{
-    comments, dcl::SecondaryRoles, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
-    AlterIndexOperation, AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget,
-    AttachedToken, BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef,
-    ColumnOption, ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements,
-    ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource, CreateIndex, CreateTable,
-    CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem, ExcludeSelectItem, Expr,
-    ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, HavingBound,
-    IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr, Join,
-    JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
+    AccessExpr, AlterColumnOperation, AlterIndexOperation, AlterTableOperation, Analyze, Array,
+    Assignment, AssignmentTarget, AttachedToken, BeginEndStatements, CaseStatement, CloseCursor,
+    ClusteredIndex, ColumnDef, ColumnOption, ColumnOptionDef, ConditionalStatementBlock,
+    ConditionalStatements, ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource,
+    CreateIndex, CreateTable, CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem,
+    ExcludeSelectItem, Expr, ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    HavingBound, IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr,
+    Join, JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
     MatchRecognizePattern, Measure, Merge, MergeAction, MergeClause, MergeInsertExpr,
-    MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition, ObjectName,
-    ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert, OpenStatement, OrderBy,
-    OrderByExpr, OrderByKind, OutputClause, Parens, Partition, PartitionBoundValue,
-    PivotValueSource, ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
-    ReferentialAction, RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select,
-    SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias,
+    MergeInsertKind, MergeUpdateExpr, MySqlAlterTableComment, NamedParenthesizedList,
+    NamedWindowDefinition, ObjectName, ObjectNamePart, Offset, OnConflict, OnConflictAction,
+    OnInsert, OpenStatement, OrderBy, OrderByExpr, OrderByKind, OutputClause, Parens, Partition,
+    PartitionBoundValue, PivotValueSource, ProjectionSelect, Query, RaiseStatement,
+    RaiseStatementValue, ReferentialAction, RenameSelectItem, ReplaceSelectElement,
+    ReplaceSelectItem, Select, SelectInto, SelectIntoTarget, SelectItem, SetExpr, SqlOption,
+    StartTransactionSnapshot, Statement, Subscript, SymbolDefinition, TableAlias,
     TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
-    TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewColumnDef, WhileStatement,
-    WildcardAdditionalOptions, With, WithFill,
+    TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewCheckOption, ViewColumnDef,
+    WhileStatement, WildcardAdditionalOptions, With, WithFill, comments, dcl::SecondaryRoles,
+    value::ValueWithSpan,
 };
 
 /// Given an iterator of spans, return the [Span::union] of all spans.
@@ -283,6 +284,8 @@ impl Spanned for Values {
 /// - [Statement::ShowVariables]
 /// - [Statement::ShowCreate]
 /// - [Statement::ShowColumns]
+/// - [Statement::ShowIndexes]
+/// - [Statement::ShowSchemaMetadata]
 /// - [Statement::ShowTables]
 /// - [Statement::ShowCollation]
 /// - [Statement::StartTransaction]
@@ -321,12 +324,15 @@ impl Spanned for Values {
 impl Spanned for Statement {
     fn span(&self) -> Span {
         match self {
+            Statement::Help { mask } => mask.span(),
             Statement::Analyze(analyze) => analyze.span(),
+            Statement::MySqlTableMaintenance { .. } => Span::empty(),
             Statement::Truncate(truncate) => truncate.span(),
             Statement::Msck(msck) => msck.span(),
             Statement::Query(query) => query.span(),
             Statement::Insert(insert) => insert.span(),
             Statement::Install { extension_name } => extension_name.span,
+            Statement::MySqlComponent { .. } => Span::empty(),
             Statement::Load { extension_name } => extension_name.span,
             Statement::Directory {
                 overwrite: _,
@@ -406,9 +412,10 @@ impl Spanned for Statement {
                 columns,
                 query,
                 with_options,
+                ..
             } => union_spans(
                 core::iter::once(name.span())
-                    .chain(columns.iter().map(|i| i.span))
+                    .chain(columns.iter().map(|column| column.name.span))
                     .chain(core::iter::once(query.span()))
                     .chain(with_options.iter().map(|i| i.span())),
             ),
@@ -440,11 +447,39 @@ impl Spanned for Statement {
             Statement::ShowVariables { .. } => Span::empty(),
             Statement::ShowCreate { .. } => Span::empty(),
             Statement::ShowColumns { .. } => Span::empty(),
+            Statement::ShowIndexes {
+                table_name,
+                database,
+                filter,
+                ..
+            } => table_name
+                .span()
+                .union(
+                    &database
+                        .as_ref()
+                        .map_or(Span::empty(), |database| database.span),
+                )
+                .union(&filter.as_ref().map_or(Span::empty(), Spanned::span)),
+            Statement::ShowSchemaMetadata {
+                database, filter, ..
+            } => database
+                .as_ref()
+                .map_or(Span::empty(), |database| database.span)
+                .union(&match filter {
+                    Some(super::ShowStatementFilter::Where(expression)) => expression.span(),
+                    _ => Span::empty(),
+                }),
             Statement::ShowTables { .. } => Span::empty(),
             Statement::ShowCollation { .. } => Span::empty(),
             Statement::ShowCharset { .. } => Span::empty(),
             Statement::Use(u) => u.span(),
-            Statement::StartTransaction { .. } => Span::empty(),
+            Statement::StartTransaction {
+                consistent_snapshot,
+                ..
+            } => consistent_snapshot
+                .as_ref()
+                .map(StartTransactionSnapshot::span)
+                .unwrap_or_else(Span::empty),
             Statement::Comment { .. } => Span::empty(),
             Statement::Commit { .. } => Span::empty(),
             Statement::Rollback { .. } => Span::empty(),
@@ -454,7 +489,7 @@ impl Spanned for Statement {
             Statement::CreateDomain { .. } => Span::empty(),
             Statement::CreateTrigger { .. } => Span::empty(),
             Statement::DropTrigger { .. } => Span::empty(),
-            Statement::CreateProcedure { .. } => Span::empty(),
+            Statement::CreateProcedure(_) => Span::empty(),
             Statement::CreateMacro { .. } => Span::empty(),
             Statement::CreateStage { .. } => Span::empty(),
             Statement::Assert { .. } => Span::empty(),
@@ -467,6 +502,7 @@ impl Spanned for Statement {
             Statement::Kill { .. } => Span::empty(),
             Statement::ExplainTable { .. } => Span::empty(),
             Statement::Explain { .. } => Span::empty(),
+            Statement::Do(_) => Span::empty(),
             Statement::Savepoint { .. } => Span::empty(),
             Statement::ReleaseSavepoint { .. } => Span::empty(),
             Statement::Merge(merge) => merge.span(),
@@ -488,12 +524,14 @@ impl Spanned for Statement {
             Statement::ShowCatalogs { .. } => Span::empty(),
             Statement::ShowDatabases { .. } => Span::empty(),
             Statement::ShowProcessList { .. } => Span::empty(),
+            Statement::MySqlShowProfile { .. } => Span::empty(),
             Statement::ShowSchemas { .. } => Span::empty(),
             Statement::ShowObjects { .. } => Span::empty(),
             Statement::ShowViews { .. } => Span::empty(),
             Statement::LISTEN { .. } => Span::empty(),
             Statement::NOTIFY { .. } => Span::empty(),
             Statement::LoadData { .. } => Span::empty(),
+            Statement::MySqlLoadData(load) => load.table.span(),
             Statement::UNLISTEN { .. } => Span::empty(),
             Statement::RenameTable { .. } => Span::empty(),
             Statement::RaisError { .. } => Span::empty(),
@@ -558,6 +596,7 @@ impl Spanned for CreateTable {
             name,
             columns,
             constraints,
+            elements: _,
             hive_distribution: _, // hive specific
             hive_formats: _,      // hive specific
             file_format: _,       // enum
@@ -572,6 +611,7 @@ impl Spanned for CreateTable {
             primary_key: _,  // todo, clickhouse specific
             order_by: _,     // todo, clickhouse specific
             partition_by: _, // todo, BigQuery specific
+            mysql_partitioning,
             cluster_by: _,   // todo, BigQuery specific
             clustered_by: _, // todo, Hive specific
             inherits: _,     // todo, PostgreSQL specific
@@ -614,8 +654,69 @@ impl Spanned for CreateTable {
                 .chain(query.iter().map(|i| i.span()))
                 .chain(clone.iter().map(|i| i.span()))
                 .chain(partition_of.iter().map(|i| i.span()))
-                .chain(for_values.iter().map(|i| i.span())),
+                .chain(for_values.iter().map(|i| i.span()))
+                .chain(mysql_partitioning.iter().map(|i| i.span())),
         )
+    }
+}
+
+impl Spanned for crate::ast::MySqlPartitionBy {
+    fn span(&self) -> Span {
+        use crate::ast::{MySqlPartitionMethod as M, MySqlSubpartitionMethod as S};
+        let primary = match &self.method {
+            M::Range { expression } | M::List { expression } | M::Hash { expression, .. } => {
+                expression.span()
+            }
+            M::RangeColumns { columns } | M::ListColumns { columns } | M::Key { columns, .. } => {
+                union_spans(columns.iter().map(|column| column.span))
+            }
+        };
+        let secondary = self
+            .subpartition
+            .as_ref()
+            .map_or(Span::empty(), |subpartition| match &subpartition.method {
+                S::Hash { expression, .. } => expression.span(),
+                S::Key { columns, .. } => union_spans(columns.iter().map(|column| column.span)),
+            });
+        union_spans(
+            iter::once(primary)
+                .chain(iter::once(secondary))
+                .chain(self.definitions.iter().map(Spanned::span)),
+        )
+    }
+}
+
+impl Spanned for crate::ast::MySqlPartitionDefinition {
+    fn span(&self) -> Span {
+        use crate::ast::{MySqlPartitionBound as B, MySqlPartitionValues as V};
+        let bound = |value: &B| match value {
+            B::Expr(value) => value.span(),
+            B::MaxValue => Span::empty(),
+        };
+        let values = match &self.values {
+            Some(V::LessThan(values)) => union_spans(values.iter().map(bound)),
+            Some(V::In(values)) => union_spans(values.iter().flatten().map(bound)),
+            None => Span::empty(),
+        };
+        union_spans(
+            iter::once(self.name.span)
+                .chain(iter::once(values))
+                .chain(self.options.iter().map(Spanned::span))
+                .chain(self.subpartitions.iter().flat_map(|child| {
+                    iter::once(child.name.span).chain(child.options.iter().map(Spanned::span))
+                })),
+        )
+    }
+}
+
+impl Spanned for crate::ast::MySqlPartitionOption {
+    fn span(&self) -> Span {
+        use crate::ast::MySqlPartitionOption as O;
+        match self {
+            O::Engine { engine, .. } | O::Tablespace(engine) => engine.span,
+            O::Comment(value) | O::DataDirectory(value) | O::IndexDirectory(value) => value.span(),
+            O::MaxRows(_) | O::MinRows(_) | O::Nodegroup(_) => Span::empty(),
+        }
     }
 }
 
@@ -646,6 +747,7 @@ impl Spanned for TableConstraint {
             TableConstraint::PrimaryKey(constraint) => constraint.span(),
             TableConstraint::ForeignKey(constraint) => constraint.span(),
             TableConstraint::Check(constraint) => constraint.span(),
+            TableConstraint::Exclude(constraint) => constraint.span(),
             TableConstraint::Index(constraint) => constraint.span(),
             TableConstraint::FulltextOrSpatial(constraint) => constraint.span(),
             TableConstraint::PrimaryKeyUsingIndex(constraint)
@@ -684,6 +786,7 @@ impl Spanned for ForValues {
 impl Spanned for CreateIndex {
     fn span(&self) -> Span {
         let CreateIndex {
+            kind: _,
             name,
             table_name,
             using: _,
@@ -831,6 +934,7 @@ impl Spanned for ColumnOption {
             ColumnOption::CharacterSet(object_name) => object_name.span(),
             ColumnOption::Collation(object_name) => object_name.span(),
             ColumnOption::Comment(_) => Span::empty(),
+            ColumnOption::MySqlComment(_) => Span::empty(),
             ColumnOption::OnUpdate(expr) => expr.span(),
             ColumnOption::Generated { .. } => Span::empty(),
             ColumnOption::Options(vec) => union_spans(vec.iter().map(|i| i.span())),
@@ -840,6 +944,7 @@ impl Spanned for ColumnOption {
             ColumnOption::Tags(..) => Span::empty(),
             ColumnOption::Srid(..) => Span::empty(),
             ColumnOption::Invisible => Span::empty(),
+            ColumnOption::Visible => Span::empty(),
         }
     }
 }
@@ -887,6 +992,7 @@ impl Spanned for Analyze {
 /// - [AlterColumnOperation::DropNotNull]
 /// - [AlterColumnOperation::DropDefault]
 /// - [AlterColumnOperation::AddGenerated]
+/// - identity lifecycle operations
 impl Spanned for AlterColumnOperation {
     fn span(&self) -> Span {
         match self {
@@ -894,12 +1000,20 @@ impl Spanned for AlterColumnOperation {
             AlterColumnOperation::DropNotNull => Span::empty(),
             AlterColumnOperation::SetDefault { value } => value.span(),
             AlterColumnOperation::DropDefault => Span::empty(),
+            AlterColumnOperation::SetStatistics { .. }
+            | AlterColumnOperation::SetStorage { .. }
+            | AlterColumnOperation::SetCompression { .. }
+            | AlterColumnOperation::SetVisibility { .. } => Span::empty(),
             AlterColumnOperation::SetDataType {
                 data_type: _,
                 using,
                 had_set: _,
             } => using.as_ref().map_or(Span::empty(), |u| u.span()),
-            AlterColumnOperation::AddGenerated { .. } => Span::empty(),
+            AlterColumnOperation::AddGenerated { .. }
+            | AlterColumnOperation::SetGenerated { .. }
+            | AlterColumnOperation::SetSequenceOptions { .. }
+            | AlterColumnOperation::RestartIdentity { .. }
+            | AlterColumnOperation::DropIdentity { .. } => Span::empty(),
         }
     }
 }
@@ -925,6 +1039,7 @@ impl Spanned for Delete {
             optimizer_hints: _,
             tables,
             from,
+            postgres_target_inheritance: _,
             using,
             selection,
             returning,
@@ -960,6 +1075,7 @@ impl Spanned for Update {
             update_token,
             optimizer_hints: _,
             table,
+            postgres_target_inheritance: _,
             assignments,
             from,
             selection,
@@ -1208,6 +1324,7 @@ impl Spanned for AlterTableOperation {
             AlterTableOperation::AlterColumn { column_name, op } => {
                 column_name.span.union(&op.span())
             }
+            AlterTableOperation::AlterIndexVisibility { name, .. } => name.span,
             AlterTableOperation::SwapWith { table_name } => table_name.span(),
             AlterTableOperation::SetTblProperties { table_properties } => {
                 union_spans(table_properties.iter().map(|i| i.span()))
@@ -1334,7 +1451,8 @@ impl Spanned for Insert {
             table,
             table_alias,
             columns,
-            overwrite: _, // bool
+            overriding: _, // identity generation policy
+            overwrite: _,  // bool
             source,
             partitioned,
             after_columns,
@@ -1464,6 +1582,7 @@ impl Spanned for Expr {
     fn span(&self) -> Span {
         match self {
             Expr::Identifier(ident) => ident.span,
+            Expr::UserVariable(ident) => ident.span,
             Expr::CompoundIdentifier(vec) => union_spans(vec.iter().map(|i| i.span)),
             Expr::CompoundFieldAccess { root, access_chain } => {
                 union_spans(iter::once(root.span()).chain(access_chain.iter().map(|i| i.span())))
@@ -1508,14 +1627,14 @@ impl Spanned for Expr {
                 expr,
                 pattern,
                 escape_char: _,
-                any: _,
+                quantifier: _,
             } => expr.span().union(&pattern.span()),
             Expr::ILike {
                 negated: _,
                 expr,
                 pattern,
                 escape_char: _,
-                any: _,
+                quantifier: _,
             } => expr.span().union(&pattern.span()),
             Expr::RLike { .. } => Span::empty(),
             Expr::IsNormalized {
@@ -1525,6 +1644,7 @@ impl Spanned for Expr {
             } => expr.span(),
             Expr::SimilarTo {
                 negated: _,
+                quantifier: _,
                 expr,
                 pattern,
                 escape_char: _,
@@ -1558,6 +1678,18 @@ impl Spanned for Expr {
             Expr::Array(array) => array.span(),
             Expr::MatchAgainst { .. } => Span::empty(),
             Expr::JsonAccess { value, path } => value.span().union(&path.span()),
+            Expr::JsonValue(json_value) => {
+                let mut span = json_value.json.span().union(&json_value.path.span());
+                for clause in [json_value.on_empty.as_ref(), json_value.on_error.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let super::JsonValueClause::Default(expr) = clause {
+                        span = span.union(&expr.span());
+                    }
+                }
+                span
+            }
             Expr::AnyOp {
                 left,
                 compare_op: _,
@@ -1574,6 +1706,7 @@ impl Spanned for Expr {
                 expr,
                 data_type: _,
                 charset,
+                binary_attribute: _,
                 target_before_value: _,
                 styles,
                 is_try: _,
@@ -1709,6 +1842,7 @@ impl Spanned for ObjectNamePart {
     fn span(&self) -> Span {
         match self {
             ObjectNamePart::Identifier(ident) => ident.span,
+            ObjectNamePart::UserVariable(ident) => ident.span,
             ObjectNamePart::Function(func) => func
                 .name
                 .span
@@ -1720,11 +1854,17 @@ impl Spanned for ObjectNamePart {
 impl Spanned for Array {
     fn span(&self) -> Span {
         let Array {
+            opening_token,
+            closing_token,
             elem,
             named: _, // bool
         } = self;
 
-        union_spans(elem.iter().map(|i| i.span()))
+        opening_token
+            .0
+            .span
+            .union(&closing_token.0.span)
+            .union(&union_spans(elem.iter().map(|i| i.span())))
     }
 }
 
@@ -1732,12 +1872,15 @@ impl Spanned for Function {
     fn span(&self) -> Span {
         let Function {
             name,
+            origin: _,
             uses_odbc_syntax: _,
+            mysql_literal_source: _,
             parameters,
             args,
             filter,
-            null_treatment: _, // enum
-            over: _,           // todo
+            null_treatment: _,  // enum
+            from_first_last: _, // enum
+            over: _,            // todo
             within_group,
         } = self;
 
@@ -1786,6 +1929,7 @@ impl Spanned for FunctionArgumentList {
 impl Spanned for FunctionArgumentClause {
     fn span(&self) -> Span {
         match self {
+            FunctionArgumentClause::UsingCharacterSet(charset) => charset.span,
             FunctionArgumentClause::IgnoreOrRespectNulls(_) => Span::empty(),
             FunctionArgumentClause::OrderBy(vec) => union_spans(vec.iter().map(|i| i.expr.span())),
             FunctionArgumentClause::Limit(expr) => expr.span(),
@@ -1835,6 +1979,9 @@ impl Spanned for SelectItemQualifiedWildcardKind {
 impl Spanned for SelectItem {
     fn span(&self) -> Span {
         match self {
+            // Byte/CPP boundaries above are authoritative; Expr span remains
+            // the shared logical span and is not claimed to include unary text.
+            SelectItem::MySqlProjection { expr, .. } => expr.span(),
             SelectItem::UnnamedExpr(expr) => expr.span(),
             SelectItem::ExprWithAlias { expr, alias } => expr.span().union(&alias.span),
             SelectItem::ExprWithAliases { expr, aliases } => {
@@ -1968,6 +2115,7 @@ impl Spanned for TableFactor {
                 subquery,
                 alias,
                 sample: _,
+                ..
             } => subquery
                 .span()
                 .union_opt(&alias.as_ref().map(|alias| alias.span())),
@@ -2004,6 +2152,12 @@ impl Spanned for TableFactor {
                     .iter()
                     .map(|i| i.span())
                     .chain(args.iter().map(|i| i.span()))
+                    .chain(alias.as_ref().map(|alias| alias.span())),
+            ),
+            TableFactor::RowsFrom { items, alias, .. } => union_spans(
+                items
+                    .iter()
+                    .map(|item| item.factor.span())
                     .chain(alias.as_ref().map(|alias| alias.span())),
             ),
             TableFactor::JsonTable { .. } => Span::empty(),
@@ -2385,10 +2539,17 @@ impl Spanned for SelectInto {
             temporary: _, // bool
             unlogged: _,  // bool
             table: _,     // bool
-            name,
+            target,
         } = self;
 
-        name.span()
+        match target {
+            SelectIntoTarget::Table(name) => name.span(),
+            SelectIntoTarget::Variables(variables) => {
+                union_spans(variables.iter().map(Spanned::span))
+            }
+            SelectIntoTarget::File(_) => Span::empty(),
+            SelectIntoTarget::MySqlFile(file) => file.path.span,
+        }
     }
 }
 
@@ -2463,7 +2624,10 @@ impl Spanned for AlterSchemaOperation {
 impl Spanned for AlterSchema {
     fn span(&self) -> Span {
         union_spans(
-            core::iter::once(self.name.span()).chain(self.operations.iter().map(|i| i.span())),
+            self.name
+                .iter()
+                .map(Spanned::span)
+                .chain(self.operations.iter().map(Spanned::span)),
         )
     }
 }
@@ -2476,7 +2640,8 @@ impl Spanned for CreateView {
                 .chain(core::iter::once(self.query.span()))
                 .chain(core::iter::once(self.options.span()))
                 .chain(self.cluster_by.iter().map(|i| i.span))
-                .chain(self.to.iter().map(|i| i.span())),
+                .chain(self.to.iter().map(|i| i.span()))
+                .chain(self.check_option.iter().map(ViewCheckOption::span)),
         )
     }
 }
@@ -2486,6 +2651,7 @@ impl Spanned for AlterTable {
         union_spans(
             core::iter::once(self.name.span())
                 .chain(self.operations.iter().map(|i| i.span()))
+                .chain(self.comment.iter().map(MySqlAlterTableComment::span))
                 .chain(self.on_cluster.iter().map(|i| i.span))
                 .chain(core::iter::once(self.end_token.0.span)),
         )
@@ -2522,6 +2688,10 @@ impl Spanned for MergeAction {
             MergeAction::Insert(expr) => expr.span(),
             MergeAction::Update(expr) => expr.span(),
             MergeAction::Delete { delete_token } => delete_token.0.span,
+            MergeAction::DoNothing {
+                do_token,
+                nothing_token,
+            } => union_spans([do_token.0.span, nothing_token.0.span].into_iter()),
         }
     }
 }
@@ -2678,25 +2848,37 @@ pub mod tests {
     #[test]
     pub fn test_cte() {
         let dialect = &GenericDialect;
-        let mut test = SpanTest::new(dialect, "WITH cte_outer AS (SELECT a FROM postgres.public.source), cte_ignored AS (SELECT a FROM cte_outer), cte_inner AS (SELECT a FROM cte_outer) SELECT a FROM cte_inner");
+        let mut test = SpanTest::new(
+            dialect,
+            "WITH cte_outer AS (SELECT a FROM postgres.public.source), cte_ignored AS (SELECT a FROM cte_outer), cte_inner AS (SELECT a FROM cte_outer) SELECT a FROM cte_inner",
+        );
 
         let query = test.0.parse_query().unwrap();
 
         let select_span = query.span();
 
-        assert_eq!(test.get_source(select_span), "WITH cte_outer AS (SELECT a FROM postgres.public.source), cte_ignored AS (SELECT a FROM cte_outer), cte_inner AS (SELECT a FROM cte_outer) SELECT a FROM cte_inner");
+        assert_eq!(
+            test.get_source(select_span),
+            "WITH cte_outer AS (SELECT a FROM postgres.public.source), cte_ignored AS (SELECT a FROM cte_outer), cte_inner AS (SELECT a FROM cte_outer) SELECT a FROM cte_inner"
+        );
     }
 
     #[test]
     pub fn test_snowflake_lateral_flatten() {
         let dialect = &SnowflakeDialect;
-        let mut test = SpanTest::new(dialect, "SELECT FLATTENED.VALUE:field::TEXT AS FIELD FROM SNOWFLAKE.SCHEMA.SOURCE AS S, LATERAL FLATTEN(INPUT => S.JSON_ARRAY) AS FLATTENED");
+        let mut test = SpanTest::new(
+            dialect,
+            "SELECT FLATTENED.VALUE:field::TEXT AS FIELD FROM SNOWFLAKE.SCHEMA.SOURCE AS S, LATERAL FLATTEN(INPUT => S.JSON_ARRAY) AS FLATTENED",
+        );
 
         let query = test.0.parse_select().unwrap();
 
         let select_span = query.span();
 
-        assert_eq!(test.get_source(select_span), "SELECT FLATTENED.VALUE:field::TEXT AS FIELD FROM SNOWFLAKE.SCHEMA.SOURCE AS S, LATERAL FLATTEN(INPUT => S.JSON_ARRAY) AS FLATTENED");
+        assert_eq!(
+            test.get_source(select_span),
+            "SELECT FLATTENED.VALUE:field::TEXT AS FIELD FROM SNOWFLAKE.SCHEMA.SOURCE AS S, LATERAL FLATTEN(INPUT => S.JSON_ARRAY) AS FLATTENED"
+        );
     }
 
     #[test]

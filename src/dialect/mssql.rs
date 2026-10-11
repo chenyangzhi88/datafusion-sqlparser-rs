@@ -353,6 +353,7 @@ impl MsSqlDialect {
         let statements = Some(parser.parse_conditional_statements(&[Keyword::END])?);
 
         Ok(CreateTrigger {
+            mysql_body: None,
             or_alter,
             temporary: false,
             or_replace: false,

@@ -26,16 +26,77 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::{
     ast::display_separated,
-    display_utils::{indented_list, Indent, SpaceOrNewline},
+    display_utils::{Indent, SpaceOrNewline, indented_list},
 };
 
 use super::{
-    display_comma_separated, helpers::attached_token::AttachedToken, query::InputFormatClause,
     Assignment, Expr, FromTable, Ident, InsertAliases, MysqlInsertPriority, ObjectName, OnInsert,
     OptimizerHint, OrderByExpr, Query, SelectInto, SelectItem, Setting, SqliteOnConflict,
     TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
-    Values,
+    Values, display_comma_separated, helpers::attached_token::AttachedToken,
+    query::InputFormatClause,
 };
+
+/// PostgreSQL identity-column input policy for an INSERT source.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum InsertOverriding {
+    /// Accept supplied values for GENERATED ALWAYS identity columns.
+    SystemValue,
+    /// Generate identity values instead of evaluating their supplied expressions.
+    UserValue,
+}
+
+/// MySQL modifiers accepted between `DELETE` and its target list.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlDeleteModifier {
+    /// Prefer waiting behind statements that read from the target table.
+    LowPriority,
+    /// Skip index-leaf merging during the delete.
+    Quick,
+    /// Continue after ignorable row errors.
+    Ignore,
+}
+
+/// PostgreSQL inheritance expansion attached to an UPDATE/DELETE target.
+///
+/// `Default` and an explicit trailing `*` select the same row set, but the
+/// spelling is retained because stored SQL and diagnostics must not recover it
+/// from rendered text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum PostgresTargetInheritance {
+    /// Use PostgreSQL's default target inheritance expansion.
+    #[default]
+    Default,
+    /// Restrict the target to the named relation itself.
+    Only,
+    /// Expand the target to descendants using an explicit trailing `*`.
+    Descendants,
+}
+
+impl Display for MySqlDeleteModifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LowPriority => "LOW_PRIORITY",
+            Self::Quick => "QUICK",
+            Self::Ignore => "IGNORE",
+        })
+    }
+}
+
+impl Display for InsertOverriding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SystemValue => "OVERRIDING SYSTEM VALUE",
+            Self::UserValue => "OVERRIDING USER VALUE",
+        })
+    }
+}
 
 /// INSERT statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -62,6 +123,8 @@ pub struct Insert {
     pub table_alias: Option<TableAliasWithoutColumns>,
     /// COLUMNS
     pub columns: Vec<ObjectName>,
+    /// PostgreSQL identity input policy, placed after the column list.
+    pub overriding: Option<InsertOverriding>,
     /// Overwrite (Hive)
     pub overwrite: bool,
     /// A SQL query that specifies what to insert
@@ -194,6 +257,11 @@ impl Display for Insert {
             SpaceOrNewline.fmt(f)?;
         }
 
+        if let Some(overriding) = self.overriding {
+            write!(f, "{overriding}")?;
+            SpaceOrNewline.fmt(f)?;
+        }
+
         if let Some(ref parts) = self.partitioned {
             if !parts.is_empty() {
                 write!(f, "PARTITION ({})", display_comma_separated(parts))?;
@@ -291,6 +359,8 @@ pub struct Delete {
     pub tables: Vec<ObjectName>,
     /// FROM
     pub from: FromTable,
+    /// PostgreSQL ONLY / trailing `*` identity for the single DELETE target.
+    pub postgres_target_inheritance: PostgresTargetInheritance,
     /// USING (Snowflake, Postgres, MySQL)
     pub using: Option<Vec<TableWithJoins>>,
     /// WHERE
@@ -319,10 +389,20 @@ impl Display for Delete {
         match &self.from {
             FromTable::WithFromKeyword(from) => {
                 f.write_str(" FROM")?;
-                indented_list(f, from)?;
+                if from.len() == 1 {
+                    SpaceOrNewline.fmt(f)?;
+                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                } else {
+                    indented_list(f, from)?;
+                }
             }
             FromTable::WithoutKeyword(from) => {
-                indented_list(f, from)?;
+                if from.len() == 1 {
+                    SpaceOrNewline.fmt(f)?;
+                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                } else {
+                    indented_list(f, from)?;
+                }
             }
         }
         if let Some(output) = &self.output {
@@ -360,6 +440,18 @@ impl Display for Delete {
     }
 }
 
+impl Delete {
+    /// Return MySQL DELETE modifiers in their source order.
+    pub fn mysql_modifiers(&self) -> impl Iterator<Item = MySqlDeleteModifier> + '_ {
+        self.optimizer_hints
+            .iter()
+            .filter_map(|hint| match &hint.style {
+                super::OptimizerHintStyle::MySqlDeleteModifier(modifier) => Some(*modifier),
+                _ => None,
+            })
+    }
+}
+
 /// UPDATE statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -374,6 +466,8 @@ pub struct Update {
     pub optimizer_hints: Vec<OptimizerHint>,
     /// TABLE
     pub table: TableWithJoins,
+    /// PostgreSQL ONLY / trailing `*` identity for the UPDATE target.
+    pub postgres_target_inheritance: PostgresTargetInheritance,
     /// Column assignments
     pub assignments: Vec<Assignment>,
     /// Table which provide value to be set
@@ -406,7 +500,7 @@ impl Display for Update {
             or.fmt(f)?;
             f.write_str(" ")?;
         }
-        self.table.fmt(f)?;
+        fmt_postgres_dml_target(f, &self.table, self.postgres_target_inheritance)?;
         if let Some(UpdateTableFromKind::BeforeSet(from)) = &self.from {
             SpaceOrNewline.fmt(f)?;
             f.write_str("FROM")?;
@@ -448,6 +542,36 @@ impl Display for Update {
         }
         Ok(())
     }
+}
+
+fn fmt_postgres_dml_target(
+    f: &mut fmt::Formatter<'_>,
+    table: &TableWithJoins,
+    inheritance: PostgresTargetInheritance,
+) -> fmt::Result {
+    if inheritance == PostgresTargetInheritance::Only {
+        f.write_str("ONLY ")?;
+        return table.fmt(f);
+    }
+    if inheritance != PostgresTargetInheritance::Descendants {
+        return table.fmt(f);
+    }
+    let TableFactor::Table { alias, .. } = &table.relation else {
+        return table.fmt(f);
+    };
+    let mut relation = table.relation.clone();
+    if let TableFactor::Table { alias, .. } = &mut relation {
+        *alias = None;
+    }
+    relation.fmt(f)?;
+    f.write_str(" *")?;
+    if let Some(alias) = alias {
+        write!(f, " {alias}")?;
+    }
+    for join in &table.joins {
+        write!(f, " {join}")?;
+    }
+    Ok(())
 }
 
 /// A `MERGE` statement.
@@ -608,6 +732,18 @@ pub enum MergeAction {
         /// The `DELETE` token that starts the sub-expression.
         delete_token: AttachedToken,
     },
+    /// Do not modify the selected candidate row.
+    ///
+    /// PostgreSQL permits this action for both `WHEN MATCHED` and
+    /// `WHEN NOT MATCHED` clauses. Keeping it in the AST is important: it
+    /// still participates in first-matching-clause selection and statement
+    /// privilege checks even though it produces no row mutation.
+    DoNothing {
+        /// The `DO` token that starts the action.
+        do_token: AttachedToken,
+        /// The `NOTHING` token that completes the action.
+        nothing_token: AttachedToken,
+    },
 }
 
 impl Display for MergeAction {
@@ -621,6 +757,9 @@ impl Display for MergeAction {
             }
             MergeAction::Delete { .. } => {
                 write!(f, "DELETE")
+            }
+            MergeAction::DoNothing { .. } => {
+                write!(f, "DO NOTHING")
             }
         }
     }

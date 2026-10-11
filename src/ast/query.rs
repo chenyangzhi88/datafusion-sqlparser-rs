@@ -863,6 +863,28 @@ pub enum SelectItemQualifiedWildcardKind {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum SelectItem {
+    /// Projection from an admitted MySQL byte source. The CPP range references
+    /// the parsed statement ledger, never Expr's presentation string.
+    MySqlProjection {
+        /// Actual projection expression retaining its source-origin AST.
+        expr: Expr,
+        /// Explicit alias before native alias/name conversion; `None` means
+        /// the public label must be derived from the original CPP occurrence.
+        alias: Option<super::MySqlText>,
+        /// Checked original bytes for this projection. Detached catalog ranges
+        /// require the matching admitted source owner to be reattached.
+        source_occurrence: super::SqlSourceOccurrence,
+        /// Half-open indices into the containing statement's CPP piece ledger,
+        /// including native inserted spaces rather than rendered Expr text.
+        cpp_piece_range: super::SqlCppPieceRange,
+        /// Bound by the actual byte-source adapter from that parse's ledger.
+        /// A deserialized definition must rebind its original byte source.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        bound_cpp: Option<super::SqlCppLedger>,
+        /// Actual pre-rewrite literal grammar node, sharing its admitted
+        /// segment owner. Native automatic names use only its first segment.
+        source_literal: Option<super::MySqlProjectionLiteral>,
+    },
     /// Any expression, not followed by `[ AS ] alias`
     UnnamedExpr(Expr),
     /// An expression, followed by `[ AS ] alias`
@@ -1178,6 +1200,13 @@ impl fmt::Display for SelectItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use core::fmt::Write;
         match &self {
+            SelectItem::MySqlProjection { expr, alias, .. } => {
+                expr.fmt(f)?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {alias}")?;
+                }
+                Ok(())
+            }
             SelectItem::UnnamedExpr(expr) => expr.fmt(f),
             SelectItem::ExprWithAlias { expr, alias } => {
                 expr.fmt(f)?;
@@ -1364,6 +1393,34 @@ pub struct TableFunctionArgs {
     pub settings: Option<Vec<Setting>>,
 }
 
+/// One set-returning function in PostgreSQL's `ROWS FROM` construct.
+///
+/// The optional column definition list is part of the function item rather
+/// than the outer table alias.  PostgreSQL uses it to give a `record` result
+/// its concrete names and types at the call site.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct RowsFromItem {
+    /// Source routine name used for PostgreSQL's default output label.
+    pub name: Ident,
+    /// Set-returning function relation. It is boxed because routine binding
+    /// may replace the call with a derived relation exposing OUT columns.
+    pub factor: Box<TableFactor>,
+    /// Optional `AS (name type, ...)` record definition.
+    pub columns: Vec<ColumnDef>,
+}
+
+impl fmt::Display for RowsFromItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.factor)?;
+        if !self.columns.is_empty() {
+            write!(f, " AS ({})", display_comma_separated(&self.columns))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -1428,6 +1485,19 @@ impl fmt::Display for TableIndexHintForClause {
             TableIndexHintForClause::GroupBy => "GROUP BY",
         })
     }
+}
+
+/// The producer of a derived-table boundary. SQL text cannot issue a compiler
+/// View-column wrapper; rendering and reparsing always produces `Source`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum DerivedTableOrigin {
+    /// A source SQL factor or an ordinary compiler-generated derived table.
+    #[default]
+    Source,
+    /// The compiler's ordinal-preserving CREATE VIEW public-column wrapper.
+    ViewColumnAlias,
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -1498,6 +1568,8 @@ pub enum TableFactor {
     },
     /// A derived table (a parenthesized subquery), optionally `LATERAL`.
     Derived {
+        /// Actual producer provenance, retained by cloning and serialization.
+        origin: DerivedTableOrigin,
         /// Whether the derived table is LATERAL.
         lateral: bool,
         /// The subquery producing the derived table.
@@ -1525,6 +1597,16 @@ pub enum TableFactor {
         /// Whether `WITH ORDINALITY` was specified to include ordinality.
         with_ordinality: bool,
         /// Optional alias for the result of the function.
+        alias: Option<TableAlias>,
+    },
+    /// PostgreSQL `ROWS FROM(function [AS (columns)], ...) [WITH ORDINALITY]`.
+    RowsFrom {
+        /// Functions whose result rows are zipped, padding shorter results
+        /// with NULLs to the longest result.
+        items: Vec<RowsFromItem>,
+        /// Whether to append a one-based `bigint` ordinality column.
+        with_ordinality: bool,
+        /// Optional alias for the complete zipped relation.
         alias: Option<TableAlias>,
     },
     /// ```sql
@@ -1568,8 +1650,9 @@ pub enum TableFactor {
         /// The JSON expression to be evaluated. It must evaluate to a json string
         json_expr: Expr,
         /// The path to the array or object to be iterated over.
-        /// It must evaluate to a json array or object.
-        json_path: ValueWithSpan,
+        /// Grammar admits a literal only; the owning SQL adapter may replace
+        /// that literal with its real typed compiler Item before lowering.
+        json_path: Expr,
         /// The columns to be extracted from each element of the array or object.
         /// Each column must have a name and a type.
         columns: Vec<JsonTableColumn>,
@@ -2258,6 +2341,7 @@ impl fmt::Display for TableFactor {
                 subquery,
                 alias,
                 sample,
+                ..
             } => {
                 if *lateral {
                     write!(f, "LATERAL ")?;
@@ -2287,6 +2371,20 @@ impl fmt::Display for TableFactor {
                 }
                 write!(f, "{name}")?;
                 write!(f, "({})", display_comma_separated(args))?;
+                if *with_ordinality {
+                    write!(f, " WITH ORDINALITY")?;
+                }
+                if let Some(alias) = alias {
+                    write!(f, " {alias}")?;
+                }
+                Ok(())
+            }
+            TableFactor::RowsFrom {
+                items,
+                with_ordinality,
+                alias,
+            } => {
+                write!(f, "ROWS FROM ({})", display_comma_separated(items))?;
                 if *with_ordinality {
                     write!(f, " WITH ORDINALITY")?;
                 }
@@ -3690,18 +3788,178 @@ pub struct SelectInto {
     pub unlogged: bool,
     /// `TABLE` keyword present.
     pub table: bool,
-    /// Name of the target table.
-    pub name: ObjectName,
+    /// The unique destination of the selected rows.
+    pub target: SelectIntoTarget,
+}
+
+/// A table, a list of MySQL variables, or a MySQL server-side file.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum SelectIntoTarget {
+    /// Create a table from the selected rows.
+    Table(ObjectName),
+    /// Assign the selected columns to MySQL variables.
+    Variables(Vec<ObjectName>),
+    /// Write the selected rows to a MySQL server-side file.
+    File(SelectIntoFile),
+    /// Admitted MySQL byte source; decoded/generic file fields remain unchanged.
+    MySqlFile(MySqlSelectIntoFile),
+}
+
+/// Native MySQL file-output syntax retaining admitted byte text roles.
+/// It neither authorizes filesystem access nor performs output conversion;
+/// generic decoded file output remains [`SelectIntoFile`].
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct MySqlSelectIntoFile {
+    /// Actual output pathname literal and span; raw input preserves its
+    /// filesystem-role bytes until the output consumer applies native policy.
+    pub path: super::ValueWithSpan,
+    /// `true` for DUMPFILE, `false` for OUTFILE; runtime row/format limits are
+    /// not enforced by this syntax node.
+    pub dumpfile: bool,
+    /// Optional explicit CHARACTER SET expression, without an inferred default.
+    pub character_set: Option<Expr>,
+    /// Ordered explicit FIELDS options, reusing the native LOAD literal roles.
+    pub fields: Vec<super::MySqlLoadFieldOption>,
+    /// Ordered explicit LINES options; missing defaults stay omitted.
+    pub lines: Vec<super::MySqlLoadLineOption>,
+}
+
+impl fmt::Display for MySqlSelectIntoFile {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "INTO {} {}",
+            if self.dumpfile { "DUMPFILE" } else { "OUTFILE" },
+            self.path
+        )?;
+        if let Some(charset) = &self.character_set {
+            write!(f, " CHARACTER SET {charset}")?;
+        }
+        if !self.fields.is_empty() {
+            write!(f, " FIELDS")?;
+            for field in &self.fields {
+                write!(f, " {field}")?;
+            }
+        }
+        if !self.lines.is_empty() {
+            write!(f, " LINES")?;
+            for line in &self.lines {
+                write!(f, " {line}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// MySQL `SELECT ... INTO { OUTFILE | DUMPFILE }` destination and text format.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct SelectIntoFile {
+    /// Server-side destination path.
+    pub path: String,
+    /// `true` for `DUMPFILE`, `false` for `OUTFILE`.
+    pub dumpfile: bool,
+    /// Optional output character set.
+    pub character_set: Option<ObjectName>,
+    /// `FIELDS TERMINATED BY` value.
+    pub fields_terminated_by: Option<String>,
+    /// `FIELDS ENCLOSED BY` value.
+    pub fields_enclosed_by: Option<String>,
+    /// Whether `OPTIONALLY` precedes `ENCLOSED BY`.
+    pub fields_optionally_enclosed: bool,
+    /// `FIELDS ESCAPED BY` value.
+    pub fields_escaped_by: Option<String>,
+    /// `LINES STARTING BY` value.
+    pub lines_starting_by: Option<String>,
+    /// `LINES TERMINATED BY` value.
+    pub lines_terminated_by: Option<String>,
 }
 
 impl fmt::Display for SelectInto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let SelectIntoTarget::MySqlFile(file) = &self.target {
+            return file.fmt(f);
+        }
+        if let SelectIntoTarget::File(file) = &self.target {
+            let path = escape_mysql_file_literal(&file.path);
+            write!(
+                f,
+                "INTO {} '{path}'",
+                if file.dumpfile { "DUMPFILE" } else { "OUTFILE" }
+            )?;
+            if let Some(character_set) = &file.character_set {
+                write!(f, " CHARACTER SET {character_set}")?;
+            }
+            if !file.dumpfile
+                && (file.fields_terminated_by.is_some()
+                    || file.fields_enclosed_by.is_some()
+                    || file.fields_escaped_by.is_some())
+            {
+                f.write_str(" FIELDS")?;
+                if let Some(value) = &file.fields_terminated_by {
+                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                }
+                if let Some(value) = &file.fields_enclosed_by {
+                    if file.fields_optionally_enclosed {
+                        f.write_str(" OPTIONALLY")?;
+                    }
+                    write!(f, " ENCLOSED BY '{}'", escape_mysql_file_literal(value))?;
+                }
+                if let Some(value) = &file.fields_escaped_by {
+                    write!(f, " ESCAPED BY '{}'", escape_mysql_file_literal(value))?;
+                }
+            }
+            if !file.dumpfile
+                && (file.lines_starting_by.is_some() || file.lines_terminated_by.is_some())
+            {
+                f.write_str(" LINES")?;
+                if let Some(value) = &file.lines_starting_by {
+                    write!(f, " STARTING BY '{}'", escape_mysql_file_literal(value))?;
+                }
+                if let Some(value) = &file.lines_terminated_by {
+                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                }
+            }
+            return Ok(());
+        }
         let temporary = if self.temporary { " TEMPORARY" } else { "" };
         let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
         let table = if self.table { " TABLE" } else { "" };
 
-        write!(f, "INTO{}{}{} {}", temporary, unlogged, table, self.name)
+        match &self.target {
+            SelectIntoTarget::Table(name) => {
+                write!(f, "INTO{}{}{} {}", temporary, unlogged, table, name)
+            }
+            SelectIntoTarget::Variables(variables) => {
+                write!(f, "INTO {}", display_comma_separated(variables))
+            }
+            SelectIntoTarget::File(_) => unreachable!("file destination was formatted above"),
+            SelectIntoTarget::MySqlFile(_) => {
+                unreachable!("raw file destination was formatted above")
+            }
+        }
     }
+}
+
+fn escape_mysql_file_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{1a}' => escaped.push_str("\\Z"),
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("''"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// ClickHouse supports GROUP BY WITH modifiers(includes ROLLUP|CUBE|TOTALS).
@@ -4023,8 +4281,8 @@ impl fmt::Display for JsonTableColumn {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 /// A nested column in a `JSON_TABLE` column list.
 pub struct JsonTableNestedColumn {
-    /// JSON path expression (must be a literal `Value`).
-    pub path: ValueWithSpan,
+    /// Grammar admits a literal; binding retains its actual typed Item.
+    pub path: Expr,
     /// Columns extracted from the matched nested array.
     pub columns: Vec<JsonTableColumn>,
 }
@@ -4055,31 +4313,58 @@ pub struct JsonTableNamedColumn {
     pub name: Ident,
     /// The type of the column to be extracted.
     pub r#type: DataType,
-    /// The path to the column to be extracted. Must be a literal string.
-    pub path: ValueWithSpan,
+    /// Explicit native CHARACTER SET/CHARSET declaration, if present.
+    pub character_set: Option<Ident>,
+    /// Explicit native COLLATE declaration, distinct from the connection default.
+    pub collation: Option<ObjectName>,
+    /// The path to the column to be extracted. Grammar admits a literal string;
+    /// its actual typed binding, rather than decoded AST text, owns its charset.
+    pub path: Expr,
     /// true if the column is a boolean set to true if the given path exists
     pub exists: bool,
     /// The empty handling clause of the column
     pub on_empty: Option<JsonTableColumnErrorHandling>,
     /// The error handling clause of the column
     pub on_error: Option<JsonTableColumnErrorHandling>,
+    /// True only when the grammar reduced ON ERROR followed by ON EMPTY.
+    /// Preserves presentation order; Source diagnostics are emitted by the
+    /// actual parser's adapter at that reduction, never from this inert fact.
+    pub on_error_before_empty: bool,
 }
 
 impl fmt::Display for JsonTableNamedColumn {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.r#type,)?;
+        if let Some(charset) = &self.character_set {
+            write!(f, " CHARACTER SET {charset}")?;
+        }
+        if let Some(collation) = &self.collation {
+            write!(f, " COLLATE {collation}")?;
+        }
         write!(
             f,
-            "{} {}{} PATH {}",
-            self.name,
-            self.r#type,
+            "{} PATH {}",
             if self.exists { " EXISTS" } else { "" },
             self.path
         )?;
-        if let Some(on_empty) = &self.on_empty {
-            write!(f, " {on_empty} ON EMPTY")?;
-        }
-        if let Some(on_error) = &self.on_error {
-            write!(f, " {on_error} ON ERROR")?;
+        let empty = |f: &mut fmt::Formatter| -> fmt::Result {
+            if let Some(value) = &self.on_empty {
+                write!(f, " {value} ON EMPTY")?;
+            }
+            Ok(())
+        };
+        let error = |f: &mut fmt::Formatter| -> fmt::Result {
+            if let Some(value) = &self.on_error {
+                write!(f, " {value} ON ERROR")?;
+            }
+            Ok(())
+        };
+        if self.on_error_before_empty {
+            error(f)?;
+            empty(f)?;
+        } else {
+            empty(f)?;
+            error(f)?;
         }
         Ok(())
     }
@@ -4094,8 +4379,9 @@ impl fmt::Display for JsonTableNamedColumn {
 pub enum JsonTableColumnErrorHandling {
     /// `NULL` — return NULL when the path does not match.
     Null,
-    /// `DEFAULT <value>` — use the provided `Value` as a default.
-    Default(ValueWithSpan),
+    /// `DEFAULT <value>` — grammar admits a literal, then its actual bound Item
+    /// supplies the declaration's native JSON text and character domain.
+    Default(Expr),
     /// `ERROR` — raise an error.
     Error,
 }

@@ -17,7 +17,9 @@
 
 //! Recursive visitors for ast Nodes. See [`Visitor`] for more details.
 
-use crate::ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan};
+use crate::ast::{
+    DataType, Expr, MySqlText, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan,
+};
 use core::ops::ControlFlow;
 
 /// A type that can be visited by a [`Visitor`]. See [`Visitor`] for
@@ -122,7 +124,25 @@ macro_rules! visit_noop {
     };
 }
 
-visit_noop!(u8, u16, u32, u64, i8, i16, i32, i64, char, bool, String);
+visit_noop!(
+    u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool, String
+);
+
+// A tuple can contain real AST children (for example MySQL trigger ordering).
+// Traverse both components in source order rather than skipping the pair.
+impl<A: Visit, B: Visit> Visit for (A, B) {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        self.0.visit(visitor)?;
+        self.1.visit(visitor)
+    }
+}
+
+impl<A: VisitMut, B: VisitMut> VisitMut for (A, B) {
+    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
+        self.0.visit(visitor)?;
+        self.1.visit(visitor)
+    }
+}
 
 #[cfg(feature = "bigdecimal")]
 visit_noop!(bigdecimal::BigDecimal);
@@ -266,6 +286,24 @@ pub trait Visitor {
     fn post_visit_value(&mut self, _value: &ValueWithSpan) -> ControlFlow<Self::Break> {
         ControlFlow::Continue(())
     }
+    /// Native text roles are visible without rendering/decoding their bytes.
+    fn pre_visit_mysql_text(&mut self, _text: &MySqlText) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked after a native text node without decoding or rendering its bytes.
+    /// The default continues traversal; returning `Break` stops the same walk.
+    fn post_visit_mysql_text(&mut self, _text: &MySqlText) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Includes nested container/member types through the existing derive walk.
+    fn pre_visit_data_type(&mut self, _data_type: &DataType) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked after a data type's derived child traversal, including nested
+    /// container types and native byte members. The default is a no-op.
+    fn post_visit_data_type(&mut self, _data_type: &DataType) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
 }
 
 /// A visitor that can be used to mutate an AST tree.
@@ -392,6 +430,26 @@ pub trait VisitorMut {
 
     /// Invoked for any statements that appear in the AST after visiting children
     fn post_visit_value(&mut self, _value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked before a mutable native text node. Mutation does not bypass its
+    /// checked source/admission APIs or convert source bytes into compiler proof.
+    fn pre_visit_mysql_text(&mut self, _text: &mut MySqlText) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked after a mutable native text node; the default continues the walk
+    /// without decoding, rendering or reattaching its source.
+    fn post_visit_mysql_text(&mut self, _text: &mut MySqlText) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked before a mutable data type's children, including native ENUM/SET
+    /// members. Returning `Break` stops the existing traversal.
+    fn pre_visit_data_type(&mut self, _data_type: &mut DataType) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+    /// Invoked after a mutable data type and its derived children; the default
+    /// does not alter the generic or native type representation.
+    fn post_visit_data_type(&mut self, _data_type: &mut DataType) -> ControlFlow<Self::Break> {
         ControlFlow::Continue(())
     }
 }
@@ -588,12 +646,15 @@ where
 ///     *expr = Expr::Function(Function {
 ///           name: ObjectName::from(vec![Ident::new("f")]),
 ///           uses_odbc_syntax: false,
+///           mysql_literal_source: None,
+///           origin: sqlparser::ast::FunctionOrigin::Compiler,
 ///           args: FunctionArguments::List(FunctionArgumentList {
 ///               duplicate_treatment: None,
 ///               args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(old_expr))],
 ///               clauses: vec![],
 ///           }),
 ///           null_treatment: None,
+///           from_first_last: None,
 ///           filter: None,
 ///           over: None,
 ///           parameters: FunctionArguments::None,
@@ -702,378 +763,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ast::Statement;
-    use crate::dialect::GenericDialect;
-    use crate::parser::Parser;
-    use crate::tokenizer::Tokenizer;
-
-    #[derive(Default)]
-    struct TestVisitor {
-        visited: Vec<String>,
-    }
-
-    impl Visitor for TestVisitor {
-        type Break = ();
-
-        /// Invoked for any queries that appear in the AST before visiting children
-        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("PRE: QUERY: {query}"));
-            ControlFlow::Continue(())
-        }
-
-        /// Invoked for any queries that appear in the AST after visiting children
-        fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("POST: QUERY: {query}"));
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("PRE: SELECT: {select}"));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("POST: SELECT: {select}"));
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("PRE: RELATION: {relation}"));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("POST: RELATION: {relation}"));
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_table_factor(
-            &mut self,
-            table_factor: &TableFactor,
-        ) -> ControlFlow<Self::Break> {
-            self.visited
-                .push(format!("PRE: TABLE FACTOR: {table_factor}"));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_table_factor(
-            &mut self,
-            table_factor: &TableFactor,
-        ) -> ControlFlow<Self::Break> {
-            self.visited
-                .push(format!("POST: TABLE FACTOR: {table_factor}"));
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("PRE: EXPR: {expr}"));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("POST: EXPR: {expr}"));
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("PRE: STATEMENT: {statement}"));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-            self.visited.push(format!("POST: STATEMENT: {statement}"));
-            ControlFlow::Continue(())
-        }
-    }
-
-    fn do_visit<V: Visitor<Break = ()>>(sql: &str, visitor: &mut V) -> Statement {
-        let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let s = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
-
-        let flow = s.visit(visitor);
-        assert_eq!(flow, ControlFlow::Continue(()));
-        s
-    }
-
-    #[test]
-    fn test_sql() {
-        let tests = vec![
-            (
-                "SELECT * from table_name as my_table",
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM table_name AS my_table",
-                    "PRE: QUERY: SELECT * FROM table_name AS my_table",
-                    "PRE: SELECT: SELECT * FROM table_name AS my_table",
-                    "PRE: TABLE FACTOR: table_name AS my_table",
-                    "PRE: RELATION: table_name",
-                    "POST: RELATION: table_name",
-                    "POST: TABLE FACTOR: table_name AS my_table",
-                    "POST: SELECT: SELECT * FROM table_name AS my_table",
-                    "POST: QUERY: SELECT * FROM table_name AS my_table",
-                    "POST: STATEMENT: SELECT * FROM table_name AS my_table",
-                ],
-            ),
-            (
-                "SELECT * from t1 join t2 on t1.id = t2.t1_id",
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                    "PRE: QUERY: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                    "PRE: SELECT: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                    "PRE: TABLE FACTOR: t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
-                    "POST: TABLE FACTOR: t1",
-                    "PRE: TABLE FACTOR: t2",
-                    "PRE: RELATION: t2",
-                    "POST: RELATION: t2",
-                    "POST: TABLE FACTOR: t2",
-                    "PRE: EXPR: t1.id = t2.t1_id",
-                    "PRE: EXPR: t1.id",
-                    "POST: EXPR: t1.id",
-                    "PRE: EXPR: t2.t1_id",
-                    "POST: EXPR: t2.t1_id",
-                    "POST: EXPR: t1.id = t2.t1_id",
-                    "POST: SELECT: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                    "POST: QUERY: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                    "POST: STATEMENT: SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-                ],
-            ),
-            (
-                "SELECT * from t1 where EXISTS(SELECT column from t2)",
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: TABLE FACTOR: t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
-                    "POST: TABLE FACTOR: t1",
-                    "PRE: EXPR: EXISTS (SELECT column FROM t2)",
-                    "PRE: QUERY: SELECT column FROM t2",
-                    "PRE: SELECT: SELECT column FROM t2",
-                    "PRE: EXPR: column",
-                    "POST: EXPR: column",
-                    "PRE: TABLE FACTOR: t2",
-                    "PRE: RELATION: t2",
-                    "POST: RELATION: t2",
-                    "POST: TABLE FACTOR: t2",
-                    "POST: SELECT: SELECT column FROM t2",
-                    "POST: QUERY: SELECT column FROM t2",
-                    "POST: EXPR: EXISTS (SELECT column FROM t2)",
-                    "POST: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "POST: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "POST: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                ],
-            ),
-            (
-                "SELECT * from t1 where EXISTS(SELECT column from t2)",
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: TABLE FACTOR: t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
-                    "POST: TABLE FACTOR: t1",
-                    "PRE: EXPR: EXISTS (SELECT column FROM t2)",
-                    "PRE: QUERY: SELECT column FROM t2",
-                    "PRE: SELECT: SELECT column FROM t2",
-                    "PRE: EXPR: column",
-                    "POST: EXPR: column",
-                    "PRE: TABLE FACTOR: t2",
-                    "PRE: RELATION: t2",
-                    "POST: RELATION: t2",
-                    "POST: TABLE FACTOR: t2",
-                    "POST: SELECT: SELECT column FROM t2",
-                    "POST: QUERY: SELECT column FROM t2",
-                    "POST: EXPR: EXISTS (SELECT column FROM t2)",
-                    "POST: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "POST: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "POST: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                ],
-            ),
-            (
-                "SELECT * from t1 where EXISTS(SELECT column from t2) UNION SELECT * from t3",
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2) UNION SELECT * FROM t3",
-                    "PRE: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2) UNION SELECT * FROM t3",
-                    "PRE: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: TABLE FACTOR: t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
-                    "POST: TABLE FACTOR: t1",
-                    "PRE: EXPR: EXISTS (SELECT column FROM t2)",
-                    "PRE: QUERY: SELECT column FROM t2",
-                    "PRE: SELECT: SELECT column FROM t2",
-                    "PRE: EXPR: column",
-                    "POST: EXPR: column",
-                    "PRE: TABLE FACTOR: t2",
-                    "PRE: RELATION: t2",
-                    "POST: RELATION: t2",
-                    "POST: TABLE FACTOR: t2",
-                    "POST: SELECT: SELECT column FROM t2",
-                    "POST: QUERY: SELECT column FROM t2",
-                    "POST: EXPR: EXISTS (SELECT column FROM t2)",
-                    "POST: SELECT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2)",
-                    "PRE: SELECT: SELECT * FROM t3",
-                    "PRE: TABLE FACTOR: t3",
-                    "PRE: RELATION: t3",
-                    "POST: RELATION: t3",
-                    "POST: TABLE FACTOR: t3",
-                    "POST: SELECT: SELECT * FROM t3",
-                    "POST: QUERY: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2) UNION SELECT * FROM t3",
-                    "POST: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2) UNION SELECT * FROM t3",
-                ],
-            ),
-            (
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "PRE: QUERY: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "PRE: SELECT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: TABLE FACTOR: monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: TABLE FACTOR: monthly_sales",
-                    "PRE: RELATION: monthly_sales",
-                    "POST: RELATION: monthly_sales",
-                    "POST: TABLE FACTOR: monthly_sales",
-                    "PRE: EXPR: SUM(a.amount)",
-                    "PRE: EXPR: a.amount",
-                    "POST: EXPR: a.amount",
-                    "POST: EXPR: SUM(a.amount)",
-                    "PRE: EXPR: a.MONTH",
-                    "POST: EXPR: a.MONTH",
-                    "PRE: EXPR: 'JAN'",
-                    "POST: EXPR: 'JAN'",
-                    "PRE: EXPR: 'FEB'",
-                    "POST: EXPR: 'FEB'",
-                    "PRE: EXPR: 'MAR'",
-                    "POST: EXPR: 'MAR'",
-                    "PRE: EXPR: 'APR'",
-                    "POST: EXPR: 'APR'",
-                    "POST: TABLE FACTOR: monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "POST: SELECT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: EXPR: EMPID",
-                    "POST: EXPR: EMPID",
-                    "POST: QUERY: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "POST: STATEMENT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                ]
-            ),
-            (
-                "SHOW COLUMNS FROM t1",
-                vec![
-                    "PRE: STATEMENT: SHOW COLUMNS FROM t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
-                    "POST: STATEMENT: SHOW COLUMNS FROM t1",
-                ],
-            ),
-        ];
-        for (sql, expected) in tests {
-            let mut visitor = TestVisitor::default();
-            let _ = do_visit(sql, &mut visitor);
-            let actual: Vec<_> = visitor.visited.iter().map(|x| x.as_str()).collect();
-            assert_eq!(actual, expected)
-        }
-    }
-
-    struct QuickVisitor; // [`TestVisitor`] is too slow to iterate over thousands of nodes
-
-    impl Visitor for QuickVisitor {
-        type Break = ();
-    }
-
-    #[test]
-    fn overflow() {
-        let cond = (0..1000)
-            .map(|n| format!("X = {n}"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let sql = format!("SELECT x where {cond}");
-
-        let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql.as_str()).tokenize().unwrap();
-        let s = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
-
-        let mut visitor = QuickVisitor {};
-        let flow = s.visit(&mut visitor);
-        assert_eq!(flow, ControlFlow::Continue(()));
-    }
-}
-
-#[cfg(test)]
-mod visit_mut_tests {
-    use crate::ast::{Statement, Value, ValueWithSpan, VisitMut, VisitorMut};
-    use crate::dialect::GenericDialect;
-    use crate::parser::Parser;
-    use crate::tokenizer::Tokenizer;
-    use core::ops::ControlFlow;
-
-    #[derive(Default)]
-    struct MutatorVisitor {
-        index: u64,
-    }
-
-    impl VisitorMut for MutatorVisitor {
-        type Break = ();
-
-        fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
-            self.index += 1;
-            value.value = Value::SingleQuotedString(format!("REDACTED_{}", self.index));
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_value(&mut self, _value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
-            ControlFlow::Continue(())
-        }
-    }
-
-    fn do_visit_mut<V: VisitorMut<Break = ()>>(sql: &str, visitor: &mut V) -> Statement {
-        let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let mut s = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
-
-        let flow = s.visit(visitor);
-        assert_eq!(flow, ControlFlow::Continue(()));
-        s
-    }
-
-    #[test]
-    fn test_value_redact() {
-        let tests = vec![
-            (
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('REDACTED_1', 'REDACTED_2', 'REDACTED_3', 'REDACTED_4')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
-            ),
-        ];
-
-        for (sql, expected) in tests {
-            let mut visitor = MutatorVisitor::default();
-            let mutated = do_visit_mut(sql, &mut visitor);
-            assert_eq!(mutated.to_string(), expected)
-        }
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;

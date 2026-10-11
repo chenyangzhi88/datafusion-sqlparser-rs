@@ -747,6 +747,7 @@ fn parse_alter_dynamic_table(parser: &mut Parser) -> Result<Statement, ParserErr
         if_exists: false,
         only: false,
         operations: vec![operation],
+        comment: None,
         location: None,
         on_cluster: None,
         table_type: Some(AlterTableType::Dynamic),
@@ -789,6 +790,7 @@ fn parse_alter_external_table(parser: &mut Parser) -> Result<Statement, ParserEr
         if_exists,
         only: false,
         operations: vec![operation],
+        comment: None,
         location: None,
         on_cluster: None,
         table_type: Some(AlterTableType::External),
@@ -873,7 +875,7 @@ pub fn parse_create_table(
                     builder = builder.like(Some(CreateTableLikeKind::Plain(
                         crate::ast::CreateTableLike {
                             name,
-                            defaults: None,
+                            options: Vec::new(),
                         },
                     )));
                 }
@@ -1440,7 +1442,7 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
                 Token::Word(key) => copy_options.push(parser.parse_key_value_option(&key)?),
                 _ => {
                     return parser
-                        .expected_ref("another copy option, ; or EOF'", parser.peek_token_ref())
+                        .expected_ref("another copy option, ; or EOF'", parser.peek_token_ref());
                 }
             }
         }
@@ -1808,6 +1810,7 @@ fn parse_multi_table_insert(
         table: TableObject::TableName(ObjectName(vec![])), // Not used for multi-table insert
         table_alias: None,
         columns: vec![],
+        overriding: None,
         overwrite,
         source: Some(source),
         assignments: vec![],

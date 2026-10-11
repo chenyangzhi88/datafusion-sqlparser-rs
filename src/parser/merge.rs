@@ -20,7 +20,7 @@ use crate::{
         Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr, MergeInsertKind,
         MergeUpdateExpr, ObjectName, OutputClause, SetExpr,
     },
-    dialect::{BigQueryDialect, GenericDialect, MySqlDialect},
+    dialect::{BigQueryDialect, GenericDialect, MySqlDialect, PostgreSqlDialect},
     keywords::Keyword,
     parser::IsOptional,
     tokenizer::TokenWithSpan,
@@ -106,6 +106,7 @@ impl Parser<'_> {
                 Keyword::UPDATE,
                 Keyword::INSERT,
                 Keyword::DELETE,
+                Keyword::DO,
             ]) {
                 Some(Keyword::UPDATE) => {
                     if matches!(
@@ -194,9 +195,18 @@ impl Parser<'_> {
                         insert_predicate,
                     })
                 }
+                Some(Keyword::DO) if dialect_of!(self is PostgreSqlDialect) => {
+                    let do_token = self.get_current_token().clone();
+                    self.expect_keyword_is(Keyword::NOTHING)?;
+                    let nothing_token = self.get_current_token().clone();
+                    MergeAction::DoNothing {
+                        do_token: do_token.into(),
+                        nothing_token: nothing_token.into(),
+                    }
+                }
                 _ => {
                     return parser_err!(
-                        "expected UPDATE, DELETE or INSERT in merge clause",
+                        "expected UPDATE, DELETE, INSERT or DO NOTHING in merge clause",
                         self.peek_token_ref().span.start
                     );
                 }

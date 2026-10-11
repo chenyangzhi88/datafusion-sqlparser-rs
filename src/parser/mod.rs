@@ -21,16 +21,16 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    cell::{Cell, OnceCell, RefCell},
     fmt::{self, Display},
     str::FromStr,
 };
 use helpers::attached_token::AttachedToken;
-
 use log::debug;
 
-use recursion::RecursionCounter;
 use IsLateral::*;
 use IsOptional::*;
+use recursion::RecursionCounter;
 
 use crate::ast::*;
 use crate::ast::{
@@ -43,9 +43,54 @@ use crate::ast::{
     },
 };
 use crate::dialect::*;
-use crate::keywords::{Keyword, ALL_KEYWORDS};
+use crate::keywords::{ALL_KEYWORDS, Keyword};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
+
+/// MySQL's actual SET option type. DEFAULT is not always SESSION: tri-level
+/// transaction variables use it for the next transaction only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MySqlSetOption {
+    /// Use MySQL's default option scope, including next-transaction semantics
+    /// for transaction characteristics rather than an explicit SESSION scope.
+    Default,
+    /// Apply to the current session; also represents the LOCAL spelling.
+    Session,
+    /// Apply to the server's global variable value.
+    Global,
+    /// Update the global value and persist the resulting setting.
+    Persist,
+    /// Persist the setting without updating its runtime value.
+    PersistOnly,
+}
+
+/// One reduction on the original MySQL SET cursor. The optional keyword
+/// changes inheritance; an @@ qualifier belongs solely to its actual target.
+#[derive(Clone, Debug)]
+pub enum MySqlSetAssignment<T> {
+    /// Assign a value to the original variable target on this SET cursor.
+    Variable {
+        /// Explicit option keyword, if present; an @@ qualifier stays in target.
+        keyword: Option<MySqlSetOption>,
+        /// Original assignment target, retaining its variable qualifier.
+        target: ObjectName,
+        /// RHS produced once by the caller's reduction callback.
+        value: T,
+    },
+    /// A SET NAMES declaration, optionally followed by COLLATE.
+    Names {
+        /// Requested character set, or None for SET NAMES DEFAULT.
+        character_set: Option<Ident>,
+        /// Explicit COLLATE name, or None when no collation was specified.
+        collation: Option<Ident>,
+    },
+    /// A SET CHARACTER SET declaration, including its CHARSET spelling.
+    CharacterSet {
+        /// Requested character set, or None for the DEFAULT declaration.
+        character_set: Option<Ident>,
+    },
+}
 
 /// Errors produced by the SQL parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +101,20 @@ pub enum ParserError {
     ParserError(String),
     /// Raised when a recursion depth limit is exceeded.
     RecursionLimitExceeded,
+    /// Raised when a caller's cooperative cancellation probe fires.
+    Cancelled,
+    /// An actual caller allocation budget refused source admission.
+    ResourceExhausted(String),
+    /// The original source deadline expired.
+    DeadlineExceeded,
+    /// MySQL ALTER SCHEMA repeated READ ONLY with conflicting normalized values.
+    MySqlConflictingSchemaReadOnly,
+    /// MySQL mode-0 WITH inserted an exact duplicate CTE name after parsing
+    /// that definition, before reading any following list element or body.
+    /// The payload is the actual identifier value, not reconstructed SQL.
+    MySqlDuplicateCte(String),
+    /// Native YEAR_SYM opt_field_length reduction, before Item FIX.
+    MySqlInvalidYearWidth,
 }
 
 // Use `Parser::expected` instead, if possible
@@ -185,6 +244,19 @@ pub enum WildcardExpr {
 
 impl From<TokenizerError> for ParserError {
     fn from(e: TokenizerError) -> Self {
+        match e.source_kind {
+            crate::tokenizer::MySqlSourceErrorKind::ResourceExhausted => {
+                return Self::ResourceExhausted(e.message);
+            }
+            crate::tokenizer::MySqlSourceErrorKind::Cancelled => return Self::Cancelled,
+            crate::tokenizer::MySqlSourceErrorKind::DeadlineExceeded => {
+                return Self::DeadlineExceeded;
+            }
+            crate::tokenizer::MySqlSourceErrorKind::Message => {}
+        }
+        if e.message == QUERY_CANCELLED_MESSAGE {
+            return ParserError::Cancelled;
+        }
         ParserError::TokenizerError(e.to_string())
     }
 }
@@ -198,6 +270,14 @@ impl fmt::Display for ParserError {
                 ParserError::TokenizerError(s) => s,
                 ParserError::ParserError(s) => s,
                 ParserError::RecursionLimitExceeded => "recursion limit exceeded",
+                ParserError::Cancelled => QUERY_CANCELLED_MESSAGE,
+                ParserError::ResourceExhausted(message) => message,
+                ParserError::DeadlineExceeded => "query source deadline exceeded",
+                ParserError::MySqlConflictingSchemaReadOnly =>
+                    "Conflicting declarations: 'READ ONLY=0' and 'READ ONLY=1'",
+                ParserError::MySqlDuplicateCte(name) =>
+                    return write!(f, "sql parser error: Not unique table/alias: '{name}'"),
+                ParserError::MySqlInvalidYearWidth => "Invalid display width. Use YEAR instead.",
             }
         )
     }
@@ -306,47 +386,299 @@ enum ParserState {
     ColumnDefinition,
 }
 
-/// A SQL Parser
+const MYSQL_TOKEN_BLOCK_SIZE: usize = 64;
+
+struct MySqlTokenBlock {
+    slots: [OnceCell<MySqlSourceToken>; MYSQL_TOKEN_BLOCK_SIZE],
+    next: [OnceCell<Box<MySqlTokenBlock>>; 2],
+    admission: SqlSourceAdmission,
+}
+
+impl MySqlTokenBlock {
+    fn new(admission: SqlSourceAdmission) -> Self {
+        Self {
+            slots: core::array::from_fn(|_| OnceCell::new()),
+            next: core::array::from_fn(|_| OnceCell::new()),
+            admission,
+        }
+    }
+}
+
+/// Stable addresses for already published borrowed tokens. Filling an actual
+/// lookahead allocates only its next fixed block, never reallocates old slots.
+struct MySqlRawTokens<'a> {
+    first: Box<MySqlTokenBlock>,
+    cursor: RefCell<MySqlTokenCursor<'a>>,
+    filled: Cell<usize>,
+    eof: Cell<bool>,
+    error: OnceCell<ParserError>,
+}
+
+impl<'a> MySqlRawTokens<'a> {
+    fn new(cursor: MySqlTokenCursor<'a>) -> Result<Self, TokenizerError> {
+        let admission = cursor.admit(core::mem::size_of::<MySqlTokenBlock>())?;
+        Ok(Self {
+            first: Box::new(MySqlTokenBlock::new(admission)),
+            cursor: RefCell::new(cursor),
+            filled: Cell::new(0),
+            eof: Cell::new(false),
+            error: OnceCell::new(),
+        })
+    }
+    fn block(&self, index: usize) -> Option<&MySqlTokenBlock> {
+        let mut block = self.first.as_ref();
+        let key = (index / MYSQL_TOKEN_BLOCK_SIZE).checked_add(1)?;
+        let highest = usize::BITS - 1 - key.leading_zeros();
+        // Same stable physical blocks, indexed by ordinal's binary path.
+        // No pointer directory/cache; lookup and Drop have bounded tree depth.
+        for shift in (0..highest).rev() {
+            let next = &block.next[(key >> shift) & 1];
+            if next.get().is_none() {
+                let admission = match self
+                    .cursor
+                    .borrow()
+                    .admit(core::mem::size_of::<MySqlTokenBlock>())
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = self.error.set(error.into());
+                        return None;
+                    }
+                };
+                let _ = next.set(Box::new(MySqlTokenBlock::new(admission)));
+            }
+            block = next.get()?.as_ref();
+        }
+        Some(block)
+    }
+    fn get(&self, index: usize) -> Option<&MySqlSourceToken> {
+        while self.filled.get() <= index && !self.eof.get() && self.error.get().is_none() {
+            let next = self.cursor.borrow_mut().next_token();
+            match next {
+                Ok(Some(token)) => {
+                    let filled = self.filled.get();
+                    let block = self.block(filled)?;
+                    if block.slots[filled % MYSQL_TOKEN_BLOCK_SIZE]
+                        .set(token)
+                        .is_err()
+                    {
+                        let _ = self.error.set(ParserError::ParserError(
+                            "MySQL source slot was filled twice".into(),
+                        ));
+                        return None;
+                    }
+                    self.filled.set(filled + 1);
+                }
+                Ok(None) => self.eof.set(true),
+                Err(error) => {
+                    let _ = self.error.set(error.into());
+                }
+            }
+        }
+        if index >= self.filled.get() {
+            return None;
+        }
+        self.block(index)?.slots[index % MYSQL_TOKEN_BLOCK_SIZE].get()
+    }
+    fn admissions(
+        &self,
+        extra: usize,
+    ) -> Result<(Vec<SqlSourceAdmission>, SqlSourceAdmission), TokenizerError> {
+        fn count(block: &MySqlTokenBlock) -> usize {
+            1 + block
+                .next
+                .iter()
+                .filter_map(OnceCell::get)
+                .map(|next| count(next))
+                .sum::<usize>()
+        }
+        fn collect(block: &MySqlTokenBlock, result: &mut Vec<SqlSourceAdmission>) {
+            result.push(block.admission.clone());
+            for next in &block.next {
+                if let Some(next) = next.get() {
+                    collect(next, result);
+                }
+            }
+        }
+        let capacity = count(&self.first)
+            .checked_add(extra)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<SqlSourceAdmission>()))
+            .ok_or_else(|| TokenizerError {
+                source_kind: crate::tokenizer::MySqlSourceErrorKind::Message,
+                message: "statement admission capacity overflow".into(),
+                location: Location::new(1, 1),
+            })?;
+        let admission = self.cursor.borrow().admit(capacity)?;
+        let mut result = Vec::with_capacity(capacity / core::mem::size_of::<SqlSourceAdmission>());
+        collect(&self.first, &mut result);
+        Ok((result, admission))
+    }
+}
+
+enum ParserTokenOwner<'a> {
+    Filled(Vec<TokenWithSpan>),
+    Raw(MySqlRawTokens<'a>),
+}
+
+impl<'a> ParserTokenOwner<'a> {
+    fn get(&self, index: usize) -> Option<&TokenWithSpan> {
+        match self {
+            Self::Filled(tokens) => tokens.get(index),
+            Self::Raw(tokens) => tokens.get(index).map(|token| &token.token),
+        }
+    }
+    /// Only tokens already demanded by the grammar. Never scans a source tail.
+    fn into_filled(self) -> Vec<TokenWithSpan> {
+        match self {
+            Self::Filled(tokens) => tokens,
+            Self::Raw(tokens) => (0..tokens.filled.get())
+                .filter_map(|index| tokens.get(index).map(|token| token.token.clone()))
+                .collect(),
+        }
+    }
+    fn raw(&self) -> Option<&MySqlRawTokens<'a>> {
+        match self {
+            Self::Raw(tokens) => Some(tokens),
+            Self::Filled(_) => None,
+        }
+    }
+}
+
+/// One parsed byte statement and its one retained source/CPP allocation owner.
+/// Consumers must retain this bundle with prepared/compiled artifacts; ranges
+/// alone do not imply an admitted source or reusable compiler capability.
+#[derive(Debug)]
+pub struct MySqlParsedStatement<Body = Statement> {
+    /// The statement parsed by the existing grammar, retaining native byte-role
+    /// AST nodes instead of a rendered/reparsed SQL mirror.
+    pub statement: Body,
+    /// Checked original bytes for this statement, excluding its terminating
+    /// semicolon. Catalog deserialization requires explicit owner reattachment.
+    pub source_occurrence: SqlSourceOccurrence,
+    /// Absolute offset into the original owner immediately after the consumed
+    /// semicolon, or at source end. The lazy caller resumes its remaining bytes
+    /// under the next statement's actual mode, without prelexing that tail.
+    pub consumed_end: usize,
+    /// The real CPP contribution ledger for this parse: attached source ranges
+    /// and native inserted spaces, not the statement's Display output.
+    pub cpp: Vec<SqlCppPiece>,
+    /// Exact grammar-consumed secret literal occurrences, not a SQL_TEXT scan
+    /// or inferred password spelling. No spans are issued for filled tokens.
+    pub secret_spans: Vec<SqlSourceOccurrence>,
+    admissions: Vec<SqlSourceAdmission>,
+    admissions_admission: SqlSourceAdmission,
+}
+
+impl<Body> MySqlParsedStatement<Body> {
+    /// Move the selected body into its caller's logical sum type without
+    /// cloning/reissuing any source, CPP ledger or allocation admission.
+    pub fn map_body<Next>(self, map: impl FnOnce(Body) -> Next) -> MySqlParsedStatement<Next> {
+        MySqlParsedStatement {
+            statement: map(self.statement),
+            source_occurrence: self.source_occurrence,
+            consumed_end: self.consumed_end,
+            cpp: self.cpp,
+            secret_spans: self.secret_spans,
+            admissions: self.admissions,
+            admissions_admission: self.admissions_admission,
+        }
+    }
+    /// Move this parse's CPP contributions and their retained admissions into
+    /// a ledger owned by the supplied admitted statement context. The ledger
+    /// records the actual source and connection charsets; it does not render
+    /// or reparse the AST, copy source bytes, or grant new source authority.
+    /// The moved contribution/admission vectors are empty on this bundle
+    /// afterward, while its statement and source occurrence remain intact.
+    pub fn take_cpp_ledger(
+        &mut self,
+        owner: SqlSourceAdmission,
+        source_charset: &'static str,
+        connection_charset: &'static str,
+    ) -> crate::ast::SqlCppLedger {
+        crate::ast::SqlCppLedger::adopt(
+            core::mem::take(&mut self.cpp),
+            core::mem::take(&mut self.admissions),
+            self.admissions_admission.clone(),
+            owner,
+            source_charset,
+            connection_charset,
+        )
+    }
+    /// Move the AST to its sole prepared binding while retaining the original
+    /// source/CPP leases. No second AST is kept merely to own those leases.
+    pub fn into_owned_parts(
+        self,
+    ) -> (
+        Body,
+        SqlSourceOccurrence,
+        Vec<SqlCppPiece>,
+        Vec<SqlSourceAdmission>,
+        SqlSourceAdmission,
+        Vec<SqlSourceOccurrence>,
+    ) {
+        (
+            self.statement,
+            self.source_occurrence,
+            self.cpp,
+            self.admissions,
+            self.admissions_admission,
+            self.secret_spans,
+        )
+    }
+}
+
+/// The single raw expression source and retained allocation owner.
+#[derive(Debug)]
+pub struct MySqlParsedExpression {
+    /// Expression from the real expression grammar, not a wrapper statement.
+    pub expression: Expr,
+    /// Actual original expression bytes; not Display output.
+    pub source_occurrence: SqlSourceOccurrence,
+    /// Actual contributions in this expression's CPP ledger.
+    pub cpp_range: SqlCppPieceRange,
+    /// One retained ledger, transferred to the expression's binding owner.
+    pub cpp: Vec<SqlCppPiece>,
+    admissions: Vec<SqlSourceAdmission>,
+    admissions_admission: SqlSourceAdmission,
+}
+
+impl MySqlParsedExpression {
+    /// Move this parse's CPP/admissions into the supplied admitted owner.
+    /// No copied SQL, new tokenization, or evaluated/compiler authority.
+    pub fn take_cpp_ledger(
+        &mut self,
+        owner: SqlSourceAdmission,
+        source_charset: &'static str,
+        connection_charset: &'static str,
+    ) -> crate::ast::SqlCppLedger {
+        crate::ast::SqlCppLedger::adopt(
+            core::mem::take(&mut self.cpp),
+            core::mem::take(&mut self.admissions),
+            self.admissions_admission.clone(),
+            owner,
+            source_charset,
+            connection_charset,
+        )
+    }
+}
+
+/// A SQL parser, with one grammar for decoded or admitted MySQL byte input.
 ///
-/// This struct is the main entry point for parsing SQL queries.
+/// * Parsing SQL: [`Parser::new`] and [`Parser::parse_sql`]
+/// * Controlling recursion: [`Parser::with_recursion_limit`]
+/// * Controlling parser options: [`Parser::with_options`]
+/// * Providing existing tokens: [`Parser::with_tokens`]
+/// * Admitted bytes: [`Parser::try_with_mysql_source`] and
+///   [`Parser::parse_next_mysql_source`]
 ///
-/// # Functionality:
-/// * Parsing SQL: see examples on [`Parser::new`] and [`Parser::parse_sql`]
-/// * Controlling recursion: See [`Parser::with_recursion_limit`]
-/// * Controlling parser options: See [`Parser::with_options`]
-/// * Providing your own tokens: See [`Parser::with_tokens`]
-///
-/// # Internals
-///
-/// The parser uses a [`Tokenizer`] to tokenize the input SQL string into a
-/// `Vec` of [`TokenWithSpan`]s and maintains an `index` to the current token
-/// being processed. The token vec may contain multiple SQL statements.
-///
-/// * The "current" token is the token at `index - 1`
-/// * The "next" token is the token at `index`
-/// * The "previous" token is the token at `index - 2`
-///
-/// If `index` is equal to the length of the token stream, the 'next' token is
-/// [`Token::EOF`].
-///
-/// For example, the SQL string "SELECT * FROM foo" will be tokenized into
-/// following tokens:
-/// ```text
-///  [
-///    "SELECT", // token index 0
-///    " ",      // whitespace
-///    "*",
-///    " ",
-///    "FROM",
-///    " ",
-///    "foo"
-///   ]
-/// ```
-///
-///
+/// The token owner holds either an already filled token vector or stable,
+/// demand-filled MySQL token blocks. Both use the same parser index:
+/// the current token is `index - 1`, next is `index`, previous is `index - 2`.
+/// MySQL byte input fills only actual grammar lookahead; checkpoint rollback
+/// revisits published tokens without lexing them again.
 pub struct Parser<'a> {
     /// The tokens
-    tokens: Vec<TokenWithSpan>,
+    tokens: ParserTokenOwner<'a>,
     /// The index of the first unprocessed token in [`Parser::tokens`].
     index: usize,
     /// The current state of the parser.
@@ -359,6 +691,16 @@ pub struct Parser<'a> {
     options: ParserOptions,
     /// Ensures the stack does not overflow by limiting recursion depth.
     recursion_counter: RecursionCounter,
+    cancellation: Option<CancellationCheck>,
+    // This is the real command's grammar termination policy, not a pre-scan
+    // or the number of tokens currently demanded from a raw source.
+    mysql_multi_statements: bool,
+    // Installed only by the raw saved-program callback entry. The header
+    // parser stops before the body so the existing PSM compiler consumes the
+    // same physical token/CPP owner, not a second lexer or displayed SQL.
+    mysql_program_header_only: bool,
+    mysql_secret_spans: Vec<SqlSourceOccurrence>,
+    mysql_secret_admission: Option<SqlSourceAdmission>,
 }
 
 impl<'a> Parser<'a> {
@@ -379,12 +721,40 @@ impl<'a> Parser<'a> {
     /// ```
     pub fn new(dialect: &'a dyn Dialect) -> Self {
         Self {
-            tokens: vec![],
+            tokens: ParserTokenOwner::Filled(vec![]),
             index: 0,
             state: ParserState::Normal,
             dialect,
             recursion_counter: RecursionCounter::new(DEFAULT_REMAINING_DEPTH),
             options: ParserOptions::new().with_trailing_commas(dialect.supports_trailing_commas()),
+            cancellation: None,
+            mysql_multi_statements: true,
+            mysql_program_header_only: false,
+            mysql_secret_spans: Vec::new(),
+            mysql_secret_admission: None,
+        }
+    }
+
+    /// Installs a cooperative cancellation probe for long token and syntax streams.
+    pub fn with_cancellation(mut self, cancellation: CancellationCheck) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Selects the actual MySQL command's termination production. Multi-query
+    /// execution stops at the demanded semicolon without reading its tail;
+    /// preparation and single-query commands require END_OF_INPUT before any
+    /// execution. This option applies only to admitted MySQL source parsing.
+    pub fn with_mysql_multi_statements(mut self, enabled: bool) -> Self {
+        self.mysql_multi_statements = enabled;
+        self
+    }
+
+    fn check_cancelled(&self) -> Result<(), ParserError> {
+        if self.cancellation.as_ref().is_some_and(|check| check()) {
+            Err(ParserError::Cancelled)
+        } else {
+            Ok(())
         }
     }
 
@@ -444,7 +814,7 @@ impl<'a> Parser<'a> {
 
     /// Reset this parser to parse the specified token stream
     pub fn with_tokens_with_locations(mut self, tokens: Vec<TokenWithSpan>) -> Self {
-        self.tokens = tokens;
+        self.tokens = ParserTokenOwner::Filled(tokens);
         self.index = 0;
         self
     }
@@ -470,10 +840,703 @@ impl<'a> Parser<'a> {
     /// See example on [`Parser::new()`] for an example
     pub fn try_with_sql(self, sql: &str) -> Result<Self, ParserError> {
         debug!("Parsing sql '{sql}'...");
-        let tokens = Tokenizer::new(self.dialect, sql)
-            .with_unescape(self.options.unescape)
-            .tokenize_with_location()?;
+        let mut tokenizer = Tokenizer::new(self.dialect, sql).with_unescape(self.options.unescape);
+        if let Some(cancellation) = self.cancellation.clone() {
+            tokenizer = tokenizer.with_cancellation(cancellation);
+        }
+        let tokens = tokenizer.tokenize_with_location()?;
         Ok(self.with_tokens_with_locations(tokens))
+    }
+
+    /// Installs attached raw input without lexing its tail. The adapter admits
+    /// the lazy token storage; the supplied source owner must already retain
+    /// its original byte-capacity/header lease. Only MySQL with a native client
+    /// charset of minimum width one is accepted. The adapter/dialect must capture
+    /// this statement's current source context; no charset is guessed from bytes.
+    /// Use [`Self::parse_next_mysql_source`] to parse only the demanded statement.
+    pub fn try_with_mysql_source(
+        mut self,
+        source: SqlSourceOccurrence,
+        adapter: &'a dyn MySqlSourceAdapter,
+    ) -> Result<Self, ParserError> {
+        let cursor =
+            MySqlTokenCursor::new(self.dialect, source, adapter, self.cancellation.clone())?;
+        self.tokens = ParserTokenOwner::Raw(MySqlRawTokens::new(cursor)?);
+        self.index = 0;
+        Ok(self)
+    }
+
+    /// Parses one demanded statement from installed admitted MySQL byte input.
+    /// Leading empty semicolon statements are skipped; exhausted/comment-only
+    /// input returns `None`. A terminating semicolon is consumed without asking
+    /// for the next token, so the caller can recapture the next statement's mode.
+    /// The returned bundle retains source/CPP and allocation leases; callers must
+    /// retain it with any compiled/prepared artifact. Adapter and cancellation
+    /// failures propagate rather than becoming successful EOF. This method uses
+    /// the same grammar as decoded input and performs no execution authorization.
+    pub fn parse_next_mysql_source(self) -> Result<Option<MySqlParsedStatement>, ParserError> {
+        self.parse_next_mysql_source_with_program_body(|_| {
+            Err(ParserError::ParserError(
+                "saved MySQL body requires its PSM compiler".into(),
+            ))
+        })
+        .map(|value: Option<(MySqlParsedStatement, Option<()>)>| value.map(|(parsed, _)| parsed))
+    }
+
+    /// Parse one raw statement, handing a MySQL routine/trigger body to the
+    /// caller's existing PSM grammar on this same parser and token frontier.
+    /// The callback is invoked only for a real MySQL CREATE program header;
+    /// it must consume one complete body, leaving the outer delimiter unread.
+    /// On success the parser issues the actual body occurrence/CPP range and
+    /// transfers the single statement's source/admission bundle. No body is
+    /// lexed twice, no tail statement is demanded, and callback/token/admission
+    /// errors drop this owner without publishing a partially parsed program.
+    /// The returned optional value is the caller's one compiled body, not a
+    /// second AST, evaluated value, or execution credential.
+    pub fn parse_next_mysql_source_with_program_body<T>(
+        self,
+        compile_body: impl FnOnce(&mut Self) -> Result<T, ParserError>,
+    ) -> Result<Option<(MySqlParsedStatement, Option<T>)>, ParserError> {
+        self.parse_next_mysql_source_with_body(|parser| {
+            parser.parse_statement_with_mysql_program_body(compile_body)
+        })
+    }
+
+    /// Consume the actual ordinary statement/header and its optional program
+    /// on this same cursor. The outer source/body callback chooses routing;
+    /// this helper does not finalize or create another parser/source owner.
+    pub fn parse_statement_with_mysql_program_body<T>(
+        &mut self,
+        compile_body: impl FnOnce(&mut Self) -> Result<T, ParserError>,
+    ) -> Result<(Statement, Option<T>), ParserError> {
+        let parsed = self.parse_statement();
+        self.check_source_error()?;
+        let mut statement = parsed?;
+        let program = if Self::mysql_program_body_mut(&mut statement).is_some() {
+            let start = self.index;
+            let value = compile_body(self)?;
+            self.check_source_error()?;
+            let (source, cpp) = self.mysql_source_range(start, self.index)?;
+            let body = Self::mysql_program_body_mut(&mut statement).expect("actual header");
+            body.source = Some(source);
+            body.cpp = Some(cpp);
+            Some(value)
+        } else {
+            None
+        };
+        Ok((statement, program))
+    }
+
+    /// Parse one body on this parser's sole admitted token cursor, then issue
+    /// the same checked source, CPP contributions and allocation admissions.
+    /// The callback selects a typed body; it does not issue source authority.
+    /// Delimiters and the next statement's lazy frontier remain parser-owned.
+    pub fn parse_next_mysql_source_with_body<Body, Program>(
+        self,
+        parse_body: impl FnOnce(&mut Self) -> Result<(Body, Option<Program>), ParserError>,
+    ) -> Result<Option<(MySqlParsedStatement<Body>, Option<Program>)>, ParserError> {
+        self.parse_next_mysql_source_body_inner(false, parse_body)
+            .map(|value| {
+                value.map(|(parsed, program)| {
+                    (
+                        parsed.map_body(|body| body.expect("ordinary parsed body")),
+                        program,
+                    )
+                })
+            })
+    }
+
+    /// Finalize one actual command attempt on the same admitted raw cursor.
+    /// A checked comment-only EOF has no statement body, but retains its real
+    /// source occurrence, CPP and admissions. Bare EOF returns no attempt.
+    /// Unlike the general statement helper, a leading semicolon is not skipped:
+    /// command allocation already normalized the packet's terminal delimiters.
+    /// This method neither issues a query ID nor confers execution permission.
+    pub fn parse_next_mysql_command_with_body<Body, Program>(
+        self,
+        parse_body: impl FnOnce(&mut Self) -> Result<(Body, Option<Program>), ParserError>,
+    ) -> Result<Option<(MySqlParsedStatement<Option<Body>>, Option<Program>)>, ParserError> {
+        self.parse_next_mysql_source_body_inner(true, parse_body)
+    }
+
+    fn parse_next_mysql_source_body_inner<Body, Program>(
+        mut self,
+        command_attempt: bool,
+        parse_body: impl FnOnce(&mut Self) -> Result<(Body, Option<Program>), ParserError>,
+    ) -> Result<Option<(MySqlParsedStatement<Option<Body>>, Option<Program>)>, ParserError> {
+        self.mysql_program_header_only = true;
+        if self.tokens.raw().is_none() {
+            return Err(ParserError::ParserError(
+                "byte statement requires admitted source".into(),
+            ));
+        }
+        self.tokens
+            .raw()
+            .expect("raw source")
+            .cursor
+            .borrow_mut()
+            .begin_canonical_digest()?;
+        let mut statement_start = self
+            .tokens
+            .raw()
+            .expect("raw source")
+            .cursor
+            .borrow()
+            .source()
+            .range()
+            .start;
+        while !command_attempt && self.consume_token(&Token::SemiColon) {
+            self.tokens
+                .raw()
+                .expect("raw source")
+                .cursor
+                .borrow_mut()
+                .discard_canonical_empty_statement();
+            statement_start = self
+                .tokens
+                .raw()
+                .expect("raw source")
+                .get(self.get_current_index())
+                .expect("issued empty delimiter")
+                .source
+                .range()
+                .end;
+        }
+        let at_eof = self.peek_token_ref().token == Token::EOF;
+        self.check_source_error()?;
+        let comment_only = at_eof
+            && command_attempt
+            && self
+                .tokens
+                .raw()
+                .expect("raw source")
+                .cursor
+                .borrow()
+                .has_comment();
+        if at_eof && !comment_only {
+            return Ok(None);
+        }
+        let (statement, program) = if comment_only {
+            (None, None)
+        } else {
+            let parsed = parse_body(&mut self);
+            self.check_source_error()?;
+            let (statement, program) = parsed?;
+            (Some(statement), program)
+        };
+        let delimiter = self.peek_token_ref().token.clone();
+        self.check_source_error()?;
+        let boundary = if delimiter == Token::SemiColon {
+            // Consume the issued delimiter WITHOUT demanding the next token.
+            self.advance_token();
+            let token = self
+                .tokens
+                .raw()
+                .expect("raw source")
+                .get(self.get_current_index())
+                .expect("issued delimiter");
+            let boundary = (
+                token.source.range().start,
+                token.source.range().end,
+                token.cpp.end,
+            );
+            if !self.mysql_multi_statements {
+                let next = self.peek_token_ref().token.clone();
+                self.check_source_error()?;
+                if next != Token::EOF {
+                    return self.expected_ref("end of statement", self.peek_token_ref());
+                }
+            }
+            Some(boundary)
+        } else if delimiter != Token::EOF {
+            return self.expected_ref("end of statement", self.peek_token_ref());
+        } else {
+            None
+        };
+        let ParserTokenOwner::Raw(raw) = self.tokens else {
+            unreachable!()
+        };
+        let extra = raw
+            .cursor
+            .borrow()
+            .retained_admission_count()
+            .checked_add(usize::from(self.mysql_secret_admission.is_some()))
+            .ok_or_else(|| {
+                ParserError::ResourceExhausted("secret admission count overflow".into())
+            })?;
+        let (mut admissions, admissions_admission) = raw.admissions(extra)?;
+        let mut cursor = raw.cursor.into_inner();
+        let source_end = cursor
+            .source()
+            .range()
+            .start
+            .checked_add(cursor.consumed())
+            .ok_or_else(|| ParserError::ParserError("SQL source offset overflow".into()))?;
+        let (statement_end, mut consumed_end, cpp_end) =
+            boundary.unwrap_or((source_end, source_end, usize::MAX));
+        if !self.mysql_multi_statements {
+            consumed_end = source_end;
+        }
+        let mut source_occurrence = cursor
+            .source()
+            .owner()
+            .expect("admitted source")
+            .occurrence(statement_start..statement_end)
+            .map_err(ParserError::ParserError)?;
+        if statement.is_some() {
+            if let Some(digest) = cursor.finish_canonical_digest()? {
+                source_occurrence.attach_canonical_digest(digest);
+            }
+        }
+        let (mut cpp, mut cursor_admissions, cpp_admission, container_admission) =
+            cursor.into_cpp();
+        cpp.truncate(cpp_end.min(cpp.len()));
+        admissions.append(&mut cursor_admissions);
+        admissions.extend(cpp_admission);
+        admissions.extend(container_admission);
+        admissions.extend(self.mysql_secret_admission);
+        Ok(Some((
+            MySqlParsedStatement {
+                statement,
+                source_occurrence,
+                consumed_end,
+                cpp,
+                secret_spans: self.mysql_secret_spans,
+                admissions,
+                admissions_admission,
+            },
+            program,
+        )))
+    }
+
+    fn mysql_program_body_mut(statement: &mut Statement) -> Option<&mut MySqlProgramBody> {
+        match statement {
+            Statement::CreateFunction(value) => value.mysql_body.as_mut(),
+            Statement::CreateProcedure(value) => value.mysql_body.as_mut(),
+            Statement::CreateTrigger(value) => value.mysql_body.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Mark only the last token actually consumed by a credential production.
+    /// Its original range comes from this parser's same raw token owner. The
+    /// capability is the admitted source, not a decoded identifier or body name.
+    pub fn mark_mysql_secret_token(&mut self) -> Result<(), ParserError> {
+        let Some(raw) = self.tokens.raw() else {
+            return Ok(());
+        };
+        let source = raw
+            .get(self.get_current_index())
+            .ok_or_else(|| ParserError::ParserError("secret token was not consumed".into()))?
+            .source
+            .clone();
+        if self.mysql_secret_spans.len() == self.mysql_secret_spans.capacity() {
+            let next = self
+                .mysql_secret_spans
+                .capacity()
+                .max(1)
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    ParserError::ResourceExhausted("secret span capacity overflow".into())
+                })?;
+            let bytes = next
+                .checked_mul(core::mem::size_of::<SqlSourceOccurrence>())
+                .ok_or_else(|| {
+                    ParserError::ResourceExhausted("secret span allocation overflow".into())
+                })?;
+            // The old allocation lease remains live across replacement, so
+            // admission covers the actual old+new allocation peak.
+            let admission = raw
+                .cursor
+                .borrow()
+                .admit(bytes)
+                .map_err(ParserError::from)?;
+            self.mysql_secret_spans
+                .try_reserve_exact(next - self.mysql_secret_spans.len())
+                .map_err(|_| {
+                    ParserError::ResourceExhausted("secret span allocation failed".into())
+                })?;
+            if self.mysql_secret_spans.capacity() > next {
+                return Err(ParserError::ResourceExhausted(
+                    "secret span allocator exceeded admission".into(),
+                ));
+            }
+            self.mysql_secret_admission = Some(admission);
+        }
+        self.mysql_secret_spans.push(source);
+        Ok(())
+    }
+
+    /// Copy grammar-selected password bytes without system-text conversion.
+    /// The same raw bundle retains their capacity lease; filled-token callers
+    /// cannot acquire a native source occurrence by using this allocation API.
+    pub fn copy_mysql_body_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>, ParserError> {
+        if let Some(raw) = self.tokens.raw() {
+            raw.cursor
+                .borrow_mut()
+                .admit_retained(bytes.len())
+                .map_err(ParserError::from)?;
+        }
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| ParserError::ResourceExhausted("body byte allocation failed".into()))?;
+        if value.capacity() > bytes.len() {
+            return Err(ParserError::ResourceExhausted(
+                "body byte allocator exceeded admission".into(),
+            ));
+        }
+        value.extend_from_slice(bytes);
+        Ok(value)
+    }
+
+    /// Consume one saved MySQL program with the caller's existing control
+    /// grammar on this same admitted token owner. The callback leaves only
+    /// the optional outer semicolon unread. Finalization retains the original
+    /// body occurrence and sole CPP ledger, including all allocation leases;
+    /// it never renders SQL or creates a synthetic statement. The supplied
+    /// canonical charset labels describe that original parse, not authority.
+    /// Callback, lexical, trailing-input and allocation errors publish nothing.
+    pub fn parse_mysql_source_program<T>(
+        mut self,
+        source_charset: &'static str,
+        connection_charset: &'static str,
+        compile_body: impl FnOnce(&mut Self) -> Result<T, ParserError>,
+    ) -> Result<(T, SqlSourceOccurrence, SqlCppLedger), ParserError> {
+        if self.tokens.raw().is_none() {
+            return Err(ParserError::ParserError(
+                "byte program requires admitted source".into(),
+            ));
+        }
+        let start = self.index;
+        let body = compile_body(&mut self)?;
+        self.check_source_error()?;
+        let (occurrence, _) = self.mysql_source_range(start, self.index)?;
+        self.consume_token(&Token::SemiColon);
+        if self.peek_token_ref().token != Token::EOF {
+            return self.expected_ref("end of saved program", self.peek_token_ref());
+        }
+        self.check_source_error()?;
+        let ParserTokenOwner::Raw(raw) = self.tokens else {
+            unreachable!()
+        };
+        let extra = raw.cursor.borrow().retained_admission_count();
+        let owner = raw
+            .cursor
+            .borrow()
+            .admit(SqlCppLedger::owner_allocation_bytes())?;
+        let (mut admissions, container) = raw.admissions(extra)?;
+        let (pieces, mut cursor_admissions, cpp_admission, cursor_container) =
+            raw.cursor.into_inner().into_cpp();
+        admissions.append(&mut cursor_admissions);
+        admissions.extend(cpp_admission);
+        admissions.extend(cursor_container);
+        Ok((
+            body,
+            occurrence,
+            SqlCppLedger::adopt(
+                pieces,
+                admissions,
+                container,
+                owner,
+                source_charset,
+                connection_charset,
+            ),
+        ))
+    }
+
+    /// Borrow the original byte/CPP range consumed between two token indices.
+    /// This service works only on the same admitted raw token owner; it never
+    /// searches SQL text, renders an expression, or reparses input.
+    pub fn mysql_consumed_source(
+        &self,
+        start: usize,
+    ) -> Result<Option<(SqlSourceOccurrence, SqlCppPieceRange)>, ParserError> {
+        if self.tokens.raw().is_none() {
+            return Ok(None);
+        }
+        self.mysql_source_range(start, self.index).map(Some)
+    }
+
+    fn mysql_character_attribute_condition(&self, attribute: &str) {
+        if let Some(raw) = self.tokens.raw() {
+            let (syntax, replacement) = match attribute {
+                "BINARY" => (
+                    "BINARY as attribute of a type",
+                    "a CHARACTER SET clause with _bin collation",
+                ),
+                "ASCII" => ("ASCII", "CHARACTER SET charset_name"),
+                "UNICODE" => ("UNICODE", "CHARACTER SET charset_name"),
+                _ => unreachable!("actual character attribute reduction"),
+            };
+            raw.cursor
+                .borrow()
+                .deprecated_character_syntax(syntax, replacement);
+        }
+    }
+
+    fn mysql_charset_name_condition(&self, charset: &ObjectName) {
+        if let [part] = charset.0.as_slice() {
+            if let Some(identifier) = part.as_ident() {
+                self.mysql_charset_identifier_condition(identifier);
+            }
+        }
+    }
+
+    fn mysql_charset_identifier_condition(&self, charset: &Ident) {
+        if let Some(raw) = self.tokens.raw() {
+            raw.cursor.borrow().deprecated_character_set(&charset.value);
+        }
+    }
+
+    fn mysql_numeric_type_conditions(&self, data_type: &DataType) {
+        let integer_display_width = matches!(
+            data_type,
+            DataType::TinyInt(Some(_))
+                | DataType::Int2(Some(_))
+                | DataType::SmallInt(Some(_))
+                | DataType::MediumInt(Some(_))
+                | DataType::Int(Some(_))
+                | DataType::Int4(Some(_))
+                | DataType::Integer(Some(_))
+                | DataType::BigInt(Some(_))
+                | DataType::Int8(Some(_))
+                | DataType::TinyIntUnsigned(Some(_))
+                | DataType::Int2Unsigned(Some(_))
+                | DataType::SmallIntUnsigned(Some(_))
+                | DataType::MediumIntUnsigned(Some(_))
+                | DataType::IntUnsigned(Some(_))
+                | DataType::Int4Unsigned(Some(_))
+                | DataType::IntegerUnsigned(Some(_))
+                | DataType::BigIntUnsigned(Some(_))
+                | DataType::Int8Unsigned(Some(_))
+        );
+        let unsigned_approximate_or_decimal = matches!(
+            data_type,
+            DataType::DecimalUnsigned(_)
+                | DataType::DecUnsigned(_)
+                | DataType::FloatUnsigned(_)
+                | DataType::DoubleUnsigned(_)
+                | DataType::DoublePrecisionUnsigned
+                | DataType::RealUnsigned
+        );
+        let approximate_precision_and_scale = matches!(
+            data_type,
+            DataType::Float(sqlparser::ast::ExactNumberInfo::PrecisionAndScale(_, _))
+                | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::PrecisionAndScale(_, _))
+                | DataType::Double(sqlparser::ast::ExactNumberInfo::PrecisionAndScale(_, _))
+                | DataType::DoubleUnsigned(sqlparser::ast::ExactNumberInfo::PrecisionAndScale(
+                    _,
+                    _
+                ))
+        );
+
+        if approximate_precision_and_scale {
+            self.mysql_numeric_condition("FLOAT_DIGITS");
+        }
+        if unsigned_approximate_or_decimal {
+            self.mysql_numeric_condition("FLOAT_UNSIGNED");
+        }
+        if integer_display_width {
+            self.mysql_numeric_condition("INTEGER_DISPLAY_WIDTH");
+        }
+    }
+
+    fn mysql_year_type_conditions(
+        &self,
+        data_type: &DataType,
+        unsigned_only: bool,
+    ) -> Result<(), ParserError> {
+        let DataType::Custom(name, modifiers) = data_type else {
+            return Ok(());
+        };
+        if !name.to_string().eq_ignore_ascii_case("year") {
+            return Ok(());
+        }
+        if !modifiers.is_empty() {
+            // The native grammar uses strtoul(NUM, NULL, 10), not an end
+            // pointer check. Keep that exact prefix policy on the original
+            // numeric token, without evaluating an SQL expression.
+            let valid = matches!(modifiers.as_slice(), [width] if {
+                let mut number = Some(0_u64);
+                let mut digits = 0;
+                for byte in width.bytes().take_while(u8::is_ascii_digit) {
+                    digits += 1;
+                    number = number.and_then(|v| v.checked_mul(10))
+                        .and_then(|v| v.checked_add(u64::from(byte-b'0')));
+                }
+                digits != 0 && number == Some(4)
+            });
+            if !valid {
+                return Err(ParserError::MySqlInvalidYearWidth);
+            }
+            if let Some(raw) = self.tokens.raw() {
+                raw.cursor
+                    .borrow()
+                    .deprecated_character_syntax("YEAR(4)", "YEAR");
+            }
+        }
+        if unsigned_only {
+            self.mysql_numeric_condition("YEAR_UNSIGNED");
+        }
+        Ok(())
+    }
+
+    fn mysql_numeric_condition(&self, syntax: &str) {
+        if let Some(raw) = self.tokens.raw() {
+            raw.cursor.borrow().deprecated_numeric_syntax(syntax);
+        }
+    }
+
+    fn mysql_collation_identifier_condition(&self, collation: &Ident) {
+        if let Some(raw) = self.tokens.raw() {
+            raw.cursor.borrow().deprecated_collation(&collation.value);
+        }
+    }
+
+    fn mysql_collation_name_condition(&self, collation: &ObjectName) {
+        if let [part] = collation.0.as_slice() {
+            if let Some(identifier) = part.as_ident() {
+                self.mysql_collation_identifier_condition(identifier);
+            }
+        }
+    }
+
+    fn mysql_character_option_condition(
+        &self,
+        value: &Expr,
+        collation: bool,
+    ) -> Result<(), ParserError> {
+        let Some(raw) = self.tokens.raw() else {
+            return Ok(());
+        };
+        let name;
+        let text = match value {
+            Expr::Identifier(identifier) => identifier.value.as_str(),
+            Expr::Value(value) => match &value.value {
+                Value::MySqlText(text) => {
+                    name = self.mysql_system_text(text)?;
+                    name.as_str()
+                }
+                Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => text.as_str(),
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        if collation {
+            raw.cursor.borrow().deprecated_collation(text);
+        } else {
+            raw.cursor.borrow().deprecated_character_set(text);
+        }
+        Ok(())
+    }
+
+    fn parse_mysql_character_identifier(&mut self) -> Result<Ident, ParserError> {
+        if dialect_of!(self is MySqlDialect)
+            && matches!(
+                self.peek_token_ref().token,
+                Token::MySqlText(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+            )
+        {
+            // Native ident_or_text consumes one TEXT_STRING_sys, not a value
+            // expression or an adjacent literal. Its original Source remains
+            // in this same token ledger; the String is a system control only.
+            Ok(Ident::new(self.parse_literal_string()?))
+        } else {
+            self.parse_identifier()
+        }
+    }
+
+    fn parse_mysql_character_object_name(&mut self) -> Result<ObjectName, ParserError> {
+        if dialect_of!(self is MySqlDialect)
+            && matches!(
+                self.peek_token_ref().token,
+                Token::MySqlText(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+            )
+        {
+            Ok(ObjectName::from(vec![
+                self.parse_mysql_character_identifier()?,
+            ]))
+        } else {
+            self.parse_object_name(false)
+        }
+    }
+
+    /// Parse one expression from admitted MySQL bytes using the normal
+    /// expression grammar, retaining its one original/CPP/admission bundle.
+    /// Requires complete input (optionally one terminal semicolon). This is
+    /// not a synthetic SELECT/RETURN/SET and grants no execution capability.
+    pub fn parse_mysql_source_expression(mut self) -> Result<MySqlParsedExpression, ParserError> {
+        if self.tokens.raw().is_none() {
+            return Err(ParserError::ParserError(
+                "byte expression requires admitted source".into(),
+            ));
+        }
+        let start = self.index;
+        let expression = self.parse_expr()?;
+        let (source_occurrence, cpp_range) = self.mysql_source_range(start, self.index)?;
+        let _ = self.consume_token(&Token::SemiColon);
+        if self.peek_token_ref().token != Token::EOF {
+            return self.expected_ref("end of expression", self.peek_token_ref());
+        }
+        self.check_source_error()?;
+        let ParserTokenOwner::Raw(raw) = self.tokens else {
+            unreachable!()
+        };
+        let extra = raw.cursor.borrow().retained_admission_count();
+        let (mut admissions, admissions_admission) = raw.admissions(extra)?;
+        let (cpp, mut cursor_admissions, cpp_admission, container_admission) =
+            raw.cursor.into_inner().into_cpp();
+        admissions.append(&mut cursor_admissions);
+        admissions.extend(cpp_admission);
+        admissions.extend(container_admission);
+        Ok(MySqlParsedExpression {
+            expression,
+            source_occurrence,
+            cpp_range,
+            cpp,
+            admissions,
+            admissions_admission,
+        })
+    }
+
+    fn check_source_error(&self) -> Result<(), ParserError> {
+        if let Some(error) = self.tokens.raw().and_then(|raw| raw.error.get()) {
+            return Err(error.clone());
+        }
+        Ok(())
+    }
+
+    fn mysql_source_range(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<(SqlSourceOccurrence, SqlCppPieceRange), ParserError> {
+        let raw = self
+            .tokens
+            .raw()
+            .ok_or_else(|| ParserError::ParserError("missing MySQL source owner".into()))?;
+        let mut tokens = (start..end)
+            .filter_map(|index| raw.get(index))
+            .filter(|token| !matches!(token.token.token, Token::Whitespace(_)));
+        let first = tokens
+            .next()
+            .ok_or_else(|| ParserError::ParserError("empty MySQL source occurrence".into()))?;
+        let last = tokens.last().unwrap_or(first);
+        let owner = first
+            .source
+            .owner()
+            .ok_or_else(|| ParserError::ParserError("detached MySQL source".into()))?;
+        let occurrence = owner
+            .occurrence(first.source.range().start..last.source.range().end)
+            .map_err(ParserError::ParserError)?;
+        Ok((
+            occurrence,
+            SqlCppPieceRange {
+                start: first.cpp.start,
+                end: last.cpp.end,
+            },
+        ))
     }
 
     /// Parse potentially multiple statements
@@ -495,6 +1558,7 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut expecting_statement_delimiter = false;
         loop {
+            self.check_cancelled()?;
             // ignore empty statements (between successive statement delimiters)
             while self.consume_token(&Token::SemiColon) {
                 expecting_statement_delimiter = false;
@@ -561,7 +1625,7 @@ impl<'a> Parser<'a> {
     /// Consumes this parser returning comments from the parsed token stream.
     fn into_comments(self) -> comments::Comments {
         let mut comments = comments::Comments::default();
-        for t in self.tokens.into_iter() {
+        for t in self.tokens.into_filled() {
             match t.token {
                 Token::Whitespace(Whitespace::SingleLineComment { comment, prefix }) => {
                     comments.offer(comments::CommentWithSpan {
@@ -587,6 +1651,7 @@ impl<'a> Parser<'a> {
     /// Parse a single top-level statement (such as SELECT, INSERT, CREATE, etc.),
     /// stopping before the statement separator, if any.
     pub fn parse_statement(&mut self) -> Result<Statement, ParserError> {
+        self.check_cancelled()?;
         let _guard = self.recursion_counter.try_decrease()?;
 
         // allow the dialect to override statement parsing
@@ -596,13 +1661,30 @@ impl<'a> Parser<'a> {
 
         let next_token = self.next_token();
         match &next_token.token {
+            Token::Word(w)
+                if dialect_of!(self is MySqlDialect)
+                    && w.quote_style.is_none()
+                    && w.value.eq_ignore_ascii_case("UNINSTALL") =>
+            {
+                self.parse_mysql_component(false)
+            }
             Token::Word(w) => match w.keyword {
+                Keyword::HELP if dialect_of!(self is MySqlDialect) => self.parse_mysql_help(),
                 Keyword::KILL => self.parse_kill(),
                 Keyword::FLUSH => self.parse_flush(),
                 Keyword::DESC => self.parse_explain(DescribeAlias::Desc),
                 Keyword::DESCRIBE => self.parse_explain(DescribeAlias::Describe),
                 Keyword::EXPLAIN => self.parse_explain(DescribeAlias::Explain),
+                Keyword::ANALYZE if dialect_of!(self is MySqlDialect) => {
+                    self.parse_mysql_table_maintenance(MySqlTableMaintenanceOperation::Analyze)
+                }
                 Keyword::ANALYZE => self.parse_analyze().map(Into::into),
+                Keyword::CHECK if dialect_of!(self is MySqlDialect) => {
+                    self.parse_mysql_table_maintenance(MySqlTableMaintenanceOperation::Check)
+                }
+                Keyword::REPAIR if dialect_of!(self is MySqlDialect) => {
+                    self.parse_mysql_table_maintenance(MySqlTableMaintenanceOperation::Repair)
+                }
                 Keyword::CASE => {
                     self.prev_token();
                     self.parse_case_stmt().map(Into::into)
@@ -618,6 +1700,9 @@ impl<'a> Parser<'a> {
                 Keyword::RAISE => {
                     self.prev_token();
                     self.parse_raise_stmt().map(Into::into)
+                }
+                Keyword::DO if dialect_of!(self is PostgreSqlDialect | GenericDialect) => {
+                    self.parse_do()
                 }
                 Keyword::SELECT | Keyword::WITH | Keyword::VALUES | Keyword::FROM => {
                     self.prev_token();
@@ -640,7 +1725,10 @@ impl<'a> Parser<'a> {
                 Keyword::DROP => self.parse_drop(),
                 Keyword::DISCARD => self.parse_discard(),
                 Keyword::DECLARE => self.parse_declare(),
-                Keyword::FETCH => self.parse_fetch_statement(),
+                Keyword::FETCH => self.parse_fetch_statement(false),
+                Keyword::MOVE if dialect_of!(self is PostgreSqlDialect | GenericDialect) => {
+                    self.parse_fetch_statement(true)
+                }
                 Keyword::DELETE => self.parse_delete(next_token),
                 Keyword::INSERT => self.parse_insert(next_token),
                 Keyword::REPLACE => self.parse_replace(next_token),
@@ -695,11 +1783,17 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::RENAME => self.parse_rename(),
                 // `INSTALL` is duckdb specific https://duckdb.org/docs/extensions/overview
+                Keyword::INSTALL if dialect_of!(self is MySqlDialect) => {
+                    self.parse_mysql_component(true)
+                }
                 Keyword::INSTALL if self.dialect.supports_install() => self.parse_install(),
                 Keyword::LOAD => self.parse_load(),
                 Keyword::LOCK => {
                     self.prev_token();
                     self.parse_lock_statement().map(Into::into)
+                }
+                Keyword::OPTIMIZE if dialect_of!(self is MySqlDialect) => {
+                    self.parse_mysql_table_maintenance(MySqlTableMaintenanceOperation::Optimize)
                 }
                 Keyword::OPTIMIZE if self.dialect.supports_optimize_table() => {
                     self.parse_optimize_table()
@@ -892,6 +1986,41 @@ impl<'a> Parser<'a> {
 
         Ok(RaiseStatement { value })
     }
+
+    /// Parse a PostgreSQL anonymous code block.
+    pub fn parse_do(&mut self) -> Result<Statement, ParserError> {
+        let mut language = None;
+        let mut body = None;
+        for _ in 0..2 {
+            if self.parse_keyword(Keyword::LANGUAGE) {
+                if language.is_some() {
+                    return self
+                        .expected_ref("LANGUAGE specified only once", self.peek_token_ref());
+                }
+                language = Some(self.parse_identifier()?);
+                continue;
+            }
+            if body.is_none() {
+                let value = self.parse_value()?;
+                if !matches!(
+                    &value.value,
+                    Value::SingleQuotedString(_)
+                        | Value::DollarQuotedString(_)
+                        | Value::EscapedStringLiteral(_)
+                        | Value::UnicodeStringLiteral(_)
+                ) {
+                    return self.expected_ref("a string literal", self.peek_token_ref());
+                }
+                body = Some(value);
+                continue;
+            }
+            break;
+        }
+        let body = body.ok_or_else(|| {
+            ParserError::ParserError("DO requires an anonymous code block".to_string())
+        })?;
+        Ok(Statement::Do(DoStatement { language, body }))
+    }
     /// Parse a COMMENT statement.
     ///
     /// See [Statement::Comment]
@@ -957,6 +2086,23 @@ impl<'a> Parser<'a> {
             _ => self.expected("comment object_type", token)?,
         };
 
+        let routine_arguments = if matches!(
+            object_type,
+            CommentObject::Function | CommentObject::Procedure
+        ) {
+            self.expect_token(&Token::LParen)?;
+            let arguments = if self.consume_token(&Token::RParen) {
+                Vec::new()
+            } else {
+                let arguments = self.parse_comma_separated(Parser::parse_function_arg)?;
+                self.expect_token(&Token::RParen)?;
+                arguments
+            };
+            Some(arguments)
+        } else {
+            None
+        };
+
         self.expect_keyword_is(Keyword::IS)?;
         let comment = if self.parse_keyword(Keyword::NULL) {
             None
@@ -966,6 +2112,7 @@ impl<'a> Parser<'a> {
         Ok(Statement::Comment {
             object_type,
             object_name,
+            routine_arguments,
             comment,
             if_exists,
         })
@@ -1021,26 +2168,23 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[Keyword::LOGS]) {
             FlushType::Logs
         } else if self.parse_keywords(&[Keyword::TABLES]) {
-            loop {
-                let next_token = self.next_token();
-                match &next_token.token {
-                    Token::Word(w) => match w.keyword {
-                        Keyword::WITH => {
-                            read_lock = self.parse_keywords(&[Keyword::READ, Keyword::LOCK]);
-                        }
-                        Keyword::FOR => {
-                            export = self.parse_keyword(Keyword::EXPORT);
-                        }
-                        Keyword::NoKeyword => {
-                            self.prev_token();
-                            tables = self.parse_comma_separated(|p| p.parse_object_name(false))?;
-                        }
-                        _ => {}
-                    },
-                    _ => {
-                        break;
-                    }
+            // The enclosing statement/PSM owns its delimiter. Never consume
+            // an unknown token merely to find where this optional list ends.
+            if matches!(&self.peek_token_ref().token, Token::Word(word)
+                if word.quote_style.is_some() || word.keyword == Keyword::NoKeyword)
+            {
+                tables = self.parse_comma_separated(|parser| parser.parse_object_name(false))?;
+            }
+            if self.parse_keyword(Keyword::WITH) {
+                self.expect_keywords(&[Keyword::READ, Keyword::LOCK])?;
+                read_lock = true;
+            } else if self.parse_keyword(Keyword::FOR) {
+                self.expect_keyword(Keyword::EXPORT)?;
+                if tables.is_empty() {
+                    return self
+                        .expected_ref("table list before FOR EXPORT", self.peek_token_ref());
                 }
+                export = true;
             }
 
             FlushType::Tables
@@ -1299,6 +2443,129 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_mysql_table_maintenance(
+        &mut self,
+        operation: MySqlTableMaintenanceOperation,
+    ) -> Result<Statement, ParserError> {
+        let location = if operation != MySqlTableMaintenanceOperation::Check {
+            if self.parse_mysql_word("LOCAL") {
+                Some(FlushLocation::Local)
+            } else if self.parse_mysql_word("NO_WRITE_TO_BINLOG") {
+                Some(FlushLocation::NoWriteToBinlog)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if self
+            .parse_one_of_keywords(&[Keyword::TABLE, Keyword::TABLES])
+            .is_none()
+        {
+            return self.expected("TABLE or TABLES", self.peek_token());
+        }
+        let tables = self.parse_comma_separated(|parser| parser.parse_object_name(false))?;
+        let mut options = Vec::new();
+        if operation == MySqlTableMaintenanceOperation::Check {
+            loop {
+                let option = if self.parse_mysql_word("FOR") {
+                    if !self.parse_mysql_word("UPGRADE") {
+                        return self.expected("UPGRADE after FOR", self.peek_token());
+                    }
+                    MySqlCheckTableOption::ForUpgrade
+                } else if self.parse_mysql_word("QUICK") {
+                    MySqlCheckTableOption::Quick
+                } else if self.parse_mysql_word("FAST") {
+                    MySqlCheckTableOption::Fast
+                } else if self.parse_mysql_word("MEDIUM") {
+                    MySqlCheckTableOption::Medium
+                } else if self.parse_mysql_word("EXTENDED") {
+                    MySqlCheckTableOption::Extended
+                } else if self.parse_mysql_word("CHANGED") {
+                    MySqlCheckTableOption::Changed
+                } else {
+                    break;
+                };
+                options.push(option);
+            }
+        } else if operation == MySqlTableMaintenanceOperation::Repair {
+            loop {
+                let option = if self.parse_mysql_word("QUICK") {
+                    MySqlCheckTableOption::Quick
+                } else if self.parse_mysql_word("EXTENDED") {
+                    MySqlCheckTableOption::Extended
+                } else if self.parse_mysql_word("USE_FRM") {
+                    MySqlCheckTableOption::UseFrm
+                } else {
+                    break;
+                };
+                options.push(option);
+            }
+        }
+        let histogram = if operation == MySqlTableMaintenanceOperation::Analyze {
+            let update = self.parse_mysql_word("UPDATE");
+            let drop = !update && self.parse_mysql_word("DROP");
+            if update || drop {
+                if !self.parse_mysql_word("HISTOGRAM") || !self.parse_mysql_word("ON") {
+                    return self.expected("HISTOGRAM ON", self.peek_token());
+                }
+                let columns = self.parse_comma_separated(|parser| parser.parse_identifier())?;
+                if drop {
+                    Some(MySqlHistogramAction::Drop { columns })
+                } else {
+                    let mut buckets = 100;
+                    let data = if self.parse_mysql_word("USING") {
+                        if !self.parse_mysql_word("DATA") {
+                            return self.expected("DATA", self.peek_token());
+                        }
+                        let value = self.parse_value()?;
+                        if !matches!(
+                            &value.value,
+                            Value::MySqlText(_)
+                                | Value::SingleQuotedString(_)
+                                | Value::DoubleQuotedString(_)
+                        ) {
+                            return self.expected("string literal", self.peek_token());
+                        }
+                        Some(Expr::Value(value))
+                    } else {
+                        if self.parse_mysql_word("WITH") {
+                            let token = self.next_token();
+                            buckets = match &token.token {
+                                Token::Number(value, _) => value.parse().map_err(|_| {
+                                    ParserError::ParserError(
+                                        "Invalid histogram bucket count".into(),
+                                    )
+                                })?,
+                                _ => return self.expected("unsigned bucket count", token),
+                            };
+                            if !self.parse_mysql_word("BUCKETS") {
+                                return self.expected("BUCKETS", self.peek_token());
+                            }
+                        }
+                        None
+                    };
+                    Some(MySqlHistogramAction::Update {
+                        columns,
+                        buckets,
+                        data,
+                    })
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Statement::MySqlTableMaintenance {
+            operation,
+            location,
+            tables,
+            options,
+            histogram,
+        })
+    }
+
     /// Parse a new expression including wildcard & qualified wildcard.
     pub fn parse_wildcard_expr(&mut self) -> Result<Expr, ParserError> {
         let index = self.index;
@@ -1314,7 +2581,7 @@ impl<'a> Parser<'a> {
                     _ => {
                         return Err(ParserError::ParserError(
                             "Internal parser error: unexpected token type".to_string(),
-                        ))
+                        ));
                     }
                 }];
 
@@ -1358,7 +2625,7 @@ impl<'a> Parser<'a> {
             _ => (),
         };
 
-        self.index = index;
+        self.restore_token_index(index);
         self.parse_expr()
     }
 
@@ -1390,6 +2657,7 @@ impl<'a> Parser<'a> {
     /// Parse tokens until the precedence changes.
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     pub fn parse_subexpr(&mut self, precedence: u8) -> Result<Expr, ParserError> {
+        self.check_cancelled()?;
         let _guard = self.recursion_counter.try_decrease()?;
         debug!("parsing expr");
         let mut expr = self.parse_prefix()?;
@@ -1400,14 +2668,17 @@ impl<'a> Parser<'a> {
         //
         // For example (MSSQL): t1.a COLLATE Latin1_General_CI_AS
         if !self.in_column_definition_state() && self.parse_keyword(Keyword::COLLATE) {
+            let collation = self.parse_mysql_character_object_name()?;
+            self.mysql_collation_name_condition(&collation);
             expr = Expr::Collate {
                 expr: Box::new(expr),
-                collation: self.parse_object_name(false)?,
+                collation,
             };
         }
 
         debug!("prefix: {expr:?}");
         loop {
+            self.check_cancelled()?;
             let next_precedence = self.get_next_precedence()?;
             debug!("next precedence: {next_precedence:?}");
 
@@ -1519,6 +2790,7 @@ impl<'a> Parser<'a> {
                 Ok(Some(Expr::Value(self.parse_value()?)))
             }
             Keyword::CURRENT_CATALOG
+            | Keyword::CURRENT_ROLE
             | Keyword::CURRENT_USER
             | Keyword::SESSION_USER
             | Keyword::USER
@@ -1527,14 +2799,34 @@ impl<'a> Parser<'a> {
                     Ok(Some(Expr::Function(Function {
                         name: ObjectName::from(vec![w.to_ident(w_span)]),
                         uses_odbc_syntax: false,
+                        mysql_literal_source: None,
+                        origin: crate::ast::FunctionOrigin::Source,
                         parameters: FunctionArguments::None,
                         args: FunctionArguments::None,
                         null_treatment: None,
+                        from_first_last: None,
                         filter: None,
                         over: None,
                         within_group: vec![],
                     })))
                 }
+            Keyword::CURRENT_SCHEMA
+                if dialect_of!(self is PostgreSqlDialect | GenericDialect)
+                    && self.peek_token_ref().token != Token::LParen => {
+                Ok(Some(Expr::Function(Function {
+                    name: ObjectName::from(vec![w.to_ident(w_span)]),
+                    uses_odbc_syntax: false,
+                    mysql_literal_source: None,
+                    origin: crate::ast::FunctionOrigin::Source,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::None,
+                    null_treatment: None,
+                    from_first_last: None,
+                    filter: None,
+                    over: None,
+                    within_group: vec![],
+                })))
+            }
             Keyword::CURRENT_TIMESTAMP
             | Keyword::CURRENT_TIME
             | Keyword::CURRENT_DATE
@@ -1573,11 +2865,40 @@ impl<'a> Parser<'a> {
             }
             Keyword::OVERLAY => Ok(Some(self.parse_overlay_expr()?)),
             Keyword::TRIM => Ok(Some(self.parse_trim_expr()?)),
+            Keyword::INTERVAL
+                if dialect_of!(self is MySqlDialect)
+                    && self.peek_token_ref().token == Token::LParen =>
+            {
+                let start = self.index;
+                let value = self.parse_function(ObjectName::from(vec![w.to_ident(w_span)]))?;
+                let Expr::Function(function) = &value else { unreachable!() };
+                let FunctionArguments::List(arguments) = &function.args else {
+                    return parser_err!("INTERVAL requires two or more scalar expressions", self.peek_token_ref().span.start);
+                };
+                if arguments.args.len() < 2 {
+                    // A parenthesized duration (INTERVAL (1) DAY) remains the
+                    // existing interval expression, not the search Item.
+                    self.restore_token_index(start);
+                    return self.parse_interval().map(Some);
+                }
+                if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty()
+                    || arguments.args.iter().any(|argument| !matches!(argument,
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(_))))
+                    || function.filter.is_some() || function.over.is_some()
+                    || function.null_treatment.is_some() || function.from_first_last.is_some()
+                    || !function.within_group.is_empty()
+                    || !matches!(&function.parameters, FunctionArguments::None)
+                {
+                    return parser_err!("INTERVAL requires scalar expression arguments", self.peek_token_ref().span.start);
+                }
+                Ok(Some(value))
+            }
             Keyword::INTERVAL => Ok(Some(self.parse_interval()?)),
             // Treat ARRAY[1,2,3] as an array [1,2,3], otherwise try as subquery or a function call
             Keyword::ARRAY if *self.peek_token_ref() == Token::LBracket => {
+                let opening = self.get_current_token().clone();
                 self.expect_token(&Token::LBracket)?;
-                Ok(Some(self.parse_array_expr(true)?))
+                Ok(Some(self.parse_array_expr(true, opening)?))
             }
             Keyword::ARRAY
             if self.peek_token_ref().token == Token::LParen
@@ -1589,10 +2910,13 @@ impl<'a> Parser<'a> {
                     Ok(Some(Expr::Function(Function {
                         name: ObjectName::from(vec![w.to_ident(w_span)]),
                         uses_odbc_syntax: false,
+                        mysql_literal_source: None,
+                        origin: crate::ast::FunctionOrigin::Source,
                         parameters: FunctionArguments::None,
                         args: FunctionArguments::Subquery(query),
                         filter: None,
                         null_treatment: None,
+                        from_first_last: None,
                         over: None,
                         within_group: vec![],
                     })))
@@ -1635,32 +2959,50 @@ impl<'a> Parser<'a> {
         w: &Word,
         w_span: Span,
     ) -> Result<Expr, ParserError> {
+        if dialect_of!(self is MySqlDialect)
+            && w.quote_style.is_none()
+            && w.value.starts_with('@')
+            && !w.value.starts_with("@@")
+        {
+            let mut ident = w.to_ident(w_span);
+            ident.value.remove(0);
+            return Ok(Expr::UserVariable(
+                self.parse_mysql_user_variable_suffix(ident)?,
+            ));
+        }
+        if dialect_of!(self is MySqlDialect)
+            && w.quote_style.is_none()
+            && matches!(
+                w.value.to_ascii_uppercase().as_str(),
+                "UTC_DATE" | "UTC_TIME" | "UTC_TIMESTAMP"
+            )
+        {
+            return self.parse_time_functions(ObjectName::from(vec![w.to_ident(w_span)]));
+        }
         let is_outer_join = self.peek_outer_join_operator();
         match &self.peek_token_ref().token {
+            Token::LParen
+                if w.value.eq_ignore_ascii_case("JSON_VALUE")
+                    && (w.quote_style.is_none() || !dialect_of!(self is MySqlDialect))
+                    && dialect_of!(self is MySqlDialect | GenericDialect) =>
+            {
+                self.parse_json_value_expr()
+            }
             Token::LParen if !is_outer_join => {
                 let id_parts = vec![w.to_ident(w_span)];
                 self.parse_function(ObjectName::from(id_parts))
             }
             // string introducer https://dev.mysql.com/doc/refman/8.0/en/charset-introducer.html
-            Token::SingleQuotedString(_)
+            Token::MySqlText(_)
+            | Token::SingleQuotedString(_)
             | Token::DoubleQuotedString(_)
             | Token::HexStringLiteral(_)
+            | Token::MySqlHexStringLiteral(_, _)
                 if w.value.starts_with('_') =>
             {
                 Ok(Expr::Prefixed {
                     prefix: w.to_ident(w_span),
-                    value: self.parse_introduced_string_expr()?.into(),
-                })
-            }
-            // string introducer https://dev.mysql.com/doc/refman/8.0/en/charset-introducer.html
-            Token::SingleQuotedString(_)
-            | Token::DoubleQuotedString(_)
-            | Token::HexStringLiteral(_)
-                if w.value.starts_with('_') =>
-            {
-                Ok(Expr::Prefixed {
-                    prefix: w.to_ident(w_span),
-                    value: self.parse_introduced_string_expr()?.into(),
+                    value: self.parse_introduced_string_expr(w.value.clone())?.into(),
                 })
             }
             // An unreserved word (likely an identifier) is followed by an arrow,
@@ -1699,6 +3041,58 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_json_value_expr(&mut self) -> Result<Expr, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let json = Box::new(self.parse_expr()?);
+        self.expect_token(&Token::Comma)?;
+        let path = Box::new(self.parse_expr()?);
+        let returning = if self.parse_keyword(Keyword::RETURNING) {
+            Some(self.parse_data_type()?)
+        } else {
+            None
+        };
+        let mut on_empty = None;
+        let mut on_error = None;
+        while self.peek_token_ref().token != Token::RParen {
+            let clause = if self.parse_keyword(Keyword::NULL) {
+                JsonValueClause::Null
+            } else if self.parse_keyword(Keyword::ERROR) {
+                JsonValueClause::Error
+            } else if self.parse_keyword(Keyword::DEFAULT) {
+                JsonValueClause::Default(Box::new(self.parse_expr()?))
+            } else {
+                return self.expected_ref(
+                    "NULL, ERROR, DEFAULT, or closing parenthesis in JSON_VALUE",
+                    self.peek_token_ref(),
+                );
+            };
+            self.expect_keyword_is(Keyword::ON)?;
+            if self.parse_keyword(Keyword::EMPTY) {
+                if on_empty.replace(clause).is_some() {
+                    return Err(ParserError::ParserError(
+                        "JSON_VALUE contains more than one ON EMPTY clause".into(),
+                    ));
+                }
+            } else if self.parse_keyword(Keyword::ERROR) {
+                if on_error.replace(clause).is_some() {
+                    return Err(ParserError::ParserError(
+                        "JSON_VALUE contains more than one ON ERROR clause".into(),
+                    ));
+                }
+            } else {
+                return self.expected_ref("EMPTY or ERROR after ON", self.peek_token_ref());
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        Ok(Expr::JsonValue(JsonValueExpr {
+            json,
+            path,
+            returning,
+            on_empty,
+            on_error,
+        }))
+    }
+
     /// Returns true if the given [ObjectName] is a single unquoted
     /// identifier matching `expected` (case-insensitive).
     fn is_simple_unquoted_object_name(name: &ObjectName, expected: &str) -> bool {
@@ -1709,8 +3103,94 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse MySQL's signal_allowed_expr atom on this same token cursor.
+    /// Scoped variables and simple qualified identifiers are complete atoms;
+    /// no infix/operator or following diagnostics target belongs to this role.
+    pub fn parse_mysql_signal_allowed_expr(&mut self) -> Result<Expr, ParserError> {
+        if !dialect_of!(self is MySqlDialect) {
+            return self.expected_ref("MySQL condition atom", self.peek_token_ref());
+        }
+        // Reject forms outside this atom grammar before the general prefix
+        // parser can demand their nested literals or issue their conditions.
+        if matches!(
+            &self.peek_token_ref().token,
+            Token::Minus | Token::Plus | Token::LParen | Token::Placeholder(_)
+        ) {
+            self.check_source_error()?;
+            return self.expected_ref("literal or variable condition atom", self.peek_token_ref());
+        }
+        if matches!(&self.peek_token_ref().token, Token::Word(_))
+            && self.peek_nth_token_ref(1).token == Token::LParen
+        {
+            self.check_source_error()?;
+            return self.expected_ref(
+                "condition atom, not a function call",
+                self.peek_nth_token_ref(1),
+            );
+        }
+        let plain_identifier = matches!(&self.peek_token_ref().token, Token::Word(word)
+            if !word.value.starts_with('@') && (word.quote_style.is_some() || word.keyword == Keyword::NoKeyword));
+        let mut expression = if plain_identifier {
+            Expr::Identifier(self.parse_identifier()?)
+        } else {
+            self.parse_prefix()?
+        };
+        if let Expr::Identifier(first) = expression {
+            expression = if self.consume_token(&Token::Period) {
+                let mut parts = Vec::new();
+                self.mysql_source_push(&mut parts, first)?;
+                let second = self.parse_identifier()?;
+                self.mysql_source_push(&mut parts, second)?;
+                if self.consume_token(&Token::Period) {
+                    let third = self.parse_identifier()?;
+                    self.mysql_source_push(&mut parts, third)?;
+                }
+                Expr::CompoundIdentifier(parts)
+            } else {
+                Expr::Identifier(first)
+            };
+        }
+        if matches!(
+            &expression,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+        ) && self.peek_token_ref().token == Token::LParen
+        {
+            self.check_source_error()?;
+            return self.expected_ref("condition atom, not a function call", self.peek_token_ref());
+        }
+        let allowed = match &expression {
+            Expr::Value(value) => matches!(
+                &value.value,
+                Value::Number(..)
+                    | Value::SingleQuotedString(_)
+                    | Value::DoubleQuotedString(_)
+                    | Value::NationalStringLiteral(_)
+                    | Value::HexStringLiteral(_)
+                    | Value::SingleQuotedByteStringLiteral(_)
+                    | Value::Boolean(_)
+                    | Value::MySqlText(_)
+                    | Value::Null
+            ),
+            Expr::Identifier(_) | Expr::UserVariable(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::Prefixed { prefix, value } => {
+                prefix.value.starts_with('_') && matches!(value.as_ref(), Expr::Value(_))
+            }
+            Expr::TypedString(value) => matches!(
+                value.data_type,
+                DataType::Date | DataType::Time(..) | DataType::Timestamp(..)
+            ),
+            _ => false,
+        };
+        if !allowed {
+            return self.expected_ref("literal or variable condition atom", self.peek_token_ref());
+        }
+        self.check_source_error()?;
+        Ok(expression)
+    }
+
     /// Parse an expression prefix.
     pub fn parse_prefix(&mut self) -> Result<Expr, ParserError> {
+        self.check_cancelled()?;
         // allow the dialect to override prefix parsing
         if let Some(prefix) = self.dialect.parse_prefix(self) {
             return prefix;
@@ -1761,8 +3241,13 @@ impl<'a> Parser<'a> {
                 // MySQL supports using the `BINARY` keyword as a cast to binary type.
                 DataType::Binary(..) if self.dialect.supports_binary_kw_as_cast() => {
                     Ok(Expr::Cast {
-                        kind: CastKind::Cast,
-                        expr: Box::new(parser.parse_expr()?),
+                        kind: CastKind::Binary,
+                        // BINARY is a unary cast. Leave IN/comparisons to the
+                        // containing expression, including POSITION's syntax.
+                        expr: Box::new(
+                            parser
+                                .parse_subexpr(self.dialect.prec_value(Precedence::DoubleColon))?,
+                        ),
                         data_type: DataType::Binary(None),
                         array: false,
                         format: None,
@@ -1826,7 +3311,7 @@ impl<'a> Parser<'a> {
                 }
             } // End of Token::Word
             // array `[1, 2, 3]`
-            Token::LBracket => self.parse_array_expr(false),
+            Token::LBracket => self.parse_array_expr(false, self.get_current_token().clone()),
             tok @ Token::Minus | tok @ Token::Plus => {
                 let op = if *tok == Token::Plus {
                     UnaryOperator::Plus
@@ -1835,14 +3320,22 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Expr::UnaryOp {
                     op,
-                    expr: Box::new(
-                        self.parse_subexpr(self.dialect.prec_value(Precedence::MulDivModOp))?,
-                    ),
+                    expr: Box::new(self.parse_subexpr(
+                        if dialect_is!(dialect is MySqlDialect) {
+                            45
+                        } else {
+                            self.dialect.prec_value(Precedence::MulDivModOp)
+                        },
+                    )?),
                 })
             }
             Token::ExclamationMark if dialect.supports_bang_not_operator() => Ok(Expr::UnaryOp {
                 op: UnaryOperator::BangNot,
-                expr: Box::new(self.parse_subexpr(self.dialect.prec_value(Precedence::UnaryNot))?),
+                expr: Box::new(self.parse_subexpr(if dialect_is!(dialect is MySqlDialect) {
+                    46
+                } else {
+                    self.dialect.prec_value(Precedence::UnaryNot)
+                })?),
             }),
             tok @ Token::DoubleExclamationMark
             | tok @ Token::PGSquareRoot
@@ -1858,7 +3351,7 @@ impl<'a> Parser<'a> {
                     _ => {
                         return Err(ParserError::ParserError(
                             "Internal parser error: unexpected unary operator token".to_string(),
-                        ))
+                        ));
                     }
                 };
                 Ok(Expr::UnaryOp {
@@ -1870,7 +3363,11 @@ impl<'a> Parser<'a> {
             }
             Token::Tilde => Ok(Expr::UnaryOp {
                 op: UnaryOperator::BitwiseNot,
-                expr: Box::new(self.parse_subexpr(self.dialect.prec_value(Precedence::PlusMinus))?),
+                expr: Box::new(self.parse_subexpr(if dialect_is!(dialect is MySqlDialect) {
+                    45
+                } else {
+                    self.dialect.prec_value(Precedence::PlusMinus)
+                })?),
             }),
             tok @ Token::Sharp
             | tok @ Token::AtDashAt
@@ -1888,7 +3385,7 @@ impl<'a> Parser<'a> {
                     _ => {
                         return Err(ParserError::ParserError(format!(
                             "Unexpected token in unary operator parsing: {tok:?}"
-                        )))
+                        )));
                     }
                 };
                 Ok(Expr::UnaryOp {
@@ -1907,7 +3404,8 @@ impl<'a> Parser<'a> {
                 self.prev_token();
                 Ok(Expr::Value(self.parse_value()?))
             }
-            Token::Number(_, _)
+            Token::MySqlText(_)
+            | Token::Number(_, _)
             | Token::SingleQuotedString(_)
             | Token::DoubleQuotedString(_)
             | Token::TripleSingleQuotedString(_)
@@ -1924,7 +3422,8 @@ impl<'a> Parser<'a> {
             | Token::NationalStringLiteral(_)
             | Token::QuoteDelimitedStringLiteral(_)
             | Token::NationalQuoteDelimitedStringLiteral(_)
-            | Token::HexStringLiteral(_) => {
+            | Token::HexStringLiteral(_)
+            | Token::MySqlHexStringLiteral(_, _) => {
                 self.prev_token();
                 Ok(Expr::Value(self.parse_value()?))
             }
@@ -1960,6 +3459,9 @@ impl<'a> Parser<'a> {
                 self.expect_token(&Token::RParen)?;
                 Ok(expr)
             }
+            Token::AtSign if dialect_of!(self is MySqlDialect) => Ok(Expr::UserVariable(
+                self.parse_mysql_user_variable_name(span.start)?,
+            )),
             Token::Placeholder(_) | Token::Colon | Token::AtSign => {
                 self.prev_token();
                 Ok(Expr::Value(self.parse_value()?))
@@ -1995,6 +3497,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Expr, ParserError> {
         let mut ending_wildcard: Option<TokenWithSpan> = None;
         loop {
+            self.check_cancelled()?;
             if self.consume_token(&Token::Period) {
                 let next_token = self.peek_token_ref();
                 match &next_token.token {
@@ -2026,6 +3529,17 @@ impl<'a> Parser<'a> {
                         let expr = Expr::Identifier(Ident::with_span(next_token.span, s));
                         chain.push(AccessExpr::Dot(expr));
                         self.advance_token(); // The consumed placeholder
+                    }
+                    Token::Word(_)
+                        if dialect_of!(self is PostgreSqlDialect | MySqlDialect)
+                            && self.peek_nth_token_ref(1).token == Token::LParen
+                            && Self::is_all_ident(&root, &chain) =>
+                    {
+                        // After a namespace qualifier this is a normal routine
+                        // name, not unqualified CEIL/EXTRACT/JSON_VALUE grammar.
+                        let name = self.parse_identifier()?;
+                        let function = self.parse_function(ObjectName::from(vec![name]))?;
+                        chain.push(AccessExpr::Dot(function));
                     }
                     // Fallback to parsing an arbitrary expression, but restrict to expression
                     // types that are valid after the dot operator. This ensures that e.g.
@@ -2449,16 +3963,22 @@ impl<'a> Parser<'a> {
             return Ok(Function {
                 name,
                 uses_odbc_syntax: false,
+                mysql_literal_source: None,
+                origin: crate::ast::FunctionOrigin::Source,
                 parameters: FunctionArguments::None,
                 args: FunctionArguments::Subquery(subquery),
                 filter: None,
                 null_treatment: None,
+                from_first_last: None,
                 over: None,
                 within_group: vec![],
             });
         }
 
-        let mut args = self.parse_function_argument_list()?;
+        let mysql_char = dialect_of!(self is MySqlDialect)
+            && matches!(name.0.as_slice(), [part] if part.as_ident().is_some_and(|name|
+                name.quote_style.is_none() && name.value.eq_ignore_ascii_case("CHAR")));
+        let mut args = self.parse_function_argument_list_with_mysql_char(mysql_char)?;
         let mut parameters = FunctionArguments::None;
         // ClickHouse aggregations support parametric functions like `HISTOGRAM(0.5, 0.6)(x, y)`
         // which (0.5, 0.6) is a parameter to the function.
@@ -2491,6 +4011,28 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // NTH_VALUE has a dedicated FROM FIRST/LAST clause. Consume only
+        // that pair: an ordinary SELECT's FROM relation is not this clause.
+        let from_first_last = if name.0.len() == 1
+            && name.0[0].as_ident().is_some_and(|identifier| {
+                identifier.quote_style.is_none()
+                    && identifier.value.eq_ignore_ascii_case("NTH_VALUE")
+            })
+            && matches!(self.peek_token_ref().token, Token::Word(ref word) if word.keyword == Keyword::FROM)
+            && matches!(self.peek_nth_token(1).token, Token::Word(ref word) if matches!(word.keyword, Keyword::FIRST | Keyword::LAST))
+        {
+            self.next_token();
+            Some(
+                match self.expect_one_of_keywords(&[Keyword::FIRST, Keyword::LAST])? {
+                    Keyword::FIRST => FromFirstLast::First,
+                    Keyword::LAST => FromFirstLast::Last,
+                    _ => unreachable!("FIRST/LAST was checked"),
+                },
+            )
+        } else {
+            None
+        };
+
         // Syntax for null treatment shows up either in the args list
         // or after the function call, but not both.
         let null_treatment = if args
@@ -2517,9 +4059,12 @@ impl<'a> Parser<'a> {
         Ok(Function {
             name,
             uses_odbc_syntax: false,
+            mysql_literal_source: None,
+            origin: crate::ast::FunctionOrigin::Source,
             parameters,
             args: FunctionArguments::List(args),
             null_treatment,
+            from_first_last,
             filter,
             over,
             within_group,
@@ -2552,11 +4097,14 @@ impl<'a> Parser<'a> {
         Ok(Expr::Function(Function {
             name,
             uses_odbc_syntax: false,
+            mysql_literal_source: None,
+            origin: crate::ast::FunctionOrigin::Source,
             parameters: FunctionArguments::None,
             args,
             filter: None,
             over: None,
             null_treatment: None,
+            from_first_last: None,
             within_group: vec![],
         }))
     }
@@ -2586,10 +4134,31 @@ impl<'a> Parser<'a> {
         } else {
             (self.parse_window_frame_bound()?, None)
         };
+        let exclusion = if self.parse_keyword(Keyword::EXCLUDE) {
+            Some(if self.parse_keywords(&[Keyword::CURRENT, Keyword::ROW]) {
+                WindowFrameExclusion::CurrentRow
+            } else if self.parse_keyword(Keyword::GROUP) {
+                WindowFrameExclusion::Group
+            } else if self.parse_keyword(Keyword::TIES) {
+                WindowFrameExclusion::Ties
+            } else {
+                self.expect_keyword_is(Keyword::NO)?;
+                // OTHERS is not a reserved identifier in all dialects.
+                let token = self.next_token();
+                if !matches!(&token.token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("OTHERS"))
+                {
+                    return self.expected("OTHERS", token);
+                }
+                WindowFrameExclusion::NoOthers
+            })
+        } else {
+            None
+        };
         Ok(WindowFrame {
             units,
             start_bound,
             end_bound,
+            exclusion,
         })
     }
 
@@ -2754,6 +4323,7 @@ impl<'a> Parser<'a> {
             expr: Box::new(expr),
             data_type: Some(data_type),
             charset: None,
+            binary_attribute: false,
             target_before_value: true,
             styles,
         })
@@ -2770,30 +4340,48 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::LParen)?;
         let expr = self.parse_expr()?;
         if self.parse_keyword(Keyword::USING) {
-            let charset = self.parse_object_name(false)?;
+            let charset = self.parse_mysql_character_object_name()?;
+            self.mysql_charset_name_condition(&charset);
             self.expect_token(&Token::RParen)?;
             return Ok(Expr::Convert {
                 is_try,
                 expr: Box::new(expr),
                 data_type: None,
                 charset: Some(charset),
+                binary_attribute: false,
                 target_before_value: false,
                 styles: vec![],
             });
         }
         self.expect_token(&Token::Comma)?;
-        let data_type = self.parse_data_type()?;
+        let data_type = self.parse_data_type_without_conditions()?;
         let charset = if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
-            Some(self.parse_object_name(false)?)
+            let charset = self.parse_mysql_character_object_name()?;
+            self.mysql_charset_name_condition(&charset);
+            Some(charset)
         } else {
             None
         };
+        let binary_attribute = dialect_of!(self is MySqlDialect | GenericDialect)
+            && matches!(
+                data_type,
+                DataType::Character(_)
+                    | DataType::Char(_)
+                    | DataType::CharacterVarying(_)
+                    | DataType::CharVarying(_)
+                    | DataType::Varchar(_)
+            )
+            && self.parse_keyword(Keyword::BINARY);
+        if binary_attribute {
+            self.mysql_character_attribute_condition("BINARY");
+        }
         self.expect_token(&Token::RParen)?;
         Ok(Expr::Convert {
             is_try,
             expr: Box::new(expr),
             data_type: Some(data_type),
             charset,
+            binary_attribute,
             target_before_value: false,
             styles: vec![],
         })
@@ -2802,12 +4390,133 @@ impl<'a> Parser<'a> {
     /// Parse a SQL CAST function e.g. `CAST(expr AS FLOAT)`
     pub fn parse_cast_expr(&mut self, kind: CastKind) -> Result<Expr, ParserError> {
         self.expect_token(&Token::LParen)?;
-        let expr = self.parse_expr()?;
+        let mut expr = self.parse_expr()?;
+        let mysql_at_time_zone = dialect_of!(self is MySqlDialect)
+            && self.parse_keywords(&[Keyword::AT, Keyword::TIME, Keyword::ZONE]);
+        if mysql_at_time_zone {
+            let interval = self.parse_keyword(Keyword::INTERVAL);
+            if !matches!(
+                self.peek_token_ref().token,
+                Token::MySqlText(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+            ) {
+                return self
+                    .expected_ref("a text literal after AT TIME ZONE", self.peek_token_ref());
+            }
+            let zone = Expr::Value(self.parse_value()?);
+            let zone = if interval {
+                Expr::Interval(Interval {
+                    value: Box::new(zone),
+                    leading_field: None,
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                })
+            } else {
+                zone
+            };
+            expr = Expr::AtTimeZone {
+                timestamp: Box::new(expr),
+                time_zone: Box::new(zone),
+            };
+        }
         self.expect_keyword_is(Keyword::AS)?;
-        let data_type = self.parse_data_type()?;
+        let data_type_start = self.index;
+        // cast_type is not the declaration PT_numeric_type production.
+        // Invalid dimensions are checked below without emitting declaration
+        // conditions from a type which this CAST grammar never admitted.
+        let data_type = self.parse_data_type_without_conditions()?;
+        if mysql_at_time_zone
+            && (kind != CastKind::Cast || !matches!(data_type, DataType::Datetime(_)))
+        {
+            return self.expected_ref("DATETIME after CAST AT TIME ZONE", self.peek_token_ref());
+        }
+        let mysql_double_has_dimensions = matches!(
+            &data_type,
+            DataType::Double(info) | DataType::DoubleUnsigned(info)
+                if !matches!(info, ExactNumberInfo::None)
+        );
+        if dialect_of!(self is MySqlDialect) && mysql_double_has_dimensions {
+            let location = (data_type_start..self.index)
+                .filter_map(|index| self.tokens.get(index))
+                .find(|token| token.token == Token::LParen)
+                .map_or(self.peek_token_ref().span.start, |token| token.span.start);
+            return parser_err!(
+                "MySQL CAST does not permit precision or scale for DOUBLE",
+                location
+            );
+        }
+        let mysql_float_has_scale = matches!(
+            &data_type,
+            DataType::Float(ExactNumberInfo::PrecisionAndScale(_, _))
+                | DataType::FloatUnsigned(ExactNumberInfo::PrecisionAndScale(_, _))
+        );
+        if dialect_of!(self is MySqlDialect) && mysql_float_has_scale {
+            let location = (data_type_start..self.index)
+                .filter_map(|index| self.tokens.get(index))
+                .find(|token| token.token == Token::Comma)
+                .map_or(self.peek_token_ref().span.start, |token| token.span.start);
+            return parser_err!("MySQL CAST does not permit a scale for FLOAT", location);
+        }
+        let charset = if dialect_of!(self is MySqlDialect | GenericDialect)
+            && matches!(
+                data_type,
+                DataType::Character(_)
+                    | DataType::Char(_)
+                    | DataType::CharacterVarying(_)
+                    | DataType::CharVarying(_)
+                    | DataType::Varchar(_)
+            )
+            && (self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET])
+                || self.parse_keyword(Keyword::CHARSET))
+        {
+            let charset = match self.peek_token_ref().token.clone() {
+                Token::MySqlText(_) => {
+                    ObjectName::from(vec![self.parse_mysql_character_identifier()?])
+                }
+                Token::SingleQuotedString(name) => {
+                    self.next_token();
+                    ObjectName::from(vec![Ident::with_quote('\'', name)])
+                }
+                _ => self.parse_object_name(false)?,
+            };
+            self.mysql_charset_name_condition(&charset);
+            Some(charset)
+        } else {
+            None
+        };
+        let binary_attribute = dialect_of!(self is MySqlDialect | GenericDialect)
+            && matches!(
+                data_type,
+                DataType::Character(_)
+                    | DataType::Char(_)
+                    | DataType::CharacterVarying(_)
+                    | DataType::CharVarying(_)
+                    | DataType::Varchar(_)
+            )
+            && self.parse_keyword(Keyword::BINARY);
+        if binary_attribute {
+            self.mysql_character_attribute_condition("BINARY");
+        }
         let array = self.parse_keyword(Keyword::ARRAY);
         let format = self.parse_optional_cast_format()?;
         self.expect_token(&Token::RParen)?;
+        if charset.is_some() || binary_attribute {
+            if array || format.is_some() {
+                return parser_err!(
+                    "CHARACTER SET cannot be combined with ARRAY or FORMAT in CAST",
+                    self.peek_token_ref()
+                );
+            }
+            return Ok(Expr::Convert {
+                is_try: kind != CastKind::Cast,
+                expr: Box::new(expr),
+                data_type: Some(data_type),
+                charset,
+                binary_attribute,
+                target_before_value: false,
+                styles: vec![],
+            });
+        }
         Ok(Expr::Cast {
             kind,
             expr: Box::new(expr),
@@ -2984,6 +4693,19 @@ impl<'a> Parser<'a> {
                 trim_where = Some(self.parse_trim_where()?);
             }
         }
+        // SQL permits an omitted trim character after BOTH/LEADING/TRAILING.
+        // Consume FROM before parsing the source; otherwise it is mistaken
+        // for an identifier and the following source becomes a syntax error.
+        if trim_where.is_some() && self.parse_keyword(Keyword::FROM) {
+            let expr = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(Expr::Trim {
+                expr: Box::new(expr),
+                trim_where,
+                trim_what: None,
+                trim_characters: None,
+            });
+        }
         let expr = self.parse_expr()?;
         if self.parse_keyword(Keyword::FROM) {
             let trim_what = Box::new(expr);
@@ -3034,10 +4756,19 @@ impl<'a> Parser<'a> {
 
     /// Parses an array expression `[ex1, ex2, ..]`
     /// if `named` is `true`, came from an expression like  `ARRAY[ex1, ex2]`
-    pub fn parse_array_expr(&mut self, named: bool) -> Result<Expr, ParserError> {
+    pub fn parse_array_expr(
+        &mut self,
+        named: bool,
+        opening: TokenWithSpan,
+    ) -> Result<Expr, ParserError> {
         let exprs = self.parse_comma_separated0(Parser::parse_expr, Token::RBracket)?;
         self.expect_token(&Token::RBracket)?;
-        Ok(Expr::Array(Array { elem: exprs, named }))
+        Ok(Expr::Array(Array {
+            opening_token: opening.into(),
+            closing_token: self.get_current_token().clone().into(),
+            elem: exprs,
+            named,
+        }))
     }
 
     /// Parse the `ON OVERFLOW` clause for `LISTAGG`.
@@ -3061,7 +4792,8 @@ impl<'a> Parser<'a> {
                     | Token::NationalStringLiteral(_)
                     | Token::QuoteDelimitedStringLiteral(_)
                     | Token::NationalQuoteDelimitedStringLiteral(_)
-                    | Token::HexStringLiteral(_) => Some(Box::new(self.parse_expr()?)),
+                    | Token::HexStringLiteral(_)
+                    | Token::MySqlHexStringLiteral(_, _) => Some(Box::new(self.parse_expr()?)),
                     _ => self.expected_ref(
                         "either filler, WITH, or WITHOUT in LISTAGG",
                         self.peek_token_ref(),
@@ -3142,6 +4874,12 @@ impl<'a> Parser<'a> {
                 Keyword::TIMEZONE_HOUR => Ok(DateTimeField::TimezoneHour),
                 Keyword::TIMEZONE_MINUTE => Ok(DateTimeField::TimezoneMinute),
                 Keyword::TIMEZONE_REGION => Ok(DateTimeField::TimezoneRegion),
+                _ if dialect_of!(self is MySqlDialect)
+                    && Self::mysql_composite_interval_fields(&w.value).is_some() =>
+                {
+                    self.prev_token();
+                    Ok(DateTimeField::Custom(self.parse_identifier()?))
+                }
                 _ if self.dialect.allow_extract_custom() => {
                     self.prev_token();
                     let custom = self.parse_identifier()?;
@@ -3212,7 +4950,7 @@ impl<'a> Parser<'a> {
     ///
     /// # Errors
     /// This method will raise an error if the column list is empty or with invalid identifiers,
-    /// the match expression is not a literal string, or if the search modifier is not valid.
+    /// the search child/modifier does not match the selected dialect grammar.
     pub fn parse_match_against(&mut self) -> Result<Expr, ParserError> {
         let columns = self.parse_parenthesized_qualified_column_list(Mandatory, false)?;
 
@@ -3220,8 +4958,14 @@ impl<'a> Parser<'a> {
 
         self.expect_token(&Token::LParen)?;
 
-        // MySQL is too permissive about the value, IMO we can't validate it perfectly on syntax level.
-        let match_value = self.parse_value()?;
+        // Native AGAINST consumes bit_expr, not Value. Stop at comparison
+        // precedence so the real IN BOOLEAN/NATURAL modifier stays on this
+        // same cursor. A parenthesized expression still owns its full grammar.
+        let match_value = Box::new(if dialect_of!(self is MySqlDialect) {
+            self.parse_subexpr(self.dialect.prec_value(Precedence::Between))?
+        } else {
+            Expr::Value(self.parse_value()?)
+        });
 
         let in_natural_language_mode_keywords = &[
             Keyword::IN,
@@ -3255,6 +4999,70 @@ impl<'a> Parser<'a> {
             match_value,
             opt_search_modifier,
         })
+    }
+
+    fn mysql_composite_interval_fields(value: &str) -> Option<(DateTimeField, DateTimeField)> {
+        match value.to_ascii_uppercase().as_str() {
+            "DAY_SECOND" => Some((DateTimeField::Day, DateTimeField::Second)),
+            "DAY_MINUTE" => Some((DateTimeField::Day, DateTimeField::Minute)),
+            "DAY_HOUR" => Some((DateTimeField::Day, DateTimeField::Hour)),
+            "DAY_MICROSECOND" => Some((DateTimeField::Day, DateTimeField::Microsecond)),
+            "HOUR_MINUTE" => Some((DateTimeField::Hour, DateTimeField::Minute)),
+            "HOUR_SECOND" => Some((DateTimeField::Hour, DateTimeField::Second)),
+            "HOUR_MICROSECOND" => Some((DateTimeField::Hour, DateTimeField::Microsecond)),
+            "MINUTE_SECOND" => Some((DateTimeField::Minute, DateTimeField::Second)),
+            "MINUTE_MICROSECOND" => Some((DateTimeField::Minute, DateTimeField::Microsecond)),
+            "SECOND_MICROSECOND" => Some((DateTimeField::Second, DateTimeField::Microsecond)),
+            "YEAR_MONTH" => Some((DateTimeField::Year, DateTimeField::Month)),
+            _ => None,
+        }
+    }
+
+    fn mysql_valid_interval_field_range(leading: &DateTimeField, last: &DateTimeField) -> bool {
+        matches!(
+            (leading, last),
+            (DateTimeField::Day, DateTimeField::Hour)
+                | (DateTimeField::Day, DateTimeField::Minute)
+                | (DateTimeField::Day, DateTimeField::Second)
+                | (DateTimeField::Day, DateTimeField::Microsecond)
+                | (DateTimeField::Hour, DateTimeField::Minute)
+                | (DateTimeField::Hour, DateTimeField::Second)
+                | (DateTimeField::Hour, DateTimeField::Microsecond)
+                | (DateTimeField::Minute, DateTimeField::Second)
+                | (DateTimeField::Minute, DateTimeField::Microsecond)
+                | (DateTimeField::Second, DateTimeField::Microsecond)
+                | (DateTimeField::Year, DateTimeField::Month)
+        )
+    }
+
+    fn validate_mysql_interval_field_range(
+        &self,
+        leading: &DateTimeField,
+        last: &DateTimeField,
+    ) -> Result<(), ParserError> {
+        if dialect_of!(self is MySqlDialect)
+            && !Self::mysql_valid_interval_field_range(leading, last)
+        {
+            return Err(ParserError::ParserError(format!(
+                "invalid MySQL composite interval unit {leading}_{last}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_mysql_composite_interval_unit(&mut self) -> Option<(DateTimeField, DateTimeField)> {
+        if !dialect_of!(self is MySqlDialect) {
+            return None;
+        }
+        let Token::Word(word) = &self.peek_token_ref().token else {
+            return None;
+        };
+        if word.quote_style.is_some() {
+            return None;
+        }
+        let fields = Self::mysql_composite_interval_fields(&word.value)?;
+        self.next_token();
+        Some(fields)
     }
 
     /// Parse an `INTERVAL` expression.
@@ -3295,7 +5103,10 @@ impl<'a> Parser<'a> {
         //
         // Note that PostgreSQL allows omitting the qualifier, so we provide
         // this more general implementation.
-        let leading_field = if self.next_token_is_temporal_unit() {
+        let composite_fields = self.parse_mysql_composite_interval_unit();
+        let leading_field = if let Some((leading, _)) = &composite_fields {
+            Some(leading.clone())
+        } else if self.next_token_is_temporal_unit() {
             Some(self.parse_date_time_field()?)
         } else if self.dialect.require_interval_qualifier() {
             return parser_err!(
@@ -3306,30 +5117,48 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let (leading_precision, last_field, fsec_precision) =
-            if leading_field == Some(DateTimeField::Second) {
-                // SQL mandates special syntax for `SECOND TO SECOND` literals.
-                // Instead of
-                //     `SECOND [(<leading precision>)] TO SECOND[(<fractional seconds precision>)]`
-                // one must use the special format:
-                //     `SECOND [( <leading precision> [ , <fractional seconds precision>] )]`
-                let last_field = None;
-                let (leading_precision, fsec_precision) = self.parse_optional_precision_scale()?;
+        let (leading_precision, last_field, fsec_precision) = if let Some((_, last)) =
+            composite_fields
+        {
+            (None, Some(last), None)
+        } else if leading_field == Some(DateTimeField::Second) {
+            // SQL mandates special syntax for `SECOND TO SECOND` literals.
+            // Instead of
+            //     `SECOND [(<leading precision>)] TO SECOND[(<fractional seconds precision>)]`
+            // one must use the special format:
+            //     `SECOND [( <leading precision> [ , <fractional seconds precision>] )]`
+            let (leading_precision, fsec_precision) = self.parse_optional_precision_scale()?;
+            if self.parse_keyword(Keyword::TO) {
+                if fsec_precision.is_some() {
+                    return self
+                        .expected_ref("no fractional precision before TO", self.peek_token_ref());
+                }
+                let last_field = Some(self.parse_date_time_field()?);
+                if let (Some(leading), Some(last)) = (&leading_field, &last_field) {
+                    self.validate_mysql_interval_field_range(leading, last)?;
+                }
+                let trailing_precision = self.parse_optional_precision()?;
+                (leading_precision, last_field, trailing_precision)
+            } else {
+                (leading_precision, None, fsec_precision)
+            }
+        } else {
+            let leading_precision = self.parse_optional_precision()?;
+            if self.parse_keyword(Keyword::TO) {
+                let last_field = Some(self.parse_date_time_field()?);
+                if let (Some(leading), Some(last)) = (&leading_field, &last_field) {
+                    self.validate_mysql_interval_field_range(leading, last)?;
+                }
+                let fsec_precision = if last_field == Some(DateTimeField::Second) {
+                    self.parse_optional_precision()?
+                } else {
+                    None
+                };
                 (leading_precision, last_field, fsec_precision)
             } else {
-                let leading_precision = self.parse_optional_precision()?;
-                if self.parse_keyword(Keyword::TO) {
-                    let last_field = Some(self.parse_date_time_field()?);
-                    let fsec_precision = if last_field == Some(DateTimeField::Second) {
-                        self.parse_optional_precision()?
-                    } else {
-                        None
-                    };
-                    (leading_precision, last_field, fsec_precision)
-                } else {
-                    (leading_precision, None, None)
-                }
-            };
+                (leading_precision, None, None)
+            }
+        };
 
         Ok(Expr::Interval(Interval {
             value: Box::new(value),
@@ -3380,7 +5209,9 @@ impl<'a> Parser<'a> {
                     | Keyword::TIMEZONE
                     | Keyword::TIMEZONE_HOUR
                     | Keyword::TIMEZONE_MINUTE
-            )
+            ) || (dialect_of!(self is MySqlDialect)
+                && word.quote_style.is_none()
+                && Self::mysql_composite_interval_fields(&word.value).is_some())
         } else {
             false
         }
@@ -3731,6 +5562,7 @@ impl<'a> Parser<'a> {
 
     /// Parse an operator following an expression
     pub fn parse_infix(&mut self, expr: Expr, precedence: u8) -> Result<Expr, ParserError> {
+        self.check_cancelled()?;
         // allow the dialect to override infix parsing
         if let Some(infix) = self.dialect.parse_infix(self, &expr, precedence) {
             return infix;
@@ -3931,8 +5763,8 @@ impl<'a> Parser<'a> {
                 ) {
                     return parser_err!(
                         format!(
-                        "Expected one of [=, >, <, =>, =<, !=, ~, ~*, !~, !~*, ~~, ~~*, !~~, !~~*] as comparison operator, found: {op}"
-                    ),
+                            "Expected one of [=, >, <, =>, =<, !=, ~, ~*, !~, !~*, ~~, ~~*, !~~, !~~*] as comparison operator, found: {op}"
+                        ),
                         span.start
                     );
                 };
@@ -3949,9 +5781,11 @@ impl<'a> Parser<'a> {
                         right: Box::new(right),
                         is_some: keyword == Keyword::SOME,
                     },
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: expected any of {{ALL, ANY, SOME}}, got {unexpected_keyword:?}"),
-                    )),
+                    unexpected_keyword => {
+                        return Err(ParserError::ParserError(format!(
+                            "Internal parser error: expected any of {{ALL, ANY, SOME}}, got {unexpected_keyword:?}"
+                        )));
+                    }
                 })
             } else {
                 Ok(Expr::BinaryOp {
@@ -4037,7 +5871,13 @@ impl<'a> Parser<'a> {
                     } else if self.parse_keyword(Keyword::LIKE) {
                         Ok(Expr::Like {
                             negated,
-                            any: self.parse_keyword(Keyword::ANY),
+                            quantifier: self
+                                .parse_one_of_keywords(&[Keyword::ANY, Keyword::ALL])
+                                .map(|keyword| match keyword {
+                                    Keyword::ANY => PatternQuantifier::Any,
+                                    Keyword::ALL => PatternQuantifier::All,
+                                    _ => unreachable!(),
+                                }),
                             expr: Box::new(expr),
                             pattern: Box::new(
                                 self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
@@ -4047,7 +5887,13 @@ impl<'a> Parser<'a> {
                     } else if self.parse_keyword(Keyword::ILIKE) {
                         Ok(Expr::ILike {
                             negated,
-                            any: self.parse_keyword(Keyword::ANY),
+                            quantifier: self
+                                .parse_one_of_keywords(&[Keyword::ANY, Keyword::ALL])
+                                .map(|keyword| match keyword {
+                                    Keyword::ANY => PatternQuantifier::Any,
+                                    Keyword::ALL => PatternQuantifier::All,
+                                    _ => unreachable!(),
+                                }),
                             expr: Box::new(expr),
                             pattern: Box::new(
                                 self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
@@ -4057,6 +5903,13 @@ impl<'a> Parser<'a> {
                     } else if self.parse_keywords(&[Keyword::SIMILAR, Keyword::TO]) {
                         Ok(Expr::SimilarTo {
                             negated,
+                            quantifier: self
+                                .parse_one_of_keywords(&[Keyword::ANY, Keyword::ALL])
+                                .map(|keyword| match keyword {
+                                    Keyword::ANY => PatternQuantifier::Any,
+                                    Keyword::ALL => PatternQuantifier::All,
+                                    _ => unreachable!(),
+                                }),
                             expr: Box::new(expr),
                             pattern: Box::new(
                                 self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
@@ -4349,6 +6202,18 @@ impl<'a> Parser<'a> {
 
     /// Get the precedence of the next token
     pub fn get_next_precedence(&self) -> Result<u8, ParserError> {
+        // MySQL has no general AT TIME ZONE infix expression. Its one CAST
+        // production consumes this clause explicitly, without admitting an
+        // arbitrary zone expression or changing other dialects' precedence.
+        if dialect_of!(self is MySqlDialect) && self.peek_keyword(Keyword::AT) {
+            return Ok(0);
+        }
+        // MySQL's bitwise XOR binds above multiplication and addition, while
+        // shifts bind below addition. The shared dialect precedence puts `^`
+        // alongside shifts; keep this override specific to MySQL.
+        if dialect_of!(self is MySqlDialect) && self.peek_token_ref().token == Token::Caret {
+            return Ok(42);
+        }
         self.dialect.get_next_precedence_default(self)
     }
 
@@ -4405,20 +6270,22 @@ impl<'a> Parser<'a> {
     /// See [`Self::peek_token`] for an example.
     pub fn peek_tokens_with_location<const N: usize>(&self) -> [TokenWithSpan; N] {
         let mut index = self.index;
-        core::array::from_fn(|_| loop {
-            let token = self.tokens.get(index);
-            index += 1;
-            if let Some(TokenWithSpan {
-                token: Token::Whitespace(_),
-                span: _,
-            }) = token
-            {
-                continue;
+        core::array::from_fn(|_| {
+            loop {
+                let token = self.tokens.get(index);
+                index += 1;
+                if let Some(TokenWithSpan {
+                    token: Token::Whitespace(_),
+                    span: _,
+                }) = token
+                {
+                    continue;
+                }
+                break token.cloned().unwrap_or(TokenWithSpan {
+                    token: Token::EOF,
+                    span: Span::empty(),
+                });
             }
-            break token.cloned().unwrap_or(TokenWithSpan {
-                token: Token::EOF,
-                span: Span::empty(),
-            });
         })
     }
 
@@ -4428,17 +6295,19 @@ impl<'a> Parser<'a> {
     /// See [`Self::peek_tokens`] for an example.
     pub fn peek_tokens_ref<const N: usize>(&self) -> [&TokenWithSpan; N] {
         let mut index = self.index;
-        core::array::from_fn(|_| loop {
-            let token = self.tokens.get(index);
-            index += 1;
-            if let Some(TokenWithSpan {
-                token: Token::Whitespace(_),
-                span: _,
-            }) = token
-            {
-                continue;
+        core::array::from_fn(|_| {
+            loop {
+                let token = self.tokens.get(index);
+                index += 1;
+                if let Some(TokenWithSpan {
+                    token: Token::Whitespace(_),
+                    span: _,
+                }) = token
+                {
+                    continue;
+                }
+                break token.unwrap_or(&EOF_TOKEN);
             }
-            break token.unwrap_or(&EOF_TOKEN);
         })
     }
 
@@ -4495,7 +6364,7 @@ impl<'a> Parser<'a> {
     fn peek_keywords(&mut self, expected: &[Keyword]) -> bool {
         let index = self.index;
         let matched = self.parse_keywords(expected);
-        self.index = index;
+        self.restore_token_index(index);
         matched
     }
 
@@ -4576,8 +6445,31 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
+            self.rewind_canonical_digest(self.index);
             return;
         }
+    }
+
+    fn rewind_canonical_digest(&self, index: usize) {
+        if let Some(raw) = self.tokens.raw() {
+            if raw.cursor.borrow().canonical_reduction_boundary().is_none() {
+                return;
+            }
+            // This token is already demanded. No lexical work is performed by
+            // the rollback check and no second token/reduction ledger is kept.
+            if let Some(token) = raw.get(index) {
+                raw.cursor
+                    .borrow_mut()
+                    .rewind_canonical_digest(token.source.range().start);
+            }
+        }
+    }
+
+    fn restore_token_index(&mut self, index: usize) {
+        if index < self.index {
+            self.rewind_canonical_digest(index);
+        }
+        self.index = index;
     }
 
     /// Report `found` was encountered instead of `expected`
@@ -4681,7 +6573,7 @@ impl<'a> Parser<'a> {
         let mut first_keyword_index = None;
         for &keyword in keywords {
             if !self.parse_keyword(keyword) {
-                self.index = start_index;
+                self.restore_token_index(start_index);
                 return None;
             }
             if first_keyword_index.is_none() {
@@ -4791,7 +6683,7 @@ impl<'a> Parser<'a> {
         let index = self.index;
         for token in tokens {
             if !self.consume_token(token) {
-                self.index = index;
+                self.restore_token_index(index);
                 return false;
             }
         }
@@ -4941,6 +6833,7 @@ impl<'a> Parser<'a> {
     {
         let mut values = vec![];
         loop {
+            self.check_cancelled()?;
             values.push(f(self)?);
             if self.is_parse_comma_separated_end_with_trailing_commas(
                 trailing_commas,
@@ -5071,11 +6964,21 @@ impl<'a> Parser<'a> {
         F: FnMut(&mut Parser) -> Result<T, ParserError>,
     {
         let index = self.index;
+        let reduction = self
+            .tokens
+            .raw()
+            .and_then(|raw| raw.cursor.borrow().canonical_reduction_boundary());
         match f(self) {
             Ok(t) => Ok(t),
             Err(e) => {
                 // Unwind stack if limit exceeded
-                self.index = index;
+                if let Some(raw) = self.tokens.raw() {
+                    let current_reduction = raw.cursor.borrow().canonical_reduction_boundary();
+                    if current_reduction != reduction {
+                        raw.cursor.borrow_mut().reject_canonical_rollback();
+                    }
+                }
+                self.restore_token_index(index);
                 Err(e)
             }
         }
@@ -5157,10 +7060,26 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::EXTERNAL) {
             self.parse_create_external_table(or_replace).map(Into::into)
         } else if self.parse_keyword(Keyword::FUNCTION) {
+            if dialect_of!(self is MySqlDialect) {
+                return self.parse_mysql_create_function(
+                    or_alter,
+                    or_replace,
+                    temporary,
+                    create_view_params,
+                );
+            }
             self.parse_create_function(or_alter, or_replace, temporary)
         } else if self.parse_keyword(Keyword::DOMAIN) {
             self.parse_create_domain().map(Into::into)
         } else if self.parse_keyword(Keyword::TRIGGER) {
+            if dialect_of!(self is MySqlDialect) {
+                return self.parse_mysql_create_trigger(
+                    or_alter,
+                    or_replace,
+                    temporary,
+                    create_view_params,
+                );
+            }
             self.parse_create_trigger(temporary, or_alter, or_replace, false)
                 .map(Into::into)
         } else if self.parse_keywords(&[Keyword::CONSTRAINT, Keyword::TRIGGER]) {
@@ -5172,6 +7091,11 @@ impl<'a> Parser<'a> {
             self.parse_create_secret(or_replace, temporary, persistent)
         } else if self.parse_keyword(Keyword::USER) {
             self.parse_create_user(or_replace).map(Into::into)
+        } else if self.parse_keyword(Keyword::PROCEDURE) {
+            if dialect_of!(self is MySqlDialect) {
+                return self.parse_mysql_create_procedure(or_alter, or_replace, create_view_params);
+            }
+            self.parse_create_procedure(or_alter, or_replace)
         } else if or_replace {
             self.expected_ref(
                 "[EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE",
@@ -5180,9 +7104,17 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::EXTENSION) {
             self.parse_create_extension().map(Into::into)
         } else if self.parse_keyword(Keyword::INDEX) {
-            self.parse_create_index(false).map(Into::into)
+            self.parse_create_index(false, CreateIndexKind::Ordinary)
+                .map(Into::into)
         } else if self.parse_keywords(&[Keyword::UNIQUE, Keyword::INDEX]) {
-            self.parse_create_index(true).map(Into::into)
+            self.parse_create_index(true, CreateIndexKind::Ordinary)
+                .map(Into::into)
+        } else if self.parse_keywords(&[Keyword::FULLTEXT, Keyword::INDEX]) {
+            self.parse_create_index(false, CreateIndexKind::FullText)
+                .map(Into::into)
+        } else if self.parse_keywords(&[Keyword::SPATIAL, Keyword::INDEX]) {
+            self.parse_create_index(false, CreateIndexKind::Spatial)
+                .map(Into::into)
         } else if self.parse_keyword(Keyword::VIRTUAL) {
             self.parse_create_virtual_table()
         } else if self.parse_keyword(Keyword::SCHEMA) {
@@ -5197,8 +7129,6 @@ impl<'a> Parser<'a> {
             self.parse_create_collation().map(Into::into)
         } else if self.parse_keyword(Keyword::TYPE) {
             self.parse_create_type()
-        } else if self.parse_keyword(Keyword::PROCEDURE) {
-            self.parse_create_procedure(or_alter)
         } else if self.parse_keyword(Keyword::CONNECTOR) {
             self.parse_create_connector().map(Into::into)
         } else if self.parse_keyword(Keyword::OPERATOR) {
@@ -5219,7 +7149,7 @@ impl<'a> Parser<'a> {
 
     fn parse_create_user(&mut self, or_replace: bool) -> Result<CreateUser, ParserError> {
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
+        let name = self.parse_account_identifier()?;
         let options = self
             .parse_key_value_options(false, &[Keyword::WITH, Keyword::TAG])?
             .options;
@@ -5518,10 +7448,14 @@ impl<'a> Parser<'a> {
                 || self.parse_keyword(Keyword::CHARSET)
             {
                 let _ = self.consume_token(&Token::Eq);
-                default_charset = Some(self.parse_identifier()?.value);
+                let charset = self.parse_mysql_character_identifier()?;
+                self.mysql_charset_identifier_condition(&charset);
+                default_charset = Some(charset.value);
             } else if self.parse_keyword(Keyword::COLLATE) {
                 let _ = self.consume_token(&Token::Eq);
-                default_collation = Some(self.parse_identifier()?.value);
+                let collation = self.parse_mysql_character_identifier()?;
+                self.mysql_collation_identifier_condition(&collation);
+                default_collation = Some(collation.value);
             } else if has_default {
                 // DEFAULT keyword not followed by CHARACTER SET, CHARSET, or COLLATE
                 self.prev_token();
@@ -5555,6 +7489,372 @@ impl<'a> Parser<'a> {
             with_tags: None,
             with_contacts: None,
         })
+    }
+
+    /// Parse one MySQL stored-program declaration type, preserving its actual
+    /// character modifiers. The returned suffix retains native ASCII,
+    /// UNICODE, BINARY, CHARACTER SET and COLLATE attributes; BYTE is the
+    /// native binary-character-set synonym. DataType retains actual members.
+    pub fn parse_mysql_program_type(&mut self) -> Result<(DataType, String), ParserError> {
+        let data_type = self.parse_data_type()?;
+        let mut syntax = String::new();
+        let character = matches!(
+            data_type,
+            DataType::Char(_)
+                | DataType::Character(_)
+                | DataType::Varchar(_)
+                | DataType::CharVarying(_)
+                | DataType::CharacterVarying(_)
+                | DataType::Text
+                | DataType::TinyText
+                | DataType::MediumText
+                | DataType::LongText
+                | DataType::Enum(_, _)
+                | DataType::Set(_)
+                | DataType::MySqlEnum(_)
+                | DataType::MySqlSet(_)
+        );
+        let national = matches!(data_type, DataType::Nchar(_) | DataType::Nvarchar(_));
+        if character {
+            let binary_first = self.parse_keyword(Keyword::BINARY);
+            if binary_first {
+                syntax.push_str(" BINARY");
+            }
+            if self.parse_mysql_word("ASCII") {
+                syntax.push_str(" ASCII");
+                let binary_last = !binary_first && self.parse_keyword(Keyword::BINARY);
+                if binary_last {
+                    syntax.push_str(" BINARY");
+                }
+                if binary_first {
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+                self.mysql_character_attribute_condition("ASCII");
+                if binary_last {
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+            } else if self.parse_mysql_word("UNICODE") {
+                syntax.push_str(" UNICODE");
+                let binary_last = !binary_first && self.parse_keyword(Keyword::BINARY);
+                if binary_last {
+                    syntax.push_str(" BINARY");
+                }
+                if binary_first {
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+                self.mysql_character_attribute_condition("UNICODE");
+                if binary_last {
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+            } else if !binary_first && self.parse_mysql_word("BYTE") {
+                syntax.push_str(" CHARACTER SET binary");
+            } else if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET])
+                || self.parse_keywords(&[Keyword::CHAR, Keyword::SET])
+                || self.parse_keyword(Keyword::CHARSET)
+            {
+                syntax.push_str(" CHARACTER SET ");
+                syntax.push_str(&self.parse_mysql_program_charset_name(true)?);
+                if binary_first {
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+                if !binary_first && self.parse_keyword(Keyword::BINARY) {
+                    syntax.push_str(" BINARY");
+                    self.mysql_character_attribute_condition("BINARY");
+                }
+            } else if binary_first {
+                self.mysql_character_attribute_condition("BINARY");
+            }
+        } else if national && self.parse_keyword(Keyword::BINARY) {
+            syntax.push_str(" BINARY");
+            self.mysql_character_attribute_condition("BINARY");
+        }
+        if self.parse_keyword(Keyword::COLLATE) {
+            syntax.push_str(" COLLATE ");
+            syntax.push_str(&self.parse_mysql_program_charset_name(false)?);
+        }
+        Ok((data_type, syntax))
+    }
+
+    fn parse_mysql_program_charset_name(&mut self, charset: bool) -> Result<String, ParserError> {
+        let name = if matches!(
+            self.peek_token_ref().token,
+            Token::MySqlText(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+        ) {
+            let name = self.parse_literal_string()?;
+            Ident::with_quote('`', name)
+        } else {
+            self.parse_identifier()?
+        };
+        if charset {
+            self.mysql_charset_identifier_condition(&name);
+        } else {
+            self.mysql_collation_identifier_condition(&name);
+        }
+        Ok(name.to_string())
+    }
+
+    fn parse_mysql_program_args(
+        &mut self,
+        function: bool,
+        body: &mut MySqlProgramBody,
+    ) -> Result<Vec<OperateFunctionArg>, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !self.consume_token(&Token::RParen) {
+            loop {
+                let mode = if self.parse_keyword(Keyword::INOUT) {
+                    Some(ArgMode::InOut)
+                } else if self.parse_keyword(Keyword::OUT) {
+                    Some(ArgMode::Out)
+                } else if self.parse_keyword(Keyword::IN) {
+                    Some(ArgMode::In)
+                } else {
+                    None
+                };
+                if function && mode.is_some() {
+                    return self.expected_ref(
+                        "function parameter name without a mode",
+                        self.peek_token_ref(),
+                    );
+                }
+                let name = self.parse_identifier()?;
+                let (data_type, syntax) = self.parse_mysql_program_type()?;
+                body.parameter_type_modifiers.push(syntax);
+                args.push(OperateFunctionArg {
+                    mode,
+                    name: Some(name),
+                    data_type,
+                    default_expr: None,
+                });
+                if self.consume_token(&Token::RParen) {
+                    break;
+                }
+                self.expect_token(&Token::Comma)?;
+            }
+        }
+        Ok(args)
+    }
+
+    fn parse_mysql_program_characteristics(
+        &mut self,
+        body: &mut MySqlProgramBody,
+    ) -> Result<Option<FunctionSecurity>, ParserError> {
+        let mut security = None;
+        loop {
+            if self.parse_keyword(Keyword::LANGUAGE) {
+                self.expect_keyword_is(Keyword::SQL)?;
+            } else if self.parse_keyword(Keyword::DETERMINISTIC) {
+                body.deterministic = Some(true);
+            } else if self.parse_keywords(&[Keyword::NOT, Keyword::DETERMINISTIC]) {
+                body.deterministic = Some(false);
+            } else if self.parse_keywords(&[Keyword::NO, Keyword::SQL]) {
+                body.data_access = Some("NO SQL".into());
+            } else if self.parse_keywords(&[Keyword::CONTAINS, Keyword::SQL]) {
+                body.data_access = Some("CONTAINS SQL".into());
+            } else if self.parse_keywords(&[Keyword::READS, Keyword::SQL, Keyword::DATA]) {
+                body.data_access = Some("READS SQL DATA".into());
+            } else if self.parse_keywords(&[Keyword::MODIFIES, Keyword::SQL, Keyword::DATA]) {
+                body.data_access = Some("MODIFIES SQL DATA".into());
+            } else if self.parse_keywords(&[Keyword::SQL, Keyword::SECURITY]) {
+                security = Some(if self.parse_keyword(Keyword::DEFINER) {
+                    FunctionSecurity::Definer
+                } else {
+                    self.expect_keyword_is(Keyword::INVOKER)?;
+                    FunctionSecurity::Invoker
+                });
+            } else if self.parse_keyword(Keyword::COMMENT) {
+                body.comment = Some(Expr::Value(
+                    Value::SingleQuotedString(self.parse_literal_string()?).into(),
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(security)
+    }
+
+    // Filled String parsers retain only a header/presentation AST here. The
+    // product's same control grammar consumes the actual UTF8 input supplied
+    // by that API. Raw parsers must use the body callback, never this scan.
+    fn finish_mysql_program_header(&mut self) -> Result<(), ParserError> {
+        if self.mysql_program_header_only {
+            return Ok(());
+        }
+        if self.tokens.raw().is_some() {
+            return Err(ParserError::ParserError(
+                "saved byte body requires its PSM compiler".into(),
+            ));
+        }
+        let mut nesting = 0usize;
+        let mut after_end = false;
+        loop {
+            self.check_cancelled()?;
+            match &self.peek_token_ref().token {
+                Token::EOF => break,
+                Token::SemiColon if nesting == 0 => break,
+                Token::Word(word) if word.quote_style.is_none() => {
+                    if word.keyword == Keyword::END {
+                        nesting = nesting.saturating_sub(1);
+                        after_end = true;
+                    } else if after_end {
+                        after_end = false;
+                    } else if matches!(
+                        word.keyword,
+                        Keyword::BEGIN
+                            | Keyword::IF
+                            | Keyword::CASE
+                            | Keyword::WHILE
+                            | Keyword::REPEAT
+                            | Keyword::LOOP
+                    ) && self.peek_nth_token_ref(1).token != Token::LParen
+                    {
+                        nesting = nesting
+                            .checked_add(1)
+                            .ok_or(ParserError::RecursionLimitExceeded)?;
+                    }
+                }
+                _ => {
+                    after_end = false;
+                }
+            }
+            self.next_token();
+        }
+        Ok(())
+    }
+
+    fn mysql_program_header(
+        params: Option<CreateViewParams>,
+    ) -> Result<MySqlProgramBody, ParserError> {
+        if params
+            .as_ref()
+            .is_some_and(|value| value.algorithm.is_some() || value.security.is_some())
+        {
+            return Err(ParserError::ParserError(
+                "view-only CREATE characteristic on stored program".into(),
+            ));
+        }
+        Ok(MySqlProgramBody {
+            definer: params.and_then(|value| value.definer),
+            ..Default::default()
+        })
+    }
+
+    fn parse_mysql_create_function(
+        &mut self,
+        or_alter: bool,
+        or_replace: bool,
+        temporary: bool,
+        params: Option<CreateViewParams>,
+    ) -> Result<Statement, ParserError> {
+        let mut body = Self::mysql_program_header(params)?;
+        body.if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        let name = self.parse_object_name(false)?;
+        let args = self.parse_mysql_program_args(true, &mut body)?;
+        self.expect_keyword_is(Keyword::RETURNS)?;
+        let (data_type, syntax) = self.parse_mysql_program_type()?;
+        body.return_type_modifiers = Some(syntax);
+        let security = self.parse_mysql_program_characteristics(&mut body)?;
+        self.finish_mysql_program_header()?;
+        let if_not_exists = body.if_not_exists;
+        Ok(CreateFunction {
+            mysql_body: Some(body),
+            or_alter,
+            or_replace,
+            temporary,
+            name,
+            args: Some(args),
+            return_type: Some(FunctionReturnType::DataType(data_type)),
+            function_body: None,
+            behavior: None,
+            called_on_null: None,
+            parallel: None,
+            security,
+            set_params: Vec::new(),
+            using: None,
+            language: None,
+            determinism_specifier: None,
+            options: None,
+            remote_connection: None,
+            if_not_exists,
+        }
+        .into())
+    }
+
+    fn parse_mysql_create_procedure(
+        &mut self,
+        or_alter: bool,
+        or_replace: bool,
+        params: Option<CreateViewParams>,
+    ) -> Result<Statement, ParserError> {
+        let mut body = Self::mysql_program_header(params)?;
+        body.if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        let name = self.parse_object_name(false)?;
+        let args = self.parse_mysql_program_args(false, &mut body)?;
+        let security = self.parse_mysql_program_characteristics(&mut body)?;
+        if self.peek_keyword(Keyword::AS) {
+            return self.expected_ref(
+                "a MySQL procedure statement (without AS)",
+                self.peek_token_ref(),
+            );
+        }
+        self.finish_mysql_program_header()?;
+        Ok(Statement::CreateProcedure(CreateProcedure {
+            mysql_body: Some(body),
+            name,
+            or_alter,
+            or_replace,
+            args,
+            language: None,
+            security,
+            set_params: Vec::new(),
+            body: None,
+        }))
+    }
+
+    fn parse_mysql_create_trigger(
+        &mut self,
+        or_alter: bool,
+        or_replace: bool,
+        temporary: bool,
+        params: Option<CreateViewParams>,
+    ) -> Result<Statement, ParserError> {
+        let mut body = Self::mysql_program_header(params)?;
+        body.if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        let name = self.parse_object_name(false)?;
+        let period = Some(self.parse_trigger_period()?);
+        let events = vec![self.parse_trigger_event()?];
+        self.expect_keyword_is(Keyword::ON)?;
+        let table_name = self.parse_object_name(false)?;
+        self.expect_keywords(&[Keyword::FOR, Keyword::EACH, Keyword::ROW])?;
+        if matches!(&self.peek_token_ref().token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("FOLLOWS"))
+        {
+            self.next_token();
+            body.ordering = Some((true, self.parse_identifier()?));
+        } else if self.parse_keyword(Keyword::PRECEDES) {
+            body.ordering = Some((false, self.parse_identifier()?));
+        }
+        self.finish_mysql_program_header()?;
+        Ok(CreateTrigger {
+            mysql_body: Some(body),
+            or_alter,
+            temporary,
+            or_replace,
+            is_constraint: false,
+            name,
+            period,
+            period_before_table: true,
+            events,
+            table_name,
+            referenced_table_name: None,
+            referencing: Vec::new(),
+            trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
+            condition: None,
+            exec_body: None,
+            statements_as: false,
+            statements: None,
+            characteristics: None,
+        }
+        .into())
     }
 
     /// Parse an optional `USING` clause for `CREATE FUNCTION`.
@@ -5735,12 +8035,24 @@ impl<'a> Parser<'a> {
             } else if self.parse_keyword(Keyword::RETURN) {
                 ensure_not_set(&body.function_body, "RETURN")?;
                 body.function_body = Some(CreateFunctionBody::Return(self.parse_expr()?));
+            } else if self.peek_keyword(Keyword::BEGIN) {
+                ensure_not_set(&body.function_body, "SQL body")?;
+                let begin_token = self.expect_keyword(Keyword::BEGIN)?;
+                self.expect_keyword_is(Keyword::ATOMIC)?;
+                let statements = self.parse_statement_list(&[Keyword::END])?;
+                let end_token = self.expect_keyword(Keyword::END)?;
+                body.function_body = Some(CreateFunctionBody::BeginAtomic(BeginEndStatements {
+                    begin_token: AttachedToken(begin_token),
+                    statements,
+                    end_token: AttachedToken(end_token),
+                }));
             } else {
                 break;
             }
         }
 
         Ok(CreateFunction {
+            mysql_body: None,
             or_alter: false,
             or_replace,
             temporary,
@@ -5777,6 +8089,7 @@ impl<'a> Parser<'a> {
         let using = self.parse_optional_create_function_using()?;
 
         Ok(CreateFunction {
+            mysql_body: None,
             or_alter: false,
             or_replace,
             temporary,
@@ -5861,6 +8174,7 @@ impl<'a> Parser<'a> {
             or_replace,
             temporary,
             if_not_exists,
+            mysql_body: None,
             name,
             args: Some(args),
             return_type,
@@ -5952,6 +8266,7 @@ impl<'a> Parser<'a> {
             or_replace,
             temporary,
             if_not_exists: false,
+            mysql_body: None,
             name,
             args: Some(args),
             return_type,
@@ -5972,6 +8287,11 @@ impl<'a> Parser<'a> {
     fn parse_function_return_type(&mut self) -> Result<FunctionReturnType, ParserError> {
         if self.parse_keyword(Keyword::SETOF) {
             Ok(FunctionReturnType::SetOf(self.parse_data_type()?))
+        } else if self.parse_keyword(Keyword::TABLE) {
+            self.expect_token(&Token::LParen)?;
+            let columns = self.parse_comma_separated(Parser::parse_function_arg)?;
+            self.expect_token(&Token::RParen)?;
+            Ok(FunctionReturnType::Table(columns))
         } else {
             Ok(FunctionReturnType::DataType(self.parse_data_type()?))
         }
@@ -6047,7 +8367,14 @@ impl<'a> Parser<'a> {
                 return self.expected("a name or type", token.clone());
             }
 
-            name = Some(Ident::new(token.to_string()));
+            let Token::Word(word) = &token.token else {
+                unreachable!("argument name token checked above");
+            };
+            name = Some(Ident {
+                value: word.value.clone(),
+                quote_style: word.quote_style,
+                span: token.span,
+            });
             data_type = next_data_type;
         }
 
@@ -6109,7 +8436,14 @@ impl<'a> Parser<'a> {
                 return self.expected("a name or type", token.clone());
             }
 
-            name = Some(Ident::new(token.to_string()));
+            let Token::Word(word) = &token.token else {
+                unreachable!("argument name token checked above");
+            };
+            name = Some(Ident {
+                value: word.value.clone(),
+                quote_style: word.quote_style,
+                span: token.span,
+            });
             data_type = next_data_type;
         }
 
@@ -6149,9 +8483,11 @@ impl<'a> Parser<'a> {
         let option = match self.parse_one_of_keywords(&[Keyword::CASCADE, Keyword::RESTRICT]) {
             Some(Keyword::CASCADE) => Some(ReferentialAction::Cascade),
             Some(Keyword::RESTRICT) => Some(ReferentialAction::Restrict),
-            Some(unexpected_keyword) => return Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{CASCADE, RESTRICT}}, got {unexpected_keyword:?}"),
-            )),
+            Some(unexpected_keyword) => {
+                return Err(ParserError::ParserError(format!(
+                    "Internal parser error: expected any of {{CASCADE, RESTRICT}}, got {unexpected_keyword:?}"
+                )));
+            }
             None => None,
         };
         Ok(DropTrigger {
@@ -6200,14 +8536,17 @@ impl<'a> Parser<'a> {
 
         let trigger_object = if self.parse_keyword(Keyword::FOR) {
             let include_each = self.parse_keyword(Keyword::EACH);
-            let trigger_object =
-                match self.expect_one_of_keywords(&[Keyword::ROW, Keyword::STATEMENT])? {
-                    Keyword::ROW => TriggerObject::Row,
-                    Keyword::STATEMENT => TriggerObject::Statement,
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in ROW/STATEMENT"),
-                    )),
-                };
+            let trigger_object = match self
+                .expect_one_of_keywords(&[Keyword::ROW, Keyword::STATEMENT])?
+            {
+                Keyword::ROW => TriggerObject::Row,
+                Keyword::STATEMENT => TriggerObject::Statement,
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in ROW/STATEMENT"
+                    )));
+                }
+            };
 
             Some(if include_each {
                 TriggerObjectKind::ForEach(trigger_object)
@@ -6234,6 +8573,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(CreateTrigger {
+            mysql_body: None,
             or_alter,
             temporary,
             or_replace,
@@ -6269,9 +8609,11 @@ impl<'a> Parser<'a> {
                 Keyword::INSTEAD => self
                     .expect_keyword_is(Keyword::OF)
                     .map(|_| TriggerPeriod::InsteadOf)?,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger period"),
-                )),
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger period"
+                    )));
+                }
             },
         )
     }
@@ -6296,9 +8638,11 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::DELETE => TriggerEvent::Delete,
                 Keyword::TRUNCATE => TriggerEvent::Truncate,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger event"),
-                )),
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger event"
+                    )));
+                }
             },
         )
     }
@@ -6328,17 +8672,25 @@ impl<'a> Parser<'a> {
 
     /// Parse the execution body of a trigger (`FUNCTION` or `PROCEDURE`).
     pub fn parse_trigger_exec_body(&mut self) -> Result<TriggerExecBody, ParserError> {
+        let exec_type = match self
+            .expect_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE])?
+        {
+            Keyword::FUNCTION => TriggerExecBodyType::Function,
+            Keyword::PROCEDURE => TriggerExecBodyType::Procedure,
+            unexpected_keyword => {
+                return Err(ParserError::ParserError(format!(
+                    "Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger exec body"
+                )));
+            }
+        };
+        let name = self.parse_object_name(false)?;
+        self.expect_token(&Token::LParen)?;
+        let arguments = self.parse_comma_separated0(Parser::parse_expr, Token::RParen)?;
+        self.expect_token(&Token::RParen)?;
         Ok(TriggerExecBody {
-            exec_type: match self
-                .expect_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE])?
-            {
-                Keyword::FUNCTION => TriggerExecBodyType::Function,
-                Keyword::PROCEDURE => TriggerExecBodyType::Procedure,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in trigger exec body"),
-                )),
-            },
-            func_desc: self.parse_function_desc()?,
+            exec_type,
+            func_desc: FunctionDesc { name, args: None },
+            arguments,
         })
     }
 
@@ -6502,14 +8854,17 @@ impl<'a> Parser<'a> {
     pub fn parse_analyze_format(&mut self) -> Result<AnalyzeFormat, ParserError> {
         let next_token = self.next_token();
         match &next_token.token {
+            Token::Word(w) if w.value.eq_ignore_ascii_case("TRADITIONAL") => {
+                Ok(AnalyzeFormat::TRADITIONAL)
+            }
             Token::Word(w) => match w.keyword {
                 Keyword::TEXT => Ok(AnalyzeFormat::TEXT),
                 Keyword::GRAPHVIZ => Ok(AnalyzeFormat::GRAPHVIZ),
                 Keyword::JSON => Ok(AnalyzeFormat::JSON),
                 Keyword::TREE => Ok(AnalyzeFormat::TREE),
-                _ => self.expected("fileformat", next_token),
+                _ => self.expected("explain format", next_token),
             },
-            _ => self.expected("fileformat", next_token),
+            _ => self.expected("explain format", next_token),
         }
     }
 
@@ -6577,8 +8932,6 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword_is(Keyword::AS)?;
         let query = self.parse_query()?;
-        // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
-
         let with_no_schema_binding = dialect_of!(self is RedshiftSqlDialect | GenericDialect)
             && self.parse_keywords(&[
                 Keyword::WITH,
@@ -6586,6 +8939,26 @@ impl<'a> Parser<'a> {
                 Keyword::SCHEMA,
                 Keyword::BINDING,
             ]);
+        let check_option = if dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.peek_keyword(Keyword::WITH)
+        {
+            let with_token = AttachedToken(self.expect_keyword(Keyword::WITH)?);
+            let kind = if self.parse_keyword(Keyword::LOCAL) {
+                ViewCheckOptionKind::Local
+            } else {
+                let _ = self.parse_keyword(Keyword::CASCADED);
+                ViewCheckOptionKind::Cascaded
+            };
+            self.expect_keyword_is(Keyword::CHECK)?;
+            let option_token = AttachedToken(self.expect_keyword(Keyword::OPTION)?);
+            Some(ViewCheckOption {
+                kind,
+                with_token,
+                option_token,
+            })
+        } else {
+            None
+        };
 
         Ok(CreateView {
             or_alter,
@@ -6604,6 +8977,7 @@ impl<'a> Parser<'a> {
             copy_grants,
             to,
             params: create_view_params,
+            check_option,
             name_before_not_exists,
         })
     }
@@ -6669,7 +9043,7 @@ impl<'a> Parser<'a> {
     /// Parse a `CREATE ROLE` statement.
     pub fn parse_create_role(&mut self) -> Result<CreateRole, ParserError> {
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let names = self.parse_comma_separated(|p| p.parse_object_name(false))?;
+        let names = self.parse_comma_separated(|p| p.parse_account_object_name())?;
 
         let _ = self.parse_keyword(Keyword::WITH); // [ WITH ]
 
@@ -6893,21 +9267,27 @@ impl<'a> Parser<'a> {
 
     /// Parse an `OWNER` clause.
     pub fn parse_owner(&mut self) -> Result<Owner, ParserError> {
-        let owner = match self.parse_one_of_keywords(&[Keyword::CURRENT_USER, Keyword::CURRENT_ROLE, Keyword::SESSION_USER]) {
+        let owner = match self.parse_one_of_keywords(&[
+            Keyword::CURRENT_USER,
+            Keyword::CURRENT_ROLE,
+            Keyword::SESSION_USER,
+        ]) {
             Some(Keyword::CURRENT_USER) => Owner::CurrentUser,
             Some(Keyword::CURRENT_ROLE) => Owner::CurrentRole,
             Some(Keyword::SESSION_USER) => Owner::SessionUser,
-            Some(unexpected_keyword) => return Err(ParserError::ParserError(
-                format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in owner"),
-            )),
-            None => {
-                match self.parse_identifier() {
-                    Ok(ident) => Owner::Ident(ident),
-                    Err(e) => {
-                        return Err(ParserError::ParserError(format!("Expected: CURRENT_USER, CURRENT_ROLE, SESSION_USER or identifier after OWNER TO. {e}")))
-                    }
-                }
+            Some(unexpected_keyword) => {
+                return Err(ParserError::ParserError(format!(
+                    "Internal parser error: unexpected keyword `{unexpected_keyword}` in owner"
+                )));
             }
+            None => match self.parse_identifier() {
+                Ok(ident) => Owner::Ident(ident),
+                Err(e) => {
+                    return Err(ParserError::ParserError(format!(
+                        "Expected: CURRENT_USER, CURRENT_ROLE, SESSION_USER or identifier after OWNER TO. {e}"
+                    )));
+                }
+            },
         };
         Ok(owner)
     }
@@ -6961,9 +9341,11 @@ impl<'a> Parser<'a> {
             Some(match keyword {
                 Keyword::PERMISSIVE => CreatePolicyType::Permissive,
                 Keyword::RESTRICTIVE => CreatePolicyType::Restrictive,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in policy type"),
-                )),
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in policy type"
+                    )));
+                }
             })
         } else {
             None
@@ -6983,9 +9365,11 @@ impl<'a> Parser<'a> {
                 Keyword::INSERT => CreatePolicyCommand::Insert,
                 Keyword::UPDATE => CreatePolicyCommand::Update,
                 Keyword::DELETE => CreatePolicyCommand::Delete,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in policy command"),
-                )),
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in policy command"
+                    )));
+                }
             })
         } else {
             None
@@ -7182,7 +9566,7 @@ impl<'a> Parser<'a> {
                     return Err(ParserError::ParserError(format!(
                         "Duplicate or unexpected keyword {:?} in CREATE OPERATOR",
                         keyword
-                    )))
+                    )));
                 }
             }
 
@@ -7417,7 +9801,15 @@ impl<'a> Parser<'a> {
         // Many dialects support the non-standard `IF EXISTS` clause and allow
         // specifying multiple objects to delete in a single statement
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let names = self.parse_comma_separated(|p| p.parse_object_name(false))?;
+        let names = self.parse_comma_separated(|p| {
+            if dialect_of!(p is MySqlDialect)
+                && matches!(object_type, ObjectType::Role | ObjectType::User)
+            {
+                p.parse_account_object_name()
+            } else {
+                p.parse_object_name(false)
+            }
+        })?;
 
         let loc = self.peek_token_ref().span.start;
         let cascade = self.parse_keyword(Keyword::CASCADE);
@@ -7624,9 +10016,11 @@ impl<'a> Parser<'a> {
                 match keyword {
                     Keyword::WITH => Some(true),
                     Keyword::WITHOUT => Some(false),
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in cursor hold"),
-                    )),
+                    unexpected_keyword => {
+                        return Err(ParserError::ParserError(format!(
+                            "Internal parser error: unexpected keyword `{unexpected_keyword}` in cursor hold"
+                        )));
+                    }
                 }
             }
             None => None,
@@ -7937,7 +10331,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `FETCH [direction] { FROM | IN } cursor INTO target;` statement.
-    pub fn parse_fetch_statement(&mut self) -> Result<Statement, ParserError> {
+    pub fn parse_fetch_statement(&mut self, move_cursor: bool) -> Result<Statement, ParserError> {
         let direction = if self.parse_keyword(Keyword::NEXT) {
             FetchDirection::Next
         } else if self.parse_keyword(Keyword::PRIOR) {
@@ -7959,8 +10353,11 @@ impl<'a> Parser<'a> {
                 FetchDirection::ForwardAll
             } else {
                 FetchDirection::Forward {
-                    // TODO: Support optional
-                    limit: Some(self.parse_number_value()?),
+                    limit: if self.peek_keyword(Keyword::FROM) || self.peek_keyword(Keyword::IN) {
+                        None
+                    } else {
+                        Some(self.parse_number_value()?)
+                    },
                 }
             }
         } else if self.parse_keyword(Keyword::BACKWARD) {
@@ -7968,16 +10365,26 @@ impl<'a> Parser<'a> {
                 FetchDirection::BackwardAll
             } else {
                 FetchDirection::Backward {
-                    // TODO: Support optional
-                    limit: Some(self.parse_number_value()?),
+                    limit: if self.peek_keyword(Keyword::FROM) || self.peek_keyword(Keyword::IN) {
+                        None
+                    } else {
+                        Some(self.parse_number_value()?)
+                    },
                 }
             }
         } else if self.parse_keyword(Keyword::ALL) {
             FetchDirection::All
-        } else {
+        } else if self.peek_keyword(Keyword::FROM) || self.peek_keyword(Keyword::IN) {
+            FetchDirection::Next
+        } else if matches!(
+            self.peek_token_ref().token,
+            Token::Number(..) | Token::Plus | Token::Minus
+        ) {
             FetchDirection::Count {
                 limit: self.parse_number_value()?,
             }
+        } else {
+            FetchDirection::Next
         };
 
         let position = if self.peek_keyword(Keyword::FROM) {
@@ -7987,7 +10394,9 @@ impl<'a> Parser<'a> {
             self.expect_keyword(Keyword::IN)?;
             FetchPosition::In
         } else {
-            return parser_err!("Expected FROM or IN", self.peek_token_ref().span.start);
+            // PostgreSQL makes FROM/IN optional. Retain FROM as the canonical
+            // display form without widening the AST with a syntax-only bit.
+            FetchPosition::From
         };
 
         let name = self.parse_identifier()?;
@@ -7999,6 +10408,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Statement::Fetch {
+            move_cursor,
             name,
             direction,
             position,
@@ -8026,7 +10436,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a `CREATE INDEX` statement.
-    pub fn parse_create_index(&mut self, unique: bool) -> Result<CreateIndex, ParserError> {
+    pub fn parse_create_index(
+        &mut self,
+        unique: bool,
+        kind: CreateIndexKind,
+    ) -> Result<CreateIndex, ParserError> {
         let concurrently = self.parse_keyword(Keyword::CONCURRENTLY);
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
@@ -8101,6 +10515,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(CreateIndex {
+            kind,
             name: index_name,
             table_name,
             using,
@@ -8503,7 +10918,8 @@ impl<'a> Parser<'a> {
         };
 
         // parse optional column list (schema)
-        let (columns, constraints) = self.parse_columns()?;
+        let (columns, constraints, elements) =
+            self.parse_create_table_elements(allow_unquoted_hyphen)?;
         let comment_after_column_def =
             if dialect_of!(self is HiveDialect) && self.parse_keyword(Keyword::COMMENT) {
                 let next_token = self.next_token();
@@ -8614,6 +11030,13 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let mysql_partitioning =
+            if dialect_of!(self is MySqlDialect) && self.peek_mysql_words(&["PARTITION", "BY"]) {
+                Some(self.parse_mysql_partition_by()?)
+            } else {
+                None
+            };
+
         // Parse optional `AS ( query )`
         let query = if self.parse_keyword(Keyword::AS) {
             Some(self.parse_query()?)
@@ -8626,10 +11049,11 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(CreateTableBuilder::new(table_name)
+        let table = CreateTableBuilder::new(table_name)
             .temporary(temporary)
             .columns(columns)
             .constraints(constraints)
+            .elements(elements)
             .or_replace(or_replace)
             .if_not_exists(if_not_exists)
             .transient(transient)
@@ -8646,6 +11070,7 @@ impl<'a> Parser<'a> {
             .on_cluster(on_cluster)
             .clustered_by(clustered_by)
             .partition_by(partition_by)
+            .mysql_partitioning(mysql_partitioning)
             .cluster_by(create_table_config.cluster_by)
             .inherits(create_table_config.inherits)
             .partition_of(partition_of)
@@ -8657,45 +11082,122 @@ impl<'a> Parser<'a> {
             .diststyle(diststyle)
             .distkey(distkey)
             .sortkey(sortkey)
-            .build())
+            .build();
+        table
+            .validate_source_order()
+            .map_err(|message| ParserError::ParserError(message.into()))?;
+        Ok(table)
     }
 
     fn maybe_parse_create_table_like(
         &mut self,
         allow_unquoted_hyphen: bool,
     ) -> Result<Option<CreateTableLikeKind>, ParserError> {
-        let like = if self.dialect.supports_create_table_like_parenthesized()
-            && self.consume_token(&Token::LParen)
-        {
-            if self.parse_keyword(Keyword::LIKE) {
-                let name = self.parse_object_name(allow_unquoted_hyphen)?;
-                let defaults = if self.parse_keywords(&[Keyword::INCLUDING, Keyword::DEFAULTS]) {
-                    Some(CreateTableLikeDefaults::Including)
-                } else if self.parse_keywords(&[Keyword::EXCLUDING, Keyword::DEFAULTS]) {
-                    Some(CreateTableLikeDefaults::Excluding)
-                } else {
-                    None
-                };
-                self.expect_token(&Token::RParen)?;
-                Some(CreateTableLikeKind::Parenthesized(CreateTableLike {
-                    name,
-                    defaults,
-                }))
-            } else {
-                // Rollback the '(' it's probably the columns list
-                self.prev_token();
-                None
-            }
-        } else if self.parse_keyword(Keyword::LIKE) || self.parse_keyword(Keyword::ILIKE) {
+        let like = if self.parse_keyword(Keyword::LIKE) || self.parse_keyword(Keyword::ILIKE) {
             let name = self.parse_object_name(allow_unquoted_hyphen)?;
             Some(CreateTableLikeKind::Plain(CreateTableLike {
                 name,
-                defaults: None,
+                options: self.parse_create_table_like_options()?,
             }))
         } else {
             None
         };
         Ok(like)
+    }
+
+    fn parse_create_table_like_options(
+        &mut self,
+    ) -> Result<Vec<CreateTableLikeOption>, ParserError> {
+        let mut options = Vec::new();
+        loop {
+            let including = if self.parse_keyword(Keyword::INCLUDING) {
+                true
+            } else if self.parse_keyword(Keyword::EXCLUDING) {
+                false
+            } else {
+                break;
+            };
+            let token = self.next_token();
+            let Token::Word(word) = &token.token else {
+                return self.expected("LIKE option", token);
+            };
+            let kind = match word.value.to_ascii_uppercase().as_str() {
+                "COMMENTS" => CreateTableLikeOptionKind::Comments,
+                "COMPRESSION" => CreateTableLikeOptionKind::Compression,
+                "CONSTRAINTS" => CreateTableLikeOptionKind::Constraints,
+                "DEFAULTS" => CreateTableLikeOptionKind::Defaults,
+                "GENERATED" => CreateTableLikeOptionKind::Generated,
+                "IDENTITY" => CreateTableLikeOptionKind::Identity,
+                "INDEXES" => CreateTableLikeOptionKind::Indexes,
+                "STATISTICS" => CreateTableLikeOptionKind::Statistics,
+                "STORAGE" => CreateTableLikeOptionKind::Storage,
+                "ALL" => CreateTableLikeOptionKind::All,
+                _ => return self.expected("LIKE option", token),
+            };
+            options.push(if including {
+                CreateTableLikeOption::Including(kind)
+            } else {
+                CreateTableLikeOption::Excluding(kind)
+            });
+        }
+        Ok(options)
+    }
+
+    fn parse_create_table_elements(
+        &mut self,
+        allow_unquoted_hyphen: bool,
+    ) -> Result<
+        (
+            Vec<ColumnDef>,
+            Vec<TableConstraint>,
+            Vec<CreateTableElement>,
+        ),
+        ParserError,
+    > {
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+        let mut elements = Vec::new();
+        if !self.consume_token(&Token::LParen) || self.consume_token(&Token::RParen) {
+            return Ok((columns, constraints, elements));
+        }
+        loop {
+            if self.dialect.supports_create_table_like_parenthesized()
+                && self.parse_keyword(Keyword::LIKE)
+            {
+                let name = self.parse_object_name(allow_unquoted_hyphen)?;
+                elements.push(CreateTableElement::Like(CreateTableLike {
+                    name,
+                    options: self.parse_create_table_like_options()?,
+                }));
+            } else if let Some(constraint) = self.parse_optional_table_constraint()? {
+                elements.push(CreateTableElement::Constraint(constraints.len()));
+                constraints.push(constraint);
+            } else if let Token::Word(_) = &self.peek_token_ref().token {
+                let column = self.parse_column_def()?;
+                elements.push(CreateTableElement::Column(columns.len()));
+                columns.push(column);
+            } else {
+                return self.expected_ref(
+                    "column, constraint, or LIKE definition",
+                    self.peek_token_ref(),
+                );
+            }
+            let comma = self.consume_token(&Token::Comma);
+            let rparen = self.peek_token_ref().token == Token::RParen;
+            if !comma && !rparen {
+                return self
+                    .expected_ref("',' or ')' after table definition", self.peek_token_ref());
+            }
+            if rparen
+                && (!comma
+                    || self.dialect.supports_column_definition_trailing_commas()
+                    || self.options.trailing_commas)
+            {
+                let _ = self.consume_token(&Token::RParen);
+                break;
+            }
+        }
+        Ok((columns, constraints, elements))
     }
 
     pub(crate) fn parse_create_table_on_commit(&mut self) -> Result<OnCommit, ParserError> {
@@ -8855,6 +11357,12 @@ impl<'a> Parser<'a> {
             let value = self.next_token();
 
             let comment = match (has_eq, value.token) {
+                (has_eq, Token::MySqlText(text)) => {
+                    Ok(Some(SqlOption::Comment(CommentDef::MySql {
+                        has_eq,
+                        text: text.with_role(MySqlTextRole::System),
+                    })))
+                }
                 (true, Token::SingleQuotedString(s)) => {
                     Ok(Some(SqlOption::Comment(CommentDef::WithEq(s))))
                 }
@@ -9031,6 +11539,22 @@ impl<'a> Parser<'a> {
             None => Expr::Identifier(self.parse_identifier()?),
         };
 
+        if [
+            "DEFAULT CHARSET",
+            "CHARSET",
+            "DEFAULT CHARACTER SET",
+            "CHARACTER SET",
+        ]
+        .iter()
+        .any(|name| key.value.eq_ignore_ascii_case(name))
+        {
+            self.mysql_character_option_condition(&value, false)?;
+        } else if ["DEFAULT COLLATE", "COLLATE"]
+            .iter()
+            .any(|name| key.value.eq_ignore_ascii_case(name))
+        {
+            self.mysql_character_option_condition(&value, true)?;
+        }
         Ok(Some(SqlOption::KeyValue { key, value }))
     }
 
@@ -9052,6 +11576,11 @@ impl<'a> Parser<'a> {
     pub fn parse_optional_inline_comment(&mut self) -> Result<Option<CommentDef>, ParserError> {
         let comment = if self.parse_keyword(Keyword::COMMENT) {
             let has_eq = self.consume_token(&Token::Eq);
+            if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                let text = text.clone().with_role(MySqlTextRole::System);
+                self.advance_token();
+                return Ok(Some(CommentDef::MySql { has_eq, text }));
+            }
             let comment = self.parse_comment_value()?;
             Some(if has_eq {
                 CommentDef::WithEq(comment)
@@ -9078,7 +11607,7 @@ impl<'a> Parser<'a> {
     /// Parse optional procedure parameters.
     pub fn parse_optional_procedure_parameters(
         &mut self,
-    ) -> Result<Option<Vec<ProcedureParam>>, ParserError> {
+    ) -> Result<Option<Vec<OperateFunctionArg>>, ParserError> {
         let mut params = vec![];
         if !self.consume_token(&Token::LParen) || self.consume_token(&Token::RParen) {
             return Ok(Some(params));
@@ -9143,7 +11672,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse procedure parameter.
-    pub fn parse_procedure_param(&mut self) -> Result<ProcedureParam, ParserError> {
+    pub fn parse_procedure_param(&mut self) -> Result<OperateFunctionArg, ParserError> {
         let mode = if self.parse_keyword(Keyword::IN) {
             Some(ArgMode::In)
         } else if self.parse_keyword(Keyword::OUT) {
@@ -9161,11 +11690,11 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(ProcedureParam {
-            name,
+        Ok(OperateFunctionArg {
+            name: Some(name),
             data_type,
             mode,
-            default,
+            default_expr: default,
         })
     }
 
@@ -9179,15 +11708,55 @@ impl<'a> Parser<'a> {
         optional_data_type: bool,
     ) -> Result<ColumnDef, ParserError> {
         let col_name = self.parse_identifier()?;
-        let data_type = if self.is_column_type_sqlite_unspecified() {
+        let mut data_type = if self.is_column_type_sqlite_unspecified() {
             DataType::Unspecified
         } else if optional_data_type {
             self.maybe_parse(|parser| parser.parse_data_type())?
                 .unwrap_or(DataType::Unspecified)
+        } else if dialect_of!(self is MySqlDialect) {
+            self.parse_data_type_without_conditions()?
         } else {
             self.parse_data_type()?
         };
         let mut options = vec![];
+        if dialect_of!(self is MySqlDialect) {
+            let year = matches!(&data_type, DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("year"));
+            let mut year_unsigned = false;
+            let mut year_zerofill = false;
+            if year {
+                while self.peek_keyword(Keyword::UNSIGNED) || self.peek_keyword(Keyword::ZEROFILL) {
+                    let token = self.next_token().token;
+                    if matches!(&token, Token::Word(word) if word.keyword == Keyword::ZEROFILL) {
+                        year_zerofill = true;
+                        self.mysql_numeric_condition("ZEROFILL");
+                    } else {
+                        year_unsigned = true;
+                    }
+                    self.mysql_source_push(
+                        &mut options,
+                        ColumnOptionDef {
+                            name: None,
+                            option: ColumnOption::DialectSpecific(vec![token]),
+                        },
+                    )?;
+                }
+                self.mysql_year_type_conditions(&data_type, year_unsigned && !year_zerofill)?;
+                // PT_year_type ignores the successful original display width.
+                if let DataType::Custom(_, modifiers) = &mut data_type {
+                    modifiers.clear();
+                }
+            }
+            // Native field_options reduce before PT_numeric_type. Preserve
+            // the original option in the same ColumnDef, with no stored flag.
+            while self.peek_keyword(Keyword::ZEROFILL) {
+                let option = self
+                    .parse_optional_column_option()?
+                    .expect("actual ZEROFILL option");
+                self.mysql_source_push(&mut options, ColumnOptionDef { name: None, option })?;
+            }
+            self.mysql_numeric_type_conditions(&data_type);
+            self.parse_mysql_column_character_options(&mut options)?;
+        }
         loop {
             if self.parse_keyword(Keyword::CONSTRAINT) {
                 let name = Some(self.parse_identifier()?);
@@ -9210,6 +11779,98 @@ impl<'a> Parser<'a> {
             data_type,
             options,
         })
+    }
+
+    // Same native opt_charset_with_opt_binary reduction, retaining each
+    // existing ColumnOption instead of encoding a warning-replay AST flag.
+    fn parse_mysql_column_character_options(
+        &mut self,
+        options: &mut Vec<ColumnOptionDef>,
+    ) -> Result<(), ParserError> {
+        let binary_first = self.peek_keyword(Keyword::BINARY);
+        if binary_first {
+            let token = self.next_token().token;
+            self.mysql_source_push(
+                options,
+                ColumnOptionDef {
+                    name: None,
+                    option: ColumnOption::DialectSpecific(vec![token]),
+                },
+            )?;
+        }
+        let attribute = match &self.peek_token_ref().token {
+            Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("ASCII") =>
+            {
+                Some("ASCII")
+            }
+            Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("UNICODE") =>
+            {
+                Some("UNICODE")
+            }
+            _ => None,
+        };
+        if let Some(attribute) = attribute {
+            // Classification already selected the native charset symbol.
+            // The existing dialect-option payload remains the ORIGINAL
+            // token spelling; warnings use the classified attribute below.
+            let token = self.next_token().token;
+            self.mysql_source_push(
+                options,
+                ColumnOptionDef {
+                    name: None,
+                    option: ColumnOption::DialectSpecific(vec![token]),
+                },
+            )?;
+            let binary_last = !binary_first && self.peek_keyword(Keyword::BINARY);
+            if binary_last {
+                let token = self.next_token().token;
+                self.mysql_source_push(
+                    options,
+                    ColumnOptionDef {
+                        name: None,
+                        option: ColumnOption::DialectSpecific(vec![token]),
+                    },
+                )?;
+            }
+            if binary_first {
+                self.mysql_character_attribute_condition("BINARY");
+            }
+            self.mysql_character_attribute_condition(attribute);
+            if binary_last {
+                self.mysql_character_attribute_condition("BINARY");
+            }
+        } else if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET])
+            || self.parse_keyword(Keyword::CHARSET)
+        {
+            let charset = self.parse_mysql_character_object_name()?;
+            self.mysql_charset_name_condition(&charset);
+            self.mysql_source_push(
+                options,
+                ColumnOptionDef {
+                    name: None,
+                    option: ColumnOption::CharacterSet(charset),
+                },
+            )?;
+            if binary_first {
+                self.mysql_character_attribute_condition("BINARY");
+            }
+            if !binary_first && self.peek_keyword(Keyword::BINARY) {
+                let token = self.next_token().token;
+                self.mysql_source_push(
+                    options,
+                    ColumnOptionDef {
+                        name: None,
+                        option: ColumnOption::DialectSpecific(vec![token]),
+                    },
+                )?;
+                self.mysql_character_attribute_condition("BINARY");
+            }
+        } else if binary_first {
+            self.mysql_character_attribute_condition("BINARY");
+        }
+        Ok(())
     }
 
     fn is_column_type_sqlite_unspecified(&mut self) -> bool {
@@ -9250,17 +11911,42 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_optional_column_option_inner(&mut self) -> Result<Option<ColumnOption>, ParserError> {
-        if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
-            Ok(Some(ColumnOption::CharacterSet(
-                self.parse_object_name(false)?,
-            )))
+        if dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.parse_keyword(Keyword::ZEROFILL)
+        {
+            self.mysql_numeric_condition("ZEROFILL");
+            Ok(Some(ColumnOption::DialectSpecific(vec![
+                Token::make_keyword("ZEROFILL"),
+            ])))
+        } else if dialect_of!(self is MySqlDialect | GenericDialect)
+            && (self.peek_mysql_words(&["BINARY"])
+                || self.peek_mysql_words(&["ASCII"])
+                || self.peek_mysql_words(&["UNICODE"]))
+        {
+            let token = self.next_token().token;
+            if let Token::Word(word) = &token {
+                self.mysql_character_attribute_condition(&word.value.to_ascii_uppercase());
+            }
+            Ok(Some(ColumnOption::DialectSpecific(vec![token])))
+        } else if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET])
+            || (dialect_of!(self is MySqlDialect | GenericDialect)
+                && self.parse_keyword(Keyword::CHARSET))
+        {
+            let charset = self.parse_mysql_character_object_name()?;
+            self.mysql_charset_name_condition(&charset);
+            Ok(Some(ColumnOption::CharacterSet(charset)))
         } else if self.parse_keywords(&[Keyword::COLLATE]) {
-            Ok(Some(ColumnOption::Collation(
-                self.parse_object_name(false)?,
-            )))
+            let collation = self.parse_mysql_character_object_name()?;
+            self.mysql_collation_name_condition(&collation);
+            Ok(Some(ColumnOption::Collation(collation)))
         } else if self.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
             Ok(Some(ColumnOption::NotNull))
         } else if self.parse_keywords(&[Keyword::COMMENT]) {
+            if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                let text = text.clone().with_role(MySqlTextRole::System);
+                self.advance_token();
+                return Ok(Some(ColumnOption::MySqlComment(text)));
+            }
             Ok(Some(ColumnOption::Comment(self.parse_comment_value()?)))
         } else if self.parse_keyword(Keyword::NULL) {
             Ok(Some(ColumnOption::Null))
@@ -9480,6 +12166,8 @@ impl<'a> Parser<'a> {
             )))
         } else if self.parse_keyword(Keyword::INVISIBLE) {
             Ok(Some(ColumnOption::Invisible))
+        } else if self.parse_keyword(Keyword::VISIBLE) {
+            Ok(Some(ColumnOption::Visible))
         } else {
             Ok(None)
         }
@@ -9716,6 +12404,7 @@ impl<'a> Parser<'a> {
                         Keyword::PRIMARY,
                         Keyword::UNIQUE,
                         Keyword::FOREIGN,
+                        Keyword::EXCLUDE,
                     ])
                     .is_some()
             {
@@ -9750,8 +12439,18 @@ impl<'a> Parser<'a> {
 
                 let nulls_distinct = self.parse_optional_nulls_distinct()?;
 
-                // optional index name
-                let index_name = self.parse_optional_ident()?;
+                // MySQL permits `UNIQUE [KEY | INDEX] [index_name]
+                // USING index_type (...)`. Preserve USING for the index-type
+                // parser instead of accepting it as an unquoted index name.
+                let index_name = match self.peek_token_ref().token {
+                    Token::Word(ref word)
+                        if word.keyword == Keyword::USING
+                            && dialect_of!(self is GenericDialect | MySqlDialect) =>
+                    {
+                        None
+                    }
+                    _ => self.parse_optional_ident()?,
+                };
                 let index_type = self.parse_optional_using_then_index_type()?;
 
                 let columns = self.parse_parenthesized_index_column_list()?;
@@ -9783,8 +12482,17 @@ impl<'a> Parser<'a> {
                     )));
                 }
 
-                // optional index name
-                let index_name = self.parse_optional_ident()?;
+                // MySQL permits `PRIMARY KEY [index_name] USING index_type
+                // (...)`; preserve USING for the index-type parser.
+                let index_name = match self.peek_token_ref().token {
+                    Token::Word(ref word)
+                        if word.keyword == Keyword::USING
+                            && dialect_of!(self is GenericDialect | MySqlDialect) =>
+                    {
+                        None
+                    }
+                    _ => self.parse_optional_ident()?,
+                };
                 let index_type = self.parse_optional_using_then_index_type()?;
 
                 let columns = self.parse_parenthesized_index_column_list()?;
@@ -9868,6 +12576,80 @@ impl<'a> Parser<'a> {
                 ))
             }
             Token::Word(w)
+                if w.keyword == Keyword::EXCLUDE
+                    && dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
+            {
+                let using = self.parse_optional_using_then_index_type()?;
+                self.expect_token(&Token::LParen)?;
+                let elements = self.parse_comma_separated(|parser| {
+                    let key = parser.parse_create_index_expr()?;
+                    parser.expect_keyword_is(Keyword::WITH)?;
+                    let decorated = parser.parse_keyword(Keyword::OPERATOR);
+                    if decorated {
+                        parser.expect_token(&Token::LParen)?;
+                    }
+                    let operator = parser.parse_operator_name()?;
+                    if decorated {
+                        parser.expect_token(&Token::RParen)?;
+                    }
+                    Ok(ExcludeConstraintElement { key, operator })
+                })?;
+                self.expect_token(&Token::RParen)?;
+                let include = if self.parse_keyword(Keyword::INCLUDE) {
+                    self.expect_token(&Token::LParen)?;
+                    let include = self.parse_comma_separated(Parser::parse_identifier)?;
+                    self.expect_token(&Token::RParen)?;
+                    include
+                } else {
+                    Vec::new()
+                };
+                let with = if self.parse_keyword(Keyword::WITH) {
+                    self.expect_token(&Token::LParen)?;
+                    let with = self.parse_comma_separated(Parser::parse_expr)?;
+                    self.expect_token(&Token::RParen)?;
+                    with
+                } else {
+                    Vec::new()
+                };
+                let tablespace = if self.parse_keywords(&[
+                    Keyword::USING,
+                    Keyword::INDEX,
+                    Keyword::TABLESPACE,
+                ]) {
+                    Some(self.parse_identifier()?)
+                } else {
+                    None
+                };
+                let predicate = if self.parse_keyword(Keyword::WHERE) {
+                    self.expect_token(&Token::LParen)?;
+                    let predicate = self.parse_expr()?;
+                    self.expect_token(&Token::RParen)?;
+                    Some(Box::new(predicate))
+                } else {
+                    None
+                };
+                let characteristics = self.parse_constraint_characteristics()?;
+                if characteristics
+                    .as_ref()
+                    .is_some_and(|characteristics| characteristics.enforced.is_some())
+                {
+                    return self.expected_ref(
+                        "DEFERRABLE or INITIALLY for an EXCLUDE constraint",
+                        self.peek_token_ref(),
+                    );
+                }
+                Ok(Some(TableConstraint::Exclude(ExcludeConstraint {
+                    name,
+                    using,
+                    elements,
+                    include,
+                    with,
+                    tablespace,
+                    predicate,
+                    characteristics,
+                })))
+            }
+            Token::Word(w)
                 if (w.keyword == Keyword::INDEX || w.keyword == Keyword::KEY)
                     && dialect_of!(self is GenericDialect | MySqlDialect)
                     && name.is_none() =>
@@ -9915,6 +12697,7 @@ impl<'a> Parser<'a> {
                 let opt_index_name = self.parse_optional_ident()?;
 
                 let columns = self.parse_parenthesized_index_column_list()?;
+                let index_options = self.parse_index_options()?;
 
                 Ok(Some(
                     FullTextOrSpatialConstraint {
@@ -9922,6 +12705,7 @@ impl<'a> Parser<'a> {
                         index_type_display,
                         opt_index_name,
                         columns,
+                        index_options,
                     }
                     .into(),
                 ))
@@ -10054,6 +12838,12 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::COMMENT) {
             let s = self.parse_literal_string()?;
             Ok(Some(IndexOption::Comment(s)))
+        } else if self.parse_keywords(&[Keyword::WITH, Keyword::PARSER]) {
+            Ok(Some(IndexOption::Parser(self.parse_identifier()?)))
+        } else if self.parse_keyword(Keyword::VISIBLE) {
+            Ok(Some(IndexOption::Visibility(true)))
+        } else if self.parse_keyword(Keyword::INVISIBLE) {
+            Ok(Some(IndexOption::Visibility(false)))
         } else {
             Ok(None)
         }
@@ -10208,8 +12998,656 @@ impl<'a> Parser<'a> {
         Ok(AlterTableOperation::AlterSortKey { columns })
     }
 
+    fn parse_mysql_partition_selection(&mut self) -> Result<MySqlPartitionSelection, ParserError> {
+        if self.parse_keyword(Keyword::ALL) {
+            return Ok(MySqlPartitionSelection::All);
+        }
+        let names = self.parse_comma_separated(Parser::parse_identifier)?;
+        if names.is_empty() {
+            self.expected_ref("partition name or ALL", self.peek_token_ref())
+        } else {
+            Ok(MySqlPartitionSelection::Names(names))
+        }
+    }
+
+    fn parse_mysql_character_set_and_collation(
+        &mut self,
+    ) -> Result<(Ident, Option<Ident>), ParserError> {
+        let _ = self.consume_token(&Token::Eq);
+        let charset = self.parse_mysql_character_identifier()?;
+        self.mysql_charset_identifier_condition(&charset);
+        let collation = if self.parse_keyword(Keyword::COLLATE) {
+            let _ = self.consume_token(&Token::Eq);
+            let collation = self.parse_mysql_character_identifier()?;
+            self.mysql_collation_identifier_condition(&collation);
+            Some(collation)
+        } else {
+            None
+        };
+        Ok((charset, collation))
+    }
+
+    fn parse_mysql_partition_bound(&mut self) -> Result<MySqlPartitionBound, ParserError> {
+        if self.parse_keyword(Keyword::MAXVALUE) {
+            Ok(MySqlPartitionBound::MaxValue)
+        } else {
+            Ok(MySqlPartitionBound::Expr(self.parse_expr()?))
+        }
+    }
+
+    fn parse_mysql_partition_string_literal(&mut self) -> Result<ValueWithSpan, ParserError> {
+        let mut value = self.parse_value()?;
+        if let Value::MySqlText(text) = &value.value {
+            // COMMENT/DIRECTORY are native TEXT_STRING_sys, not SQL value
+            // expressions. Borrow the original admitted token's converter.
+            value.value = Value::SingleQuotedString(self.mysql_system_text(text)?);
+        }
+        if matches!(
+            &value.value,
+            Value::SingleQuotedString(_)
+                | Value::DoubleQuotedString(_)
+                | Value::NationalStringLiteral(_)
+        ) {
+            Ok(value)
+        } else {
+            Err(ParserError::ParserError(
+                "MySQL partition option requires a quoted string literal".to_string(),
+            ))
+        }
+    }
+
+    fn parse_mysql_partition_options(&mut self) -> Result<Vec<MySqlPartitionOption>, ParserError> {
+        let mut options = Vec::new();
+        loop {
+            let option = if self.peek_mysql_words(&["STORAGE", "ENGINE"])
+                || self.peek_keyword(Keyword::ENGINE)
+            {
+                let storage = self.parse_keyword(Keyword::STORAGE);
+                self.expect_keyword_is(Keyword::ENGINE)?;
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::Engine {
+                    storage,
+                    engine: self.parse_identifier()?,
+                }
+            } else if self.parse_keyword(Keyword::COMMENT) {
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::Comment(self.parse_mysql_partition_string_literal()?)
+            } else if self.peek_keywords(&[Keyword::DATA, Keyword::DIRECTORY]) {
+                self.expect_keywords(&[Keyword::DATA, Keyword::DIRECTORY])?;
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::DataDirectory(self.parse_mysql_partition_string_literal()?)
+            } else if self.peek_keywords(&[Keyword::INDEX, Keyword::DIRECTORY]) {
+                self.expect_keywords(&[Keyword::INDEX, Keyword::DIRECTORY])?;
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::IndexDirectory(self.parse_mysql_partition_string_literal()?)
+            } else if self.parse_keyword(Keyword::MAX_ROWS) {
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::MaxRows(self.parse_literal_uint()?)
+            } else if self.parse_keyword(Keyword::MIN_ROWS) {
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::MinRows(self.parse_literal_uint()?)
+            } else if self.parse_keyword(Keyword::TABLESPACE) {
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::Tablespace(self.parse_identifier()?)
+            } else if self.parse_mysql_word("NODEGROUP") {
+                let _ = self.consume_token(&Token::Eq);
+                MySqlPartitionOption::Nodegroup(self.parse_literal_uint()?)
+            } else {
+                break;
+            };
+            if options.iter().any(|existing| {
+                core::mem::discriminant(existing) == core::mem::discriminant(&option)
+            }) {
+                return Err(ParserError::ParserError(format!(
+                    "duplicate MySQL partition option {option}"
+                )));
+            }
+            options.push(option);
+        }
+        Ok(options)
+    }
+
+    fn parse_mysql_subpartition_definition(
+        &mut self,
+    ) -> Result<MySqlSubpartitionDefinition, ParserError> {
+        self.expect_mysql_word("SUBPARTITION")?;
+        Ok(MySqlSubpartitionDefinition {
+            name: self.parse_identifier()?,
+            options: self.parse_mysql_partition_options()?,
+        })
+    }
+
+    fn parse_mysql_partition_definition(
+        &mut self,
+    ) -> Result<MySqlPartitionDefinition, ParserError> {
+        self.expect_keyword_is(Keyword::PARTITION)?;
+        let name = self.parse_identifier()?;
+        let values = if self.parse_keyword(Keyword::VALUES) {
+            Some(if self.parse_keywords(&[Keyword::LESS, Keyword::THAN]) {
+                if self.parse_keyword(Keyword::MAXVALUE) {
+                    MySqlPartitionValues::LessThan(vec![MySqlPartitionBound::MaxValue])
+                } else {
+                    self.expect_token(&Token::LParen)?;
+                    let values = self.parse_comma_separated(Parser::parse_mysql_partition_bound)?;
+                    self.expect_token(&Token::RParen)?;
+                    MySqlPartitionValues::LessThan(values)
+                }
+            } else if self.parse_keyword(Keyword::IN) {
+                self.expect_token(&Token::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    if self.consume_token(&Token::LParen) {
+                        let tuple =
+                            self.parse_comma_separated(Parser::parse_mysql_partition_bound)?;
+                        if tuple
+                            .iter()
+                            .any(|value| matches!(value, MySqlPartitionBound::MaxValue))
+                        {
+                            return Err(ParserError::ParserError(
+                                "MAXVALUE is not valid in VALUES IN".to_string(),
+                            ));
+                        }
+                        self.expect_token(&Token::RParen)?;
+                        values.push(tuple);
+                    } else {
+                        let value = self.parse_mysql_partition_bound()?;
+                        if matches!(&value, MySqlPartitionBound::MaxValue) {
+                            return Err(ParserError::ParserError(
+                                "MAXVALUE is not valid in VALUES IN".to_string(),
+                            ));
+                        }
+                        values.push(vec![value]);
+                    }
+                    if !self.consume_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect_token(&Token::RParen)?;
+                MySqlPartitionValues::In(values)
+            } else {
+                return self.expected_ref("LESS THAN or IN after VALUES", self.peek_token_ref());
+            })
+        } else {
+            None
+        };
+        let options = self.parse_mysql_partition_options()?;
+        let subpartitions = if self.consume_token(&Token::LParen) {
+            let definitions =
+                self.parse_comma_separated(Parser::parse_mysql_subpartition_definition)?;
+            self.expect_token(&Token::RParen)?;
+            definitions
+        } else {
+            Vec::new()
+        };
+        Ok(MySqlPartitionDefinition {
+            name,
+            values,
+            options,
+            subpartitions,
+        })
+    }
+
+    fn parse_mysql_partition_definitions(
+        &mut self,
+    ) -> Result<Vec<MySqlPartitionDefinition>, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let definitions = self.parse_comma_separated(Parser::parse_mysql_partition_definition)?;
+        self.expect_token(&Token::RParen)?;
+        Ok(definitions)
+    }
+
+    fn parse_mysql_key_algorithm(&mut self) -> Result<Option<MySqlKeyAlgorithm>, ParserError> {
+        if !self.parse_keyword(Keyword::ALGORITHM) {
+            return Ok(None);
+        }
+        let _ = self.consume_token(&Token::Eq);
+        match self.parse_literal_uint()? {
+            1 => Ok(Some(MySqlKeyAlgorithm::Algorithm1)),
+            2 => Ok(Some(MySqlKeyAlgorithm::Algorithm2)),
+            _ => Err(ParserError::ParserError(
+                "MySQL KEY ALGORITHM must be 1 or 2".to_string(),
+            )),
+        }
+    }
+
+    fn parse_mysql_parenthesized_partition_expression(&mut self) -> Result<Expr, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let expression = self.parse_expr()?;
+        self.expect_token(&Token::RParen)?;
+        Ok(expression)
+    }
+
+    fn parse_mysql_key_columns(&mut self) -> Result<Vec<Ident>, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let columns = self.parse_comma_separated0(Parser::parse_identifier, Token::RParen)?;
+        self.expect_token(&Token::RParen)?;
+        self.validate_mysql_partition_columns(&columns)?;
+        Ok(columns)
+    }
+
+    fn validate_mysql_partition_columns(&self, columns: &[Ident]) -> Result<(), ParserError> {
+        let mut names = columns
+            .iter()
+            .map(|column| column.value.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ParserError::ParserError(
+                "duplicate column in MySQL partitioning".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_mysql_partition_method(&mut self) -> Result<MySqlPartitionMethod, ParserError> {
+        let linear = self.parse_mysql_word("LINEAR");
+        if self.parse_keyword(Keyword::HASH) {
+            return Ok(MySqlPartitionMethod::Hash {
+                linear,
+                expression: self.parse_mysql_parenthesized_partition_expression()?,
+            });
+        }
+        if self.parse_keyword(Keyword::KEY) {
+            return Ok(MySqlPartitionMethod::Key {
+                linear,
+                algorithm: self.parse_mysql_key_algorithm()?,
+                columns: self.parse_mysql_key_columns()?,
+            });
+        }
+        if linear {
+            return Err(ParserError::ParserError(
+                "LINEAR is valid only with HASH or KEY partitioning".to_string(),
+            ));
+        }
+        if self.parse_keyword(Keyword::RANGE) {
+            if self.parse_keyword(Keyword::COLUMNS) {
+                let columns = self.parse_parenthesized_column_list(IsOptional::Mandatory, false)?;
+                self.validate_mysql_partition_columns(&columns)?;
+                return Ok(MySqlPartitionMethod::RangeColumns { columns });
+            }
+            return Ok(MySqlPartitionMethod::Range {
+                expression: self.parse_mysql_parenthesized_partition_expression()?,
+            });
+        }
+        if self.parse_keyword(Keyword::LIST) {
+            if self.parse_keyword(Keyword::COLUMNS) {
+                let columns = self.parse_parenthesized_column_list(IsOptional::Mandatory, false)?;
+                self.validate_mysql_partition_columns(&columns)?;
+                return Ok(MySqlPartitionMethod::ListColumns { columns });
+            }
+            return Ok(MySqlPartitionMethod::List {
+                expression: self.parse_mysql_parenthesized_partition_expression()?,
+            });
+        }
+        self.expected_ref(
+            "RANGE, LIST, HASH, LINEAR HASH, KEY, or LINEAR KEY after PARTITION BY",
+            self.peek_token_ref(),
+        )
+    }
+
+    fn parse_mysql_subpartition_method(&mut self) -> Result<MySqlSubpartitionMethod, ParserError> {
+        let linear = self.parse_mysql_word("LINEAR");
+        if self.parse_keyword(Keyword::HASH) {
+            return Ok(MySqlSubpartitionMethod::Hash {
+                linear,
+                expression: self.parse_mysql_parenthesized_partition_expression()?,
+            });
+        }
+        if self.parse_keyword(Keyword::KEY) {
+            return Ok(MySqlSubpartitionMethod::Key {
+                linear,
+                algorithm: self.parse_mysql_key_algorithm()?,
+                columns: self.parse_mysql_key_columns()?,
+            });
+        }
+        self.expected_ref(
+            "HASH, LINEAR HASH, KEY, or LINEAR KEY after SUBPARTITION BY",
+            self.peek_token_ref(),
+        )
+    }
+
+    fn parse_mysql_partition_count(&mut self, kind: &str) -> Result<u64, ParserError> {
+        let count = self.parse_literal_uint()?;
+        if !(1..=8192).contains(&count) {
+            return Err(ParserError::ParserError(format!(
+                "MySQL {kind} count must be between 1 and 8192"
+            )));
+        }
+        Ok(count)
+    }
+
+    fn parse_mysql_partition_by(&mut self) -> Result<MySqlPartitionBy, ParserError> {
+        self.expect_keywords(&[Keyword::PARTITION, Keyword::BY])?;
+        let method = self.parse_mysql_partition_method()?;
+        let partitions = if self.parse_keyword(Keyword::PARTITIONS) {
+            Some(self.parse_mysql_partition_count("partition")?)
+        } else {
+            None
+        };
+        let subpartition = if self.peek_mysql_words(&["SUBPARTITION", "BY"]) {
+            if !matches!(
+                &method,
+                MySqlPartitionMethod::Range { .. }
+                    | MySqlPartitionMethod::RangeColumns { .. }
+                    | MySqlPartitionMethod::List { .. }
+                    | MySqlPartitionMethod::ListColumns { .. }
+            ) {
+                return Err(ParserError::ParserError(
+                    "only RANGE and LIST partitioning may be subpartitioned".to_string(),
+                ));
+            }
+            self.expect_mysql_word("SUBPARTITION")?;
+            self.expect_keyword_is(Keyword::BY)?;
+            let method = self.parse_mysql_subpartition_method()?;
+            let subpartitions = if self.parse_mysql_word("SUBPARTITIONS") {
+                Some(self.parse_mysql_partition_count("subpartition")?)
+            } else {
+                None
+            };
+            Some(MySqlSubpartitionBy {
+                method,
+                subpartitions,
+            })
+        } else {
+            None
+        };
+        let definitions = if self.peek_token_ref().token == Token::LParen {
+            self.parse_mysql_partition_definitions()?
+        } else {
+            Vec::new()
+        };
+        let partitioning = MySqlPartitionBy {
+            method,
+            partitions,
+            subpartition,
+            definitions,
+        };
+        self.validate_mysql_partition_by(&partitioning)?;
+        Ok(partitioning)
+    }
+
+    fn validate_mysql_partition_by(
+        &self,
+        partitioning: &MySqlPartitionBy,
+    ) -> Result<(), ParserError> {
+        let expected_arity = match &partitioning.method {
+            MySqlPartitionMethod::Range { .. } | MySqlPartitionMethod::List { .. } => Some(1),
+            MySqlPartitionMethod::RangeColumns { columns }
+            | MySqlPartitionMethod::ListColumns { columns } => Some(columns.len()),
+            MySqlPartitionMethod::Hash { .. } | MySqlPartitionMethod::Key { .. } => None,
+        };
+        let range = matches!(
+            &partitioning.method,
+            MySqlPartitionMethod::Range { .. } | MySqlPartitionMethod::RangeColumns { .. }
+        );
+        let list = matches!(
+            &partitioning.method,
+            MySqlPartitionMethod::List { .. } | MySqlPartitionMethod::ListColumns { .. }
+        );
+        if (range || list) && partitioning.definitions.is_empty() {
+            return Err(ParserError::ParserError(
+                "RANGE and LIST partitioning require partition definitions".to_string(),
+            ));
+        }
+        let mut partition_names = partitioning
+            .definitions
+            .iter()
+            .map(|definition| definition.name.value.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        partition_names.sort_unstable();
+        if partition_names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ParserError::ParserError(
+                "duplicate MySQL partition name".to_string(),
+            ));
+        }
+        for definition in &partitioning.definitions {
+            match (&definition.values, range, list) {
+                (Some(MySqlPartitionValues::LessThan(bounds)), true, false) => {
+                    if expected_arity != Some(bounds.len()) {
+                        return Err(ParserError::ParserError(
+                            "RANGE partition boundary arity does not match its routing input"
+                                .to_string(),
+                        ));
+                    }
+                }
+                (Some(MySqlPartitionValues::In(values)), false, true) => {
+                    if values
+                        .iter()
+                        .any(|value| expected_arity != Some(value.len()))
+                    {
+                        return Err(ParserError::ParserError(
+                            "LIST partition value arity does not match its routing input"
+                                .to_string(),
+                        ));
+                    }
+                }
+                (None, false, false) => {}
+                _ => {
+                    return Err(ParserError::ParserError(
+                        "partition VALUES clause is not applicable to its partition method"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if partitioning.partitions.is_some_and(|count| {
+            !partitioning.definitions.is_empty()
+                && usize::try_from(count).ok() != Some(partitioning.definitions.len())
+        }) {
+            return Err(ParserError::ParserError(
+                "PARTITIONS count does not match the definition list".to_string(),
+            ));
+        }
+        let explicit_subpartitioning = partitioning
+            .definitions
+            .iter()
+            .any(|definition| !definition.subpartitions.is_empty());
+        if explicit_subpartitioning && partitioning.subpartition.is_none() {
+            return Err(ParserError::ParserError(
+                "SUBPARTITION definitions require a SUBPARTITION BY clause".to_string(),
+            ));
+        }
+        let mut subpartition_names = Vec::new();
+        for definition in &partitioning.definitions {
+            if explicit_subpartitioning && definition.subpartitions.is_empty() {
+                return Err(ParserError::ParserError(
+                    "every partition must define explicit subpartitions".to_string(),
+                ));
+            }
+            for subpartition in &definition.subpartitions {
+                subpartition_names.push(subpartition.name.value.to_ascii_lowercase());
+            }
+        }
+        subpartition_names.sort_unstable();
+        if subpartition_names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ParserError::ParserError(
+                "duplicate MySQL subpartition name".to_string(),
+            ));
+        }
+        let explicit_count = partitioning
+            .definitions
+            .first()
+            .filter(|_| explicit_subpartitioning)
+            .map(|definition| definition.subpartitions.len());
+        if explicit_count.is_some_and(|count| {
+            partitioning
+                .definitions
+                .iter()
+                .any(|definition| definition.subpartitions.len() != count)
+        }) {
+            return Err(ParserError::ParserError(
+                "every partition must define the same number of subpartitions".to_string(),
+            ));
+        }
+        if let Some(subpartition) = &partitioning.subpartition {
+            if subpartition.subpartitions.is_some_and(|count| {
+                explicit_count.is_some_and(|explicit| usize::try_from(count).ok() != Some(explicit))
+            }) {
+                return Err(ParserError::ParserError(
+                    "SUBPARTITIONS count does not match explicit definitions".to_string(),
+                ));
+            }
+        }
+        let partition_count = partitioning
+            .partitions
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_else(|| partitioning.definitions.len().max(1));
+        let subpartition_count = partitioning
+            .subpartition
+            .as_ref()
+            .and_then(|subpartition| subpartition.subpartitions)
+            .and_then(|count| usize::try_from(count).ok())
+            .or(explicit_count)
+            .unwrap_or(1);
+        if partition_count
+            .checked_mul(subpartition_count)
+            .is_none_or(|count| count > 8192)
+        {
+            return Err(ParserError::ParserError(
+                "the total number of MySQL partitions must not exceed 8192".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_mysql_alter_table_operation(
+        &mut self,
+    ) -> Result<Option<AlterTableOperation>, ParserError> {
+        let operation = if self.peek_mysql_words(&["ADD", "PARTITION"]) {
+            self.expect_keywords(&[Keyword::ADD, Keyword::PARTITION])?;
+            if self.parse_keyword(Keyword::PARTITIONS) {
+                let count = self.parse_literal_uint()?;
+                if !(1..=8192).contains(&count) {
+                    return Err(ParserError::ParserError(
+                        "MySQL partition count must be between 1 and 8192".to_string(),
+                    ));
+                }
+                AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::AddCount {
+                    count,
+                })
+            } else {
+                let definitions = self.parse_mysql_partition_definitions()?;
+                AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::Add {
+                    definitions,
+                })
+            }
+        } else if self.peek_mysql_words(&["REORGANIZE", "PARTITION"]) {
+            self.expect_mysql_word("REORGANIZE")?;
+            self.expect_keyword_is(Keyword::PARTITION)?;
+            let names = self.parse_comma_separated(Parser::parse_identifier)?;
+            self.expect_keyword_is(Keyword::INTO)?;
+            let definitions = self.parse_mysql_partition_definitions()?;
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::Reorganize {
+                names,
+                definitions,
+            })
+        } else if self.peek_mysql_words(&["DEFAULT", "CHARACTER", "SET"])
+            || self.peek_mysql_words(&["DEFAULT", "CHARSET"])
+            || self.peek_mysql_words(&["CHARACTER", "SET"])
+            || self.peek_mysql_words(&["CHARSET"])
+        {
+            let _ = self.parse_keyword(Keyword::DEFAULT);
+            if !self.parse_keyword(Keyword::CHARSET) {
+                self.expect_keywords(&[Keyword::CHARACTER, Keyword::SET])?;
+            }
+            let (charset, collation) = self.parse_mysql_character_set_and_collation()?;
+            AlterTableSetOperation::MySqlDefaultCharacterSet { charset, collation }
+        } else if self.peek_mysql_words(&["CONVERT", "TO", "CHARACTER", "SET"])
+            || self.peek_mysql_words(&["CONVERT", "TO", "CHARSET"])
+        {
+            self.expect_keywords(&[Keyword::CONVERT, Keyword::TO])?;
+            if !self.parse_keyword(Keyword::CHARSET) {
+                self.expect_keywords(&[Keyword::CHARACTER, Keyword::SET])?;
+            }
+            let (charset, collation) = self.parse_mysql_character_set_and_collation()?;
+            AlterTableSetOperation::MySqlConvertToCharacterSet { charset, collation }
+        } else if self.peek_mysql_words(&["PARTITION", "BY"]) {
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::PartitionBy(
+                self.parse_mysql_partition_by()?,
+            ))
+        } else if self.peek_mysql_words(&["COALESCE", "PARTITION"]) {
+            self.expect_keywords(&[Keyword::COALESCE, Keyword::PARTITION])?;
+            let count = self.parse_literal_uint()?;
+            if count == 0 {
+                return Err(ParserError::ParserError(
+                    "MySQL COALESCE PARTITION requires a positive count".to_string(),
+                ));
+            }
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::Coalesce { count })
+        } else if self.peek_mysql_words(&["DROP", "PARTITION"]) {
+            self.expect_keywords(&[Keyword::DROP, Keyword::PARTITION])?;
+            let names = self.parse_comma_separated(Parser::parse_identifier)?;
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::Drop { names })
+        } else if self.peek_mysql_words(&["EXCHANGE", "PARTITION"]) {
+            self.expect_keywords(&[Keyword::EXCHANGE, Keyword::PARTITION])?;
+            let partition = self.parse_identifier()?;
+            self.expect_keywords(&[Keyword::WITH, Keyword::TABLE])?;
+            let table = self.parse_object_name(false)?;
+            let validation = if self.parse_keyword(Keyword::WITH) {
+                self.expect_mysql_word("VALIDATION")?;
+                MySqlExchangeValidation::With
+            } else if self.parse_keyword(Keyword::WITHOUT) {
+                self.expect_mysql_word("VALIDATION")?;
+                MySqlExchangeValidation::Without
+            } else {
+                MySqlExchangeValidation::Default
+            };
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::Exchange {
+                partition,
+                table,
+                validation,
+            })
+        } else if self.peek_mysql_words(&["REMOVE", "PARTITIONING"]) {
+            self.expect_keyword_is(Keyword::REMOVE)?;
+            self.expect_mysql_word("PARTITIONING")?;
+            AlterTableSetOperation::MySqlPartition(MySqlPartitionMaintenance::RemovePartitioning)
+        } else {
+            enum MaintenanceKind {
+                Analyze,
+                Check,
+                Optimize,
+                Rebuild,
+                Repair,
+                Truncate,
+            }
+            let maintenance = if self.parse_keyword(Keyword::ANALYZE) {
+                MaintenanceKind::Analyze
+            } else if self.parse_keyword(Keyword::CHECK) {
+                MaintenanceKind::Check
+            } else if self.parse_keyword(Keyword::OPTIMIZE) {
+                MaintenanceKind::Optimize
+            } else if self.parse_mysql_word("REBUILD") {
+                MaintenanceKind::Rebuild
+            } else if self.parse_keyword(Keyword::REPAIR) {
+                MaintenanceKind::Repair
+            } else if self.parse_keyword(Keyword::TRUNCATE) {
+                MaintenanceKind::Truncate
+            } else {
+                return Ok(None);
+            };
+            self.expect_keyword_is(Keyword::PARTITION)?;
+            let selection = self.parse_mysql_partition_selection()?;
+            AlterTableSetOperation::MySqlPartition(match maintenance {
+                MaintenanceKind::Analyze => MySqlPartitionMaintenance::Analyze(selection),
+                MaintenanceKind::Check => MySqlPartitionMaintenance::Check(selection),
+                MaintenanceKind::Optimize => MySqlPartitionMaintenance::Optimize(selection),
+                MaintenanceKind::Rebuild => MySqlPartitionMaintenance::Rebuild(selection),
+                MaintenanceKind::Repair => MySqlPartitionMaintenance::Repair(selection),
+                MaintenanceKind::Truncate => MySqlPartitionMaintenance::Truncate(selection),
+            })
+        };
+        Ok(Some(AlterTableOperation::SetOptionsParens {
+            options: operation,
+        }))
+    }
+
     /// Parse a single `ALTER TABLE` operation and return an `AlterTableOperation`.
     pub fn parse_alter_table_operation(&mut self) -> Result<AlterTableOperation, ParserError> {
+        if dialect_of!(self is MySqlDialect) {
+            if let Some(operation) = self.parse_mysql_alter_table_operation()? {
+                return Ok(operation);
+            }
+        }
         let operation = if self.parse_keyword(Keyword::ADD) {
             if let Some(constraint) = self.parse_optional_table_constraint()? {
                 let not_valid = self.parse_keywords(&[Keyword::NOT, Keyword::VALID]);
@@ -10390,7 +13828,9 @@ impl<'a> Parser<'a> {
                     partitions,
                     if_exists: false,
                 }
-            } else if self.parse_keyword(Keyword::CONSTRAINT) {
+            } else if self.parse_keyword(Keyword::CONSTRAINT)
+                || (dialect_of!(self is MySqlDialect) && self.parse_keyword(Keyword::CHECK))
+            {
                 let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
                 let name = self.parse_identifier()?;
                 let drop_behavior = self.parse_optional_drop_behavior();
@@ -10409,7 +13849,9 @@ impl<'a> Parser<'a> {
                     name,
                     drop_behavior,
                 }
-            } else if self.parse_keyword(Keyword::INDEX) {
+            } else if self.parse_keyword(Keyword::INDEX)
+                || (dialect_of!(self is MySqlDialect) && self.parse_keyword(Keyword::KEY))
+            {
                 let name = self.parse_identifier()?;
                 AlterTableOperation::DropIndex { name }
             } else if self.parse_keyword(Keyword::PROJECTION)
@@ -10491,6 +13933,21 @@ impl<'a> Parser<'a> {
                 return self.parse_alter_sort_key();
             }
 
+            if self.parse_keyword(Keyword::INDEX) {
+                let name = self.parse_identifier()?;
+                let visible = if self.parse_keyword(Keyword::VISIBLE) {
+                    true
+                } else if self.parse_keyword(Keyword::INVISIBLE) {
+                    false
+                } else {
+                    return self.expected_ref(
+                        "VISIBLE or INVISIBLE after ALTER INDEX",
+                        self.peek_token_ref(),
+                    );
+                };
+                return Ok(AlterTableOperation::AlterIndexVisibility { name, visible });
+            }
+
             let _ = self.parse_keyword(Keyword::COLUMN); // [ COLUMN ]
             let column_name = self.parse_identifier()?;
             let is_postgresql = dialect_of!(self is PostgreSqlDialect);
@@ -10509,17 +13966,67 @@ impl<'a> Parser<'a> {
                 }
             } else if self.parse_keywords(&[Keyword::DROP, Keyword::DEFAULT]) {
                 AlterColumnOperation::DropDefault {}
+            } else if self.parse_keywords(&[Keyword::SET, Keyword::STATISTICS]) {
+                let negative = self.consume_token(&Token::Minus);
+                if !negative {
+                    let _ = self.consume_token(&Token::Plus);
+                }
+                if !matches!(self.peek_token_ref().token, Token::Number(..)) {
+                    return self.expected_ref("unsigned integer", self.peek_token_ref());
+                }
+                let magnitude = self.parse_literal_uint()?;
+                let target = i64::try_from(magnitude)
+                    .ok()
+                    .map(|value| if negative { -value } else { value })
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        ParserError::ParserError(
+                            "statistics target is outside the signed 32-bit range".into(),
+                        )
+                    })?;
+                AlterColumnOperation::SetStatistics { target }
+            } else if self.parse_keywords(&[Keyword::SET, Keyword::STORAGE]) {
+                AlterColumnOperation::SetStorage {
+                    storage: self.parse_identifier()?,
+                }
+            } else if self.parse_keywords(&[Keyword::SET, Keyword::COMPRESSION]) {
+                AlterColumnOperation::SetCompression {
+                    method: self.parse_identifier()?,
+                }
+            } else if dialect_of!(self is MySqlDialect | GenericDialect)
+                && self.parse_keywords(&[Keyword::SET, Keyword::VISIBLE])
+            {
+                AlterColumnOperation::SetVisibility { visible: true }
+            } else if dialect_of!(self is MySqlDialect | GenericDialect)
+                && self.parse_keywords(&[Keyword::SET, Keyword::INVISIBLE])
+            {
+                AlterColumnOperation::SetVisibility { visible: false }
+            } else if self.parse_keywords(&[Keyword::SET, Keyword::GENERATED]) {
+                let generated_as = if self.parse_keyword(Keyword::ALWAYS) {
+                    GeneratedAs::Always
+                } else if self.parse_keywords(&[Keyword::BY, Keyword::DEFAULT]) {
+                    GeneratedAs::ByDefault
+                } else {
+                    return self.expected_ref(
+                        "ALWAYS or BY DEFAULT after SET GENERATED",
+                        self.peek_token_ref(),
+                    );
+                };
+                AlterColumnOperation::SetGenerated { generated_as }
             } else if self.parse_keywords(&[Keyword::SET, Keyword::DATA, Keyword::TYPE]) {
                 self.parse_set_data_type(true)?
             } else if self.parse_keyword(Keyword::TYPE) {
                 self.parse_set_data_type(false)?
             } else if self.parse_keywords(&[Keyword::ADD, Keyword::GENERATED]) {
                 let generated_as = if self.parse_keyword(Keyword::ALWAYS) {
-                    Some(GeneratedAs::Always)
+                    GeneratedAs::Always
                 } else if self.parse_keywords(&[Keyword::BY, Keyword::DEFAULT]) {
-                    Some(GeneratedAs::ByDefault)
+                    GeneratedAs::ByDefault
                 } else {
-                    None
+                    return self.expected_ref(
+                        "ALWAYS or BY DEFAULT after ADD GENERATED",
+                        self.peek_token_ref(),
+                    );
                 };
 
                 self.expect_keywords(&[Keyword::AS, Keyword::IDENTITY])?;
@@ -10533,9 +14040,33 @@ impl<'a> Parser<'a> {
                 }
 
                 AlterColumnOperation::AddGenerated {
-                    generated_as,
+                    generated_as: Some(generated_as),
                     sequence_options,
                 }
+            } else if self.parse_keywords(&[Keyword::DROP, Keyword::IDENTITY]) {
+                AlterColumnOperation::DropIdentity {
+                    if_exists: self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]),
+                }
+            } else if self.parse_keyword(Keyword::RESTART) {
+                let _ = self.parse_keyword(Keyword::WITH);
+                let restart_with = if matches!(
+                    self.peek_token_ref().token,
+                    Token::Number(..) | Token::Plus | Token::Minus
+                ) {
+                    Some(self.parse_number()?)
+                } else {
+                    None
+                };
+                AlterColumnOperation::RestartIdentity { restart_with }
+            } else if self.parse_keyword(Keyword::SET) {
+                let sequence_options = self.parse_create_sequence_options()?;
+                if sequence_options.is_empty() {
+                    return self.expected_ref(
+                        "an identity sequence option after SET",
+                        self.peek_token_ref(),
+                    );
+                }
+                AlterColumnOperation::SetSequenceOptions { sequence_options }
             } else {
                 let message = if is_postgresql {
                     "SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE, or ADD GENERATED after ALTER COLUMN"
@@ -10674,7 +14205,9 @@ impl<'a> Parser<'a> {
             } else {
                 options = self.parse_options(Keyword::SET)?;
                 if !options.is_empty() {
-                    AlterTableOperation::SetOptionsParens { options }
+                    AlterTableOperation::SetOptionsParens {
+                        options: AlterTableSetOperation::Options(options),
+                    }
                 } else {
                     return self.expected_ref(
                     "ADD, RENAME, PARTITION, SWAP, DROP, REPLICA IDENTITY, SET, or SET TBLPROPERTIES after ALTER TABLE",
@@ -10708,14 +14241,19 @@ impl<'a> Parser<'a> {
             Keyword::PART => Ok(Partition::Part(self.parse_expr()?)),
             Keyword::PARTITION => Ok(Partition::Expr(self.parse_expr()?)),
             // unreachable because expect_one_of_keywords used above
-            unexpected_keyword => Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{PART, PARTITION}}, got {unexpected_keyword:?}"),
-            )),
+            unexpected_keyword => Err(ParserError::ParserError(format!(
+                "Internal parser error: expected any of {{PART, PARTITION}}, got {unexpected_keyword:?}"
+            ))),
         }
     }
 
     /// Parse an `ALTER <object>` statement and dispatch to the appropriate alter handler.
     pub fn parse_alter(&mut self) -> Result<Statement, ParserError> {
+        let alter_view_params = if dialect_of!(self is MySqlDialect | GenericDialect) {
+            self.parse_create_view_params()?
+        } else {
+            None
+        };
         let object_type = self.expect_one_of_keywords(&[
             Keyword::VIEW,
             Keyword::TYPE,
@@ -10723,12 +14261,14 @@ impl<'a> Parser<'a> {
             Keyword::TABLE,
             Keyword::INDEX,
             Keyword::FUNCTION,
+            Keyword::PROCEDURE,
             Keyword::AGGREGATE,
             Keyword::ROLE,
             Keyword::POLICY,
             Keyword::CONNECTOR,
             Keyword::ICEBERG,
             Keyword::SCHEMA,
+            Keyword::DATABASE,
             Keyword::USER,
             Keyword::OPERATOR,
         ])?;
@@ -10738,7 +14278,12 @@ impl<'a> Parser<'a> {
                 self.prev_token();
                 self.parse_alter_schema()
             }
-            Keyword::VIEW => self.parse_alter_view(),
+            Keyword::DATABASE => {
+                self.prev_token();
+                self.prev_token();
+                self.parse_alter_database()
+            }
+            Keyword::VIEW => self.parse_alter_view(alter_view_params),
             Keyword::TYPE => self.parse_alter_type(),
             Keyword::COLLATION => self.parse_alter_collation().map(Into::into),
             Keyword::TABLE => self.parse_alter_table(false),
@@ -10765,6 +14310,7 @@ impl<'a> Parser<'a> {
                 })
             }
             Keyword::FUNCTION => self.parse_alter_function(AlterFunctionKind::Function),
+            Keyword::PROCEDURE => self.parse_alter_function(AlterFunctionKind::Procedure),
             Keyword::AGGREGATE => self.parse_alter_function(AlterFunctionKind::Aggregate),
             Keyword::OPERATOR => {
                 if self.parse_keyword(Keyword::FAMILY) {
@@ -10780,9 +14326,9 @@ impl<'a> Parser<'a> {
             Keyword::CONNECTOR => self.parse_alter_connector(),
             Keyword::USER => self.parse_alter_user().map(Into::into),
             // unreachable because expect_one_of_keywords used above
-            unexpected_keyword => Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, AGGREGATE, ROLE, POLICY, CONNECTOR, ICEBERG, SCHEMA, USER, OPERATOR}}, got {unexpected_keyword:?}"),
-            )),
+            unexpected_keyword => Err(ParserError::ParserError(format!(
+                "Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, PROCEDURE, AGGREGATE, ROLE, POLICY, CONNECTOR, ICEBERG, SCHEMA, DATABASE, USER, OPERATOR}}, got {unexpected_keyword:?}"
+            ))),
         }
     }
 
@@ -10958,7 +14504,9 @@ impl<'a> Parser<'a> {
         kind: AlterFunctionKind,
     ) -> Result<Statement, ParserError> {
         let (function, aggregate_star, aggregate_order_by) = match kind {
-            AlterFunctionKind::Function => (self.parse_function_desc()?, false, None),
+            AlterFunctionKind::Function | AlterFunctionKind::Procedure => {
+                (self.parse_function_desc()?, false, None)
+            }
             AlterFunctionKind::Aggregate => self.parse_alter_aggregate_signature()?,
         };
 
@@ -10988,12 +14536,15 @@ impl<'a> Parser<'a> {
                 no: false,
                 extension_name: self.parse_object_name(false)?,
             }
-        } else if matches!(kind, AlterFunctionKind::Function) {
+        } else if matches!(
+            kind,
+            AlterFunctionKind::Function | AlterFunctionKind::Procedure
+        ) {
             let (actions, restrict) = self.parse_alter_function_actions()?;
             AlterFunctionOperation::Actions { actions, restrict }
         } else {
             return self.expected_ref(
-                "RENAME TO, OWNER TO, or SET SCHEMA after ALTER AGGREGATE",
+                "RENAME TO, OWNER TO, or SET SCHEMA after ALTER PROCEDURE or AGGREGATE",
                 self.peek_token_ref(),
             );
         };
@@ -11013,7 +14564,39 @@ impl<'a> Parser<'a> {
         let only = self.parse_keyword(Keyword::ONLY); // [ ONLY ]
         let table_name = self.parse_object_name(false)?;
         let on_cluster = self.parse_optional_on_cluster()?;
-        let operations = self.parse_comma_separated(Parser::parse_alter_table_operation)?;
+        let mut operations = Vec::new();
+        let mut comment = None;
+        loop {
+            if dialect_of!(self is MySqlDialect | GenericDialect)
+                && self.peek_keyword(Keyword::COMMENT)
+            {
+                if comment.is_some() {
+                    return self
+                        .expected_ref("a single COMMENT table option", self.peek_token_ref());
+                }
+                let comment_token = AttachedToken(self.expect_keyword(Keyword::COMMENT)?);
+                let _ = self.consume_token(&Token::Eq);
+                let value = if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                    let text = text.clone().with_role(MySqlTextRole::System);
+                    let span = self.next_token().span;
+                    Value::MySqlText(text).with_span(span)
+                } else {
+                    let span = self.peek_token_ref().span;
+                    Value::SingleQuotedString(self.parse_literal_string()?).with_span(span)
+                };
+                let value_token = AttachedToken(self.get_current_token().clone());
+                comment = Some(MySqlAlterTableComment {
+                    value,
+                    comment_token,
+                    value_token,
+                });
+            } else {
+                operations.push(self.parse_alter_table_operation()?);
+            }
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
 
         let mut location = None;
         if self.parse_keyword(Keyword::LOCATION) {
@@ -11039,6 +14622,7 @@ impl<'a> Parser<'a> {
             if_exists,
             only,
             operations,
+            comment,
             location,
             on_cluster,
             table_type: if iceberg {
@@ -11052,20 +14636,45 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an `ALTER VIEW` statement.
-    pub fn parse_alter_view(&mut self) -> Result<Statement, ParserError> {
+    pub fn parse_alter_view(
+        &mut self,
+        params: Option<CreateViewParams>,
+    ) -> Result<Statement, ParserError> {
         let name = self.parse_object_name(false)?;
-        let columns = self.parse_parenthesized_column_list(Optional, false)?;
+        let columns = self.parse_view_columns()?;
 
         let with_options = self.parse_options(Keyword::WITH)?;
 
         self.expect_keyword_is(Keyword::AS)?;
         let query = self.parse_query()?;
+        let check_option = if dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.peek_keyword(Keyword::WITH)
+        {
+            let with_token = AttachedToken(self.expect_keyword(Keyword::WITH)?);
+            let kind = if self.parse_keyword(Keyword::LOCAL) {
+                ViewCheckOptionKind::Local
+            } else {
+                let _ = self.parse_keyword(Keyword::CASCADED);
+                ViewCheckOptionKind::Cascaded
+            };
+            self.expect_keyword_is(Keyword::CHECK)?;
+            let option_token = AttachedToken(self.expect_keyword(Keyword::OPTION)?);
+            Some(ViewCheckOption {
+                kind,
+                with_token,
+                option_token,
+            })
+        } else {
+            None
+        };
 
         Ok(Statement::AlterView {
+            params,
             name,
             columns,
             query,
             with_options,
+            check_option,
         })
     }
 
@@ -11228,9 +14837,11 @@ impl<'a> Parser<'a> {
                     Keyword::MERGES => {
                         options.push(OperatorOption::Merges);
                     }
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in operator option"),
-                    )),
+                    unexpected_keyword => {
+                        return Err(ParserError::ParserError(format!(
+                            "Internal parser error: unexpected keyword `{unexpected_keyword}` in operator option"
+                        )));
+                    }
                 }
 
                 if !self.consume_token(&Token::Comma) {
@@ -11455,13 +15066,18 @@ impl<'a> Parser<'a> {
     ///
     /// Supports operations such as setting options, renaming, adding/dropping replicas, and changing owner.
     pub fn parse_alter_schema(&mut self) -> Result<Statement, ParserError> {
+        if dialect_of!(self is MySqlDialect) {
+            return self.parse_alter_database();
+        }
         self.expect_keywords(&[Keyword::ALTER, Keyword::SCHEMA])?;
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         let name = self.parse_object_name(false)?;
         let operation = if self.parse_keywords(&[Keyword::SET, Keyword::OPTIONS]) {
             self.prev_token();
             let options = self.parse_options(Keyword::OPTIONS)?;
-            AlterSchemaOperation::SetOptionsParens { options }
+            AlterSchemaOperation::SetOptionsParens {
+                options: AlterSchemaSetOperation::Options(options),
+            }
         } else if self.parse_keywords(&[Keyword::SET, Keyword::DEFAULT, Keyword::COLLATE]) {
             let collate = self.parse_expr()?;
             AlterSchemaOperation::SetDefaultCollate { collate }
@@ -11486,9 +15102,113 @@ impl<'a> Parser<'a> {
             return self.expected_ref("ALTER SCHEMA operation", self.peek_token_ref());
         };
         Ok(Statement::AlterSchema(AlterSchema {
-            name,
+            name: Some(name),
             if_exists,
             operations: vec![operation],
+        }))
+    }
+
+    /// Parse MySQL `ALTER DATABASE|SCHEMA` options as a typed schema
+    /// statement. The executor can distinguish this from portable schema
+    /// options through `AlterSchemaSetOperation`.
+    pub fn parse_alter_database(&mut self) -> Result<Statement, ParserError> {
+        if !dialect_of!(self is MySqlDialect) {
+            return self.expected_ref("SCHEMA after ALTER", self.peek_token_ref());
+        }
+        self.expect_keyword_is(Keyword::ALTER)?;
+        self.expect_one_of_keywords(&[Keyword::DATABASE, Keyword::SCHEMA])?;
+        // Native ident_opt: omission refers to the current actual database.
+        // Quoted identifiers remain names, not keyword look-ahead matches.
+        let name = if self.peek_mysql_words(&["READ", "ONLY"])
+            || self.peek_mysql_words(&["DEFAULT"])
+            || self.peek_mysql_words(&["CHARACTER", "SET"])
+            || self.peek_mysql_words(&["CHARSET"])
+            || self.peek_mysql_words(&["COLLATE"])
+        {
+            None
+        } else {
+            Some(self.parse_object_name(false)?)
+        };
+        let mut character_set = None;
+        let mut collation = None;
+        let mut read_only = None;
+
+        loop {
+            if self.peek_mysql_words(&["DEFAULT", "CHARACTER", "SET"])
+                || self.peek_mysql_words(&["DEFAULT", "CHARSET"])
+                || self.peek_mysql_words(&["CHARACTER", "SET"])
+                || self.peek_mysql_words(&["CHARSET"])
+            {
+                if character_set.is_some() {
+                    return Err(ParserError::ParserError(
+                        "duplicate CHARACTER SET in ALTER DATABASE".to_string(),
+                    ));
+                }
+                let _ = self.parse_keyword(Keyword::DEFAULT);
+                if !self.parse_keyword(Keyword::CHARSET) {
+                    self.expect_keywords(&[Keyword::CHARACTER, Keyword::SET])?;
+                }
+                let _ = self.consume_token(&Token::Eq);
+                let charset = self.parse_mysql_character_identifier()?;
+                self.mysql_charset_identifier_condition(&charset);
+                character_set = Some(charset);
+            } else if self.peek_mysql_words(&["DEFAULT", "COLLATE"])
+                || self.peek_mysql_words(&["COLLATE"])
+            {
+                if collation.is_some() {
+                    return Err(ParserError::ParserError(
+                        "duplicate COLLATE in ALTER DATABASE".to_string(),
+                    ));
+                }
+                let _ = self.parse_keyword(Keyword::DEFAULT);
+                self.expect_keyword_is(Keyword::COLLATE)?;
+                let _ = self.consume_token(&Token::Eq);
+                let name = self.parse_mysql_character_identifier()?;
+                self.mysql_collation_identifier_condition(&name);
+                collation = Some(name);
+            } else if self.parse_keywords(&[Keyword::READ, Keyword::ONLY]) {
+                let _ = self.consume_token(&Token::Eq);
+                let value = if self.parse_keyword(Keyword::DEFAULT) {
+                    false
+                } else {
+                    // Only native unsigned integer literals 0 or 1, not an
+                    // arbitrary expression, parameter, sign or boolean word.
+                    match self.parse_literal_uint()? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return self.expected_ref(
+                                "0, 1 or DEFAULT after READ ONLY",
+                                self.peek_token_ref(),
+                            );
+                        }
+                    }
+                };
+                if read_only.is_some_and(|previous| previous != value) {
+                    return Err(ParserError::MySqlConflictingSchemaReadOnly);
+                }
+                read_only = Some(value);
+            } else {
+                break;
+            }
+        }
+        if character_set.is_none() && collation.is_none() && read_only.is_none() {
+            return self.expected_ref(
+                "READ ONLY, DEFAULT CHARACTER SET or DEFAULT COLLATE after ALTER DATABASE",
+                self.peek_token_ref(),
+            );
+        }
+
+        Ok(Statement::AlterSchema(AlterSchema {
+            name,
+            if_exists: false,
+            operations: vec![AlterSchemaOperation::SetOptionsParens {
+                options: AlterSchemaSetOperation::MySqlDatabaseDefaults {
+                    character_set,
+                    collation,
+                    read_only,
+                },
+            }],
         }))
     }
 
@@ -11508,11 +15228,14 @@ impl<'a> Parser<'a> {
             Ok(Statement::Call(Function {
                 name: object_name,
                 uses_odbc_syntax: false,
+                mysql_literal_source: None,
+                origin: crate::ast::FunctionOrigin::Source,
                 parameters: FunctionArguments::None,
                 args: FunctionArguments::None,
                 over: None,
                 filter: None,
                 null_treatment: None,
+                from_first_last: None,
                 within_group: vec![],
             }))
         }
@@ -11965,6 +15688,10 @@ impl<'a> Parser<'a> {
         let span = next_token.span;
         let ok_value = |value: Value| Ok(value.with_span(span));
         match next_token.token {
+            Token::MySqlText(text) => {
+                let text = self.concat_mysql_text(text)?;
+                ok_value(Value::MySqlText(text))
+            }
             Token::Word(w) => match w.keyword {
                 Keyword::TRUE if self.dialect.supports_boolean_literals() => {
                     ok_value(Value::Boolean(true))
@@ -11972,7 +15699,20 @@ impl<'a> Parser<'a> {
                 Keyword::FALSE if self.dialect.supports_boolean_literals() => {
                     ok_value(Value::Boolean(false))
                 }
-                Keyword::NULL => ok_value(Value::Null),
+                Keyword::NULL => {
+                    // Genuine literal commit, not lexical NULL (IS NULL).
+                    // Fixed native state 819 default-reduces before another
+                    // yylex demand. The same cursor owns any one original close
+                    // demanded early by this shared grammar; no AST replay.
+                    if let Some(raw) = self.tokens.raw() {
+                        if let Some(token) = raw.get(self.index - 1) {
+                            raw.cursor
+                                .borrow_mut()
+                                .reduce_canonical_null(token.source.range());
+                        }
+                    }
+                    ok_value(Value::Null)
+                }
                 Keyword::NoKeyword if w.quote_style.is_some() => match w.quote_style {
                     Some('"') => ok_value(Value::DoubleQuotedString(w.value)),
                     Some('\'') => ok_value(Value::SingleQuotedString(w.value)),
@@ -12048,8 +15788,13 @@ impl<'a> Parser<'a> {
             Token::UnicodeStringLiteral(ref s) => {
                 ok_value(Value::UnicodeStringLiteral(s.to_string()))
             }
-            Token::HexStringLiteral(ref s) => ok_value(Value::HexStringLiteral(s.to_string())),
+            Token::HexStringLiteral(ref s) | Token::MySqlHexStringLiteral(ref s, _) => {
+                ok_value(Value::HexStringLiteral(s.to_string()))
+            }
             Token::Placeholder(ref s) => ok_value(Value::Placeholder(s.to_string())),
+            Token::AtSign if dialect_of!(self is MySqlDialect) => {
+                self.expected("a concrete value", next_token)
+            }
             tok @ Token::Colon | tok @ Token::AtSign => {
                 // 1. Not calling self.parse_identifier(false)?
                 //    because only in placeholder we want to check
@@ -12149,19 +15894,28 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_introduced_string_expr(&mut self) -> Result<Expr, ParserError> {
+    fn parse_introduced_string_expr(&mut self, introducer: String) -> Result<Expr, ParserError> {
         let next_token = self.next_token();
         let span = next_token.span;
         match next_token.token {
+            Token::MySqlText(text) => Ok(Expr::Value(
+                Value::MySqlText(
+                    self.concat_mysql_text(
+                        text.with_introducer(introducer)
+                            .map_err(ParserError::ParserError)?,
+                    )?,
+                )
+                .with_span(span),
+            )),
             Token::SingleQuotedString(ref s) => Ok(Expr::Value(
                 Value::SingleQuotedString(s.to_string()).with_span(span),
             )),
             Token::DoubleQuotedString(ref s) => Ok(Expr::Value(
                 Value::DoubleQuotedString(s.to_string()).with_span(span),
             )),
-            Token::HexStringLiteral(ref s) => Ok(Expr::Value(
-                Value::HexStringLiteral(s.to_string()).with_span(span),
-            )),
+            Token::HexStringLiteral(ref s) | Token::MySqlHexStringLiteral(ref s, _) => Ok(
+                Expr::Value(Value::HexStringLiteral(s.to_string()).with_span(span)),
+            ),
             unexpected => self.expected(
                 "a string value",
                 TokenWithSpan {
@@ -12213,6 +15967,7 @@ impl<'a> Parser<'a> {
     pub fn parse_literal_string(&mut self) -> Result<String, ParserError> {
         let next_token = self.next_token();
         match next_token.token {
+            Token::MySqlText(text) => self.mysql_system_text(&text),
             Token::Word(Word {
                 value,
                 keyword: Keyword::NoKeyword,
@@ -12282,8 +16037,216 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
+    /// Decode an already issued native text token under its actual admitted
+    /// system-text context. This never accepts arbitrary bytes or rendered SQL.
+    pub fn mysql_system_text(&self, text: &MySqlText) -> Result<String, ParserError> {
+        let raw = self
+            .tokens
+            .raw()
+            .ok_or_else(|| ParserError::ParserError("text has no admitted MySQL context".into()))?;
+        raw.cursor
+            .borrow_mut()
+            .system_text(text)
+            .map_err(ParserError::from)
+    }
+
+    /// Consume an already issued single native text token in the actual
+    /// connection-byte domain, retaining its original adapter admission.
+    /// This does not accept rendered strings or decoded/foreign Source facts.
+    pub fn mysql_text_string(&self, text: &MySqlText) -> Result<Vec<u8>, ParserError> {
+        let raw = self.tokens.raw().ok_or_else(|| {
+            ParserError::ParserError("text_string has no admitted MySQL context".into())
+        })?;
+        raw.cursor
+            .borrow_mut()
+            .text_string(text)
+            .map_err(ParserError::from)
+    }
+
+    fn concat_mysql_text(&mut self, first: MySqlText) -> Result<MySqlText, ParserError> {
+        if !matches!(self.peek_token_ref().token, Token::MySqlText(_)) {
+            return Ok(first);
+        }
+        let start = self.index;
+        let mut length = first.bytes().map_err(ParserError::ParserError)?.len();
+        let mut segment_count = first.segments().len();
+        let mut segment_strings = first.segments().iter().try_fold(0usize, |sum, part| {
+            sum.checked_add(part.charset().len())
+                .and_then(|sum| sum.checked_add(part.introducer().map_or(0, str::len)))
+                .ok_or_else(|| ParserError::ParserError("literal segment capacity overflow".into()))
+        })?;
+        while let Token::MySqlText(text) = &self.peek_token_ref().token {
+            length = length
+                .checked_add(text.bytes().map_err(ParserError::ParserError)?.len())
+                .ok_or_else(|| {
+                    ParserError::ParserError("adjacent literal capacity overflow".into())
+                })?;
+            segment_count = segment_count
+                .checked_add(text.segments().len())
+                .ok_or_else(|| ParserError::ParserError("literal segment count overflow".into()))?;
+            for part in text.segments() {
+                segment_strings = segment_strings
+                    .checked_add(part.charset().len())
+                    .and_then(|sum| sum.checked_add(part.introducer().map_or(0, str::len)))
+                    .ok_or_else(|| {
+                        ParserError::ParserError("literal segment capacity overflow".into())
+                    })?;
+            }
+            self.advance_token();
+        }
+        let raw = self
+            .tokens
+            .raw()
+            .ok_or_else(|| ParserError::ParserError("missing raw literal admission".into()))?;
+        let domain_length = segment_count
+            .checked_mul(core::mem::size_of::<MySqlTextSegment>())
+            .and_then(|size| size.checked_add(segment_strings))
+            .and_then(|size| size.checked_add(MySqlText::segment_owner_allocation_bytes()))
+            .and_then(|extra| length.checked_add(extra))
+            .ok_or_else(|| {
+                ParserError::ParserError("adjacent literal domain capacity overflow".into())
+            })?;
+        let admission = raw.cursor.borrow().admit_source(domain_length)?;
+        let mut bytes = Vec::with_capacity(length);
+        let mut parts = Vec::with_capacity(segment_count);
+        let append_parts = |text: &MySqlText,
+                            offset: usize,
+                            parts: &mut Vec<MySqlTextSegment>|
+         -> Result<(), ParserError> {
+            for part in text.segments() {
+                let range = part.semantic_range();
+                parts.push(
+                    MySqlTextSegment::new(
+                        offset + range.start..offset + range.end,
+                        part.source().clone(),
+                        part.charset().into(),
+                        part.quote(),
+                        part.introducer().map(String::from),
+                    )
+                    .map_err(ParserError::ParserError)?,
+                );
+            }
+            Ok(())
+        };
+        append_parts(&first, 0, &mut parts)?;
+        bytes.extend_from_slice(first.bytes().map_err(ParserError::ParserError)?);
+        for token in (start..self.index).filter_map(|index| raw.get(index)) {
+            if let Token::MySqlText(text) = &token.token.token {
+                append_parts(text, bytes.len(), &mut parts)?;
+                bytes.extend_from_slice(text.bytes().map_err(ParserError::ParserError)?);
+            }
+        }
+        let owner = SqlSourceOwner::adopt(bytes, admission.clone());
+        // Native adjacent append preserves the first literal Item name source.
+        MySqlText::from_segments(
+            owner
+                .occurrence(0..length)
+                .map_err(ParserError::ParserError)?,
+            parts,
+            admission,
+        )
+        .map_err(ParserError::ParserError)
+    }
+
+    /// One admitted binary text_string reduction, retaining lexical kind and Source.
+    fn mysql_binary_text_string(
+        &mut self,
+        digits: String,
+        kind: crate::tokenizer::MySqlHexLiteralKind,
+        span: Span,
+    ) -> Result<MySqlText, ParserError> {
+        use crate::tokenizer::MySqlHexLiteralKind;
+        let raw = self.tokens.raw().ok_or_else(|| {
+            ParserError::ParserError("binary declaration has no admitted native Source".into())
+        })?;
+        let source = raw
+            .get(self.index - 1)
+            .ok_or_else(|| {
+                ParserError::ParserError("binary declaration lost its actual token".into())
+            })?
+            .source
+            .clone();
+        let odd = digits.len() % 2 != 0;
+        if odd && kind != MySqlHexLiteralKind::HexNumber {
+            return parser_err!("invalid native binary literal width", span.start);
+        }
+        let length = digits.len().div_ceil(2);
+        let capacity = length
+            .checked_add(SqlSourceOwner::owner_allocation_bytes())
+            .and_then(|value| value.checked_add("binary".len()))
+            .ok_or_else(|| ParserError::ParserError("binary member allocation overflow".into()))?;
+        let admission = raw.cursor.borrow().admit_source(capacity)?;
+        let mut bytes = Vec::with_capacity(length);
+        let mut offset = 0;
+        if odd {
+            bytes.push(u8::from_str_radix(&digits[..1], 16).map_err(|_| {
+                ParserError::ParserError("invalid normalized native hex literal".into())
+            })?);
+            offset = 1;
+        }
+        while offset < digits.len() {
+            bytes.push(
+                u8::from_str_radix(&digits[offset..offset + 2], 16).map_err(|_| {
+                    ParserError::ParserError("invalid normalized native hex literal".into())
+                })?,
+            );
+            offset += 2;
+        }
+        let owner = SqlSourceOwner::adopt(bytes, admission);
+        MySqlText::from_occurrence(
+            owner
+                .occurrence(0..length)
+                .map_err(ParserError::ParserError)?,
+            source,
+            "binary".into(),
+            if matches!(
+                kind,
+                MySqlHexLiteralKind::HexQuoted | MySqlHexLiteralKind::BitQuoted
+            ) {
+                '\''
+            } else {
+                '\0'
+            },
+            None,
+        )
+        .and_then(|text| text.with_binary_literal(kind))
+        .map_err(ParserError::ParserError)
+    }
+
+    fn parse_mysql_members(&mut self) -> Result<Vec<MySqlText>, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let values = self.parse_comma_separated(|parser| {
+            let next = parser.next_token();
+            match next.token {
+                Token::MySqlText(text) => Ok(text),
+                Token::MySqlHexStringLiteral(digits, kind) => {
+                    parser.mysql_binary_text_string(digits, kind, next.span)
+                }
+                _ => parser.expected("single native text_string member", next),
+            }
+        })?;
+        self.expect_token(&Token::RParen)?;
+        Ok(values)
+    }
+
     /// Parse a SQL datatype (in the context of a CREATE TABLE statement for example)
     pub fn parse_data_type(&mut self) -> Result<DataType, ParserError> {
+        let mut ty = self.parse_data_type_without_conditions()?;
+        if dialect_of!(self is MySqlDialect) {
+            self.mysql_year_type_conditions(&ty, false)?;
+            if let DataType::Custom(name, modifiers) = &mut ty {
+                if name.to_string().eq_ignore_ascii_case("year") {
+                    modifiers.clear();
+                }
+            }
+        }
+        self.mysql_numeric_type_conditions(&ty);
+        Ok(ty)
+    }
+
+    // Column numeric field-options finish before the native type constructor
+    // emits numeric conditions. Keep this local parse separate from emission.
+    fn parse_data_type_without_conditions(&mut self) -> Result<DataType, ParserError> {
         let (ty, trailing_bracket) = self.parse_data_type_helper()?;
         if trailing_bracket.0 {
             return parser_err!(
@@ -12455,6 +16418,14 @@ impl<'a> Parser<'a> {
                 Keyword::NVARCHAR => {
                     Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
                 }
+                Keyword::NCHAR => Ok(DataType::Nchar(self.parse_optional_character_length()?)),
+                Keyword::NATIONAL => {
+                    if self.parse_keyword(Keyword::CHAR) || self.parse_keyword(Keyword::CHARACTER) {
+                        Ok(DataType::Nchar(self.parse_optional_character_length()?))
+                    } else {
+                        self.expected_ref("CHAR or CHARACTER after NATIONAL", self.peek_token_ref())
+                    }
+                }
                 Keyword::CHARACTER => {
                     if self.parse_keyword(Keyword::VARYING) {
                         Ok(DataType::CharacterVarying(
@@ -12498,6 +16469,26 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::VARBIT => Ok(DataType::VarBit(self.parse_optional_precision()?)),
+                Keyword::YEAR if dialect_of!(self is MySqlDialect) => {
+                    let year_name = w.value.clone();
+                    let mut modifiers = Vec::new();
+                    if self.consume_token(&Token::LParen) {
+                        let token = self.next_token();
+                        if matches!(&token.token, Token::Number(width, _) if width.contains(['e', 'E']))
+                        {
+                            return self.expected("a non-exponent YEAR display width", token);
+                        }
+                        let Token::Number(width, _) = token.token else {
+                            return self.expected("a numeric YEAR display width", token);
+                        };
+                        self.mysql_source_push(&mut modifiers, width)?;
+                        self.expect_token(&Token::RParen)?;
+                    }
+                    Ok(DataType::Custom(
+                        ObjectName::from(vec![Ident::new(year_name)]),
+                        modifiers,
+                    ))
+                }
                 Keyword::UUID => Ok(DataType::Uuid),
                 Keyword::DATE => Ok(DataType::Date),
                 Keyword::DATE32 => Ok(DataType::Date32),
@@ -12607,9 +16598,15 @@ impl<'a> Parser<'a> {
                 Keyword::BIGDECIMAL => Ok(DataType::BigDecimal(
                     self.parse_exact_number_optional_precision_scale()?,
                 )),
+                Keyword::ENUM if self.tokens.raw().is_some() => {
+                    Ok(DataType::MySqlEnum(self.parse_mysql_members()?))
+                }
                 Keyword::ENUM => Ok(DataType::Enum(self.parse_enum_values()?, None)),
                 Keyword::ENUM8 => Ok(DataType::Enum(self.parse_enum_values()?, Some(8))),
                 Keyword::ENUM16 => Ok(DataType::Enum(self.parse_enum_values()?, Some(16))),
+                Keyword::SET if self.tokens.raw().is_some() => {
+                    Ok(DataType::MySqlSet(self.parse_mysql_members()?))
+                }
                 Keyword::SET => Ok(DataType::Set(self.parse_string_values()?)),
                 Keyword::ARRAY => {
                     if self.dialect.supports_array_typedef_without_element_type() {
@@ -12699,14 +16696,20 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::SIGNED => {
-                    if self.parse_keyword(Keyword::INTEGER) {
+                    if self
+                        .parse_one_of_keywords(&[Keyword::INTEGER, Keyword::INT])
+                        .is_some()
+                    {
                         Ok(DataType::SignedInteger)
                     } else {
                         Ok(DataType::Signed)
                     }
                 }
                 Keyword::UNSIGNED => {
-                    if self.parse_keyword(Keyword::INTEGER) {
+                    if self
+                        .parse_one_of_keywords(&[Keyword::INTEGER, Keyword::INT])
+                        .is_some()
+                    {
                         Ok(DataType::UnsignedInteger)
                     } else {
                         Ok(DataType::Unsigned)
@@ -12871,15 +16874,17 @@ impl<'a> Parser<'a> {
                     return self.expected_ref(
                         "expected to match USE/IGNORE/FORCE keyword",
                         self.peek_token_ref(),
-                    )
+                    );
                 }
             };
             let index_type = match self.parse_one_of_keywords(&[Keyword::INDEX, Keyword::KEY]) {
                 Some(Keyword::INDEX) => TableIndexType::Index,
                 Some(Keyword::KEY) => TableIndexType::Key,
                 _ => {
-                    return self
-                        .expected_ref("expected to match INDEX/KEY keyword", self.peek_token_ref())
+                    return self.expected_ref(
+                        "expected to match INDEX/KEY keyword",
+                        self.peek_token_ref(),
+                    );
                 }
             };
             let for_clause = if self.parse_keyword(Keyword::FOR) {
@@ -12963,6 +16968,10 @@ impl<'a> Parser<'a> {
                 Ok(Some(w.into_ident(next_token.span)))
             }
             // For backwards-compatibility, we accept quoted strings as aliases regardless of the context.
+            Token::MySqlText(text) => Ok(Some(Ident::with_quote(
+                text.quote(),
+                self.mysql_system_text(&text)?,
+            ))),
             Token::SingleQuotedString(s) => Ok(Some(Ident::with_quote('\'', s))),
             Token::DoubleQuotedString(s) => Ok(Some(Ident::with_quote('\"', s))),
             _ => {
@@ -13003,7 +17012,7 @@ impl<'a> Parser<'a> {
                             return parser_err!(
                                 "BUG: expected to match GroupBy modifier keyword",
                                 self.peek_token_ref().span.start
-                            )
+                            );
                         }
                     });
                 }
@@ -13244,7 +17253,7 @@ impl<'a> Parser<'a> {
                     idents.push(w.to_ident(token.span));
                 }
                 Token::EOF | Token::Eq | Token::SemiColon | Token::VerticalBarRightAngleBracket => {
-                    break
+                    break;
                 }
                 _ => {}
             }
@@ -13302,12 +17311,12 @@ impl<'a> Parser<'a> {
             Token::EOF => {
                 return Err(ParserError::ParserError(
                     "Empty input when parsing identifier".to_string(),
-                ))?
+                ))?;
             }
             token => {
                 return Err(ParserError::ParserError(format!(
                     "Unexpected token in identifier: {token}"
-                )))?
+                )))?;
             }
         };
 
@@ -13322,12 +17331,12 @@ impl<'a> Parser<'a> {
                         Token::EOF => {
                             return Err(ParserError::ParserError(
                                 "Trailing period in identifier".to_string(),
-                            ))?
+                            ))?;
                         }
                         token => {
                             return Err(ParserError::ParserError(format!(
                                 "Unexpected token following period in identifier: {token}"
-                            )))?
+                            )))?;
                         }
                     }
                 }
@@ -13343,10 +17352,99 @@ impl<'a> Parser<'a> {
         Ok(idents)
     }
 
+    /// Consume the decoded MySQL ident_or_text following an already consumed
+    /// @. Delimiters are source syntax, not part of the variable's identity.
+    fn parse_mysql_user_variable_name(&mut self, start: Location) -> Result<Ident, ParserError> {
+        let token = self.next_token_no_skip().unwrap_or(&EOF_TOKEN).clone();
+        let mut ident = match &token.token {
+            Token::MySqlText(text) => {
+                Ident::with_quote_and_span(text.quote(), token.span, self.mysql_system_text(text)?)
+            }
+            Token::Word(word) => word.to_ident(token.span),
+            Token::SingleQuotedString(value) => {
+                Ident::with_quote_and_span('\'', token.span, value.clone())
+            }
+            Token::DoubleQuotedString(value) => {
+                Ident::with_quote_and_span('"', token.span, value.clone())
+            }
+            _ => return self.expected("user variable name", token),
+        };
+        ident.span.start = start;
+        self.parse_mysql_user_variable_suffix(ident)
+    }
+
+    /// The native bare user-variable name includes adjacent dots. Keep this one
+    /// decoded name rather than turning it into an ordinary qualified object.
+    fn parse_mysql_user_variable_suffix(&mut self, mut ident: Ident) -> Result<Ident, ParserError> {
+        if ident.quote_style.is_some() {
+            return Ok(ident);
+        }
+        while matches!(self.peek_token_no_skip().token, Token::Period) {
+            self.next_token_no_skip();
+            let token = self.next_token_no_skip().unwrap_or(&EOF_TOKEN).clone();
+            let component = match &token.token {
+                Token::Word(word) if word.quote_style.is_none() => &word.value,
+                Token::Number(value, false) => value,
+                _ => return self.expected("bare user variable name component", token),
+            };
+            ident.value.push('.');
+            ident.value.push_str(component);
+            ident.span.end = token.span.end;
+        }
+        Ok(ident)
+    }
+
+    /// Only SET accepts system-variable targets. SELECT INTO and ordinary
+    /// object grammars must never convert a variable into an object name.
+    /// Parse MySQL's existing variable-target production without resolving a
+    /// slot, checking grants, or evaluating a VALUE. PSM uses this same grammar
+    /// for FETCH and diagnostics, retaining quoted/user/system distinctions.
+    pub fn parse_mysql_variable_target(
+        &mut self,
+        allow_system: bool,
+    ) -> Result<ObjectName, ParserError> {
+        let token = self.peek_token().clone();
+        match &token.token {
+            Token::AtSign => {
+                self.next_token();
+                Ok(ObjectName(vec![ObjectNamePart::UserVariable(
+                    self.parse_mysql_user_variable_name(token.span.start)?,
+                )]))
+            }
+            Token::Word(word) if word.quote_style.is_none() && word.value.starts_with('@') => {
+                self.next_token();
+                if word.value.starts_with("@@") {
+                    if !allow_system {
+                        return self.expected("user variable or local variable", token);
+                    }
+                    let mut parts = vec![ObjectNamePart::Identifier(word.to_ident(token.span))];
+                    while self.consume_token(&Token::Period) {
+                        parts.push(ObjectNamePart::Identifier(self.parse_identifier()?));
+                    }
+                    Ok(ObjectName(parts))
+                } else {
+                    let mut ident = word.to_ident(token.span);
+                    ident.value.remove(0);
+                    Ok(ObjectName(vec![ObjectNamePart::UserVariable(
+                        self.parse_mysql_user_variable_suffix(ident)?,
+                    )]))
+                }
+            }
+            _ => self.parse_object_name(false),
+        }
+    }
+
     /// Parse a simple one-word identifier (possibly quoted, possibly a keyword)
     pub fn parse_identifier(&mut self) -> Result<Ident, ParserError> {
         let next_token = self.next_token();
         match next_token.token {
+            Token::Word(ref w)
+                if dialect_of!(self is MySqlDialect)
+                    && w.quote_style.is_none()
+                    && w.value.starts_with('@') =>
+            {
+                self.expected("ordinary identifier", next_token)
+            }
             Token::Word(w) => Ok(w.into_ident(next_token.span)),
             Token::SingleQuotedString(s) => Ok(Ident::with_quote('\'', s)),
             Token::DoubleQuotedString(s) => Ok(Ident::with_quote('\"', s)),
@@ -13806,11 +17904,22 @@ impl<'a> Parser<'a> {
         if self.consume_token(&Token::LParen) {
             let mut modifiers = Vec::new();
             loop {
+                self.check_cancelled()?;
                 let next_token = self.next_token();
                 match next_token.token {
                     Token::Word(w) => modifiers.push(w.to_string()),
                     Token::Number(n, _) => modifiers.push(n),
                     Token::SingleQuotedString(s) => modifiers.push(s),
+                    sign @ (Token::Minus | Token::Plus) if dialect_of!(self is PostgreSqlDialect) =>
+                    {
+                        let number = self.next_token();
+                        match number.token {
+                            Token::Number(value, _) => {
+                                modifiers.push(format!("{sign}{value}"));
+                            }
+                            _ => self.expected("number", number)?,
+                        }
+                    }
 
                     Token::Comma => {
                         continue;
@@ -13849,9 +17958,93 @@ impl<'a> Parser<'a> {
         Ok(Box::new(SetExpr::Delete(self.parse_delete(delete_token)?)))
     }
 
+    fn parse_postgres_dml_target(
+        &mut self,
+    ) -> Result<(TableWithJoins, PostgresTargetInheritance), ParserError> {
+        let only = self.parse_keyword(Keyword::ONLY);
+        let mut target = if only && self.consume_token(&Token::LParen) {
+            let name = self.parse_object_name(false)?;
+            self.expect_token(&Token::RParen)?;
+            TableWithJoins {
+                relation: TableFactor::Table {
+                    name,
+                    alias: self.maybe_parse_table_alias()?,
+                    args: None,
+                    with_hints: Vec::new(),
+                    version: None,
+                    partitions: Vec::new(),
+                    with_ordinality: false,
+                    json_path: None,
+                    sample: None,
+                    index_hints: Vec::new(),
+                },
+                joins: Vec::new(),
+            }
+        } else {
+            self.parse_table_and_joins()?
+        };
+        let descendants = self.consume_token(&Token::Mul);
+        if only && descendants {
+            return self.expected("a table alias after an ONLY target", self.peek_token());
+        }
+        if descendants {
+            let TableFactor::Table { alias, .. } = &mut target.relation else {
+                return self.expected("a base table before PostgreSQL target *", self.peek_token());
+            };
+            if alias.is_some() {
+                return self.expected(
+                    "PostgreSQL target * before the table alias",
+                    self.peek_token(),
+                );
+            }
+            *alias = self.maybe_parse_table_alias()?;
+        }
+        Ok((
+            target,
+            if only {
+                PostgresTargetInheritance::Only
+            } else if descendants {
+                PostgresTargetInheritance::Descendants
+            } else {
+                PostgresTargetInheritance::Default
+            },
+        ))
+    }
+
     /// Parse a `DELETE` statement and return `Statement::Delete`.
     pub fn parse_delete(&mut self, delete_token: TokenWithSpan) -> Result<Statement, ParserError> {
-        let optimizer_hints = self.maybe_parse_optimizer_hints()?;
+        let mut optimizer_hints = self.maybe_parse_optimizer_hints()?;
+        if dialect_of!(self is MySqlDialect) {
+            for (present, modifier) in [
+                (
+                    self.parse_keyword(Keyword::LOW_PRIORITY),
+                    MySqlDeleteModifier::LowPriority,
+                ),
+                (self.parse_mysql_word("QUICK"), MySqlDeleteModifier::Quick),
+                (
+                    self.parse_keyword(Keyword::IGNORE),
+                    MySqlDeleteModifier::Ignore,
+                ),
+            ] {
+                if present {
+                    optimizer_hints.push(OptimizerHint {
+                        prefix: String::new(),
+                        text: String::new(),
+                        style: OptimizerHintStyle::MySqlDeleteModifier(modifier),
+                    });
+                }
+            }
+            if self
+                .peek_one_of_keywords(&[Keyword::LOW_PRIORITY, Keyword::IGNORE])
+                .is_some()
+                || self.peek_mysql_words(&["QUICK"])
+            {
+                return self.expected_ref(
+                    "DELETE modifiers in LOW_PRIORITY QUICK IGNORE order",
+                    self.peek_token_ref(),
+                );
+            }
+        }
         let (tables, with_from_keyword) = if !self.parse_keyword(Keyword::FROM) {
             // `FROM` keyword is optional in BigQuery SQL.
             // https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax#delete_statement
@@ -13866,7 +18059,15 @@ impl<'a> Parser<'a> {
             (vec![], true)
         };
 
-        let from = self.parse_comma_separated(Parser::parse_table_and_joins)?;
+        let (from, postgres_target_inheritance) = if dialect_of!(self is PostgreSqlDialect) {
+            let (target, inheritance) = self.parse_postgres_dml_target()?;
+            (vec![target], inheritance)
+        } else {
+            (
+                self.parse_comma_separated(Parser::parse_table_and_joins)?,
+                PostgresTargetInheritance::Default,
+            )
+        };
 
         let output = self.maybe_parse_output_clause()?;
 
@@ -13905,6 +18106,7 @@ impl<'a> Parser<'a> {
             } else {
                 FromTable::WithoutKeyword(from)
             },
+            postgres_target_inheritance,
             using,
             selection,
             returning,
@@ -13976,6 +18178,21 @@ impl<'a> Parser<'a> {
             Some(Statement::Explain { .. }) | Some(Statement::ExplainTable { .. }) => Err(
                 ParserError::ParserError("Explain must be root of the plan".to_string()),
             ),
+            Some(statement)
+                if dialect_of!(self is MySqlDialect)
+                    && !matches!(
+                        statement,
+                        Statement::Query(_)
+                            | Statement::Insert(_)
+                            | Statement::Update(_)
+                            | Statement::Delete(_)
+                    ) =>
+            {
+                self.expected_ref(
+                    "an explainable query or DML statement",
+                    self.peek_token_ref(),
+                )
+            }
             Some(statement) => Ok(Statement::Explain {
                 describe_alias,
                 analyze,
@@ -13994,7 +18211,11 @@ impl<'a> Parser<'a> {
                         _ => None,
                     };
 
-                let has_table_keyword = if self.dialect.describe_requires_table_keyword() {
+                let has_table_keyword = if describe_alias == DescribeAlias::Explain
+                    && dialect_of!(self is MySqlDialect)
+                {
+                    self.parse_keyword(Keyword::TABLE)
+                } else if self.dialect.describe_requires_table_keyword() {
                     // only allow to use TABLE keyword for DESC|DESCRIBE statement
                     self.parse_keyword(Keyword::TABLE)
                 } else {
@@ -14018,13 +18239,18 @@ impl<'a> Parser<'a> {
     /// expect the initial keyword to be already consumed
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     pub fn parse_query(&mut self) -> Result<Box<Query>, ParserError> {
+        self.check_cancelled()?;
         let _guard = self.recursion_counter.try_decrease()?;
         let with = if self.parse_keyword(Keyword::WITH) {
             let with_token = self.get_current_token();
             Some(With {
                 with_token: with_token.clone().into(),
                 recursive: self.parse_keyword(Keyword::RECURSIVE),
-                cte_tables: self.parse_comma_separated(Parser::parse_cte)?,
+                cte_tables: if dialect_of!(self is MySqlDialect) {
+                    self.parse_mysql_cte_list()?
+                } else {
+                    self.parse_comma_separated(Parser::parse_cte)?
+                },
             })
         } else {
             None
@@ -14355,8 +18581,8 @@ impl<'a> Parser<'a> {
                 }
                 unhandled => {
                     return Err(ParserError::ParserError(format!(
-                    "`expect_one_of_keywords` further up allowed unhandled keyword: {unhandled:?}"
-                )))
+                        "`expect_one_of_keywords` further up allowed unhandled keyword: {unhandled:?}"
+                    )));
                 }
             }
         }
@@ -14481,6 +18707,27 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Native PT_with_list::push_back checks the actual list at insertion,
+    /// immediately after each completed CTE. Do not defer this to binding:
+    /// a later syntax error must not replace an earlier duplicate diagnostic.
+    fn parse_mysql_cte_list(&mut self) -> Result<Vec<Cte>, ParserError> {
+        let mut ctes: Vec<Cte> = Vec::new();
+        loop {
+            self.check_cancelled()?;
+            let cte = self.parse_cte()?;
+            if ctes
+                .iter()
+                .any(|previous| previous.alias.name.value == cte.alias.name.value)
+            {
+                return Err(ParserError::MySqlDuplicateCte(cte.alias.name.value));
+            }
+            ctes.push(cte);
+            if !self.consume_token(&Token::Comma) {
+                return Ok(ctes);
+            }
+        }
+    }
+
     /// Parse a CTE (`alias [( col1, col2, ... )] [AS] (subquery)`)
     pub fn parse_cte(&mut self) -> Result<Cte, ParserError> {
         let name = self.parse_identifier()?;
@@ -14567,6 +18814,7 @@ impl<'a> Parser<'a> {
     ///   set_operation ::= query_body { 'UNION' | 'EXCEPT' | 'INTERSECT' } [ 'ALL' ] query_body
     /// ```
     pub fn parse_query_body(&mut self, precedence: u8) -> Result<Box<SetExpr>, ParserError> {
+        self.check_cancelled()?;
         // We parse the expression using a Pratt parser, as in `parse_expr()`.
         // Start by parsing a restricted SELECT or a `(subquery)`:
         let expr = if self.peek_keyword(Keyword::SELECT)
@@ -14605,6 +18853,7 @@ impl<'a> Parser<'a> {
         precedence: u8,
     ) -> Result<Box<SetExpr>, ParserError> {
         loop {
+            self.check_cancelled()?;
             // The query can be optionally followed by a set operator:
             let op = self.parse_set_operator(&self.peek_token().token);
             let next_precedence = match op {
@@ -14675,6 +18924,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a restricted `SELECT` statement (no CTEs / `UNION` / `ORDER BY`)
     pub fn parse_select(&mut self) -> Result<Select, ParserError> {
+        self.check_cancelled()?;
         let mut from_first = None;
 
         if self.dialect.supports_from_first_select() && self.peek_keyword(Keyword::FROM) {
@@ -14752,7 +19002,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let into = if self.parse_keyword(Keyword::INTO) {
+        let mut into = if self.parse_keyword(Keyword::INTO) {
             Some(self.parse_select_into()?)
         } else {
             None
@@ -14869,6 +19119,13 @@ impl<'a> Parser<'a> {
             Default::default()
         };
 
+        if into.is_none()
+            && dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.parse_keyword(Keyword::INTO)
+        {
+            into = Some(self.parse_select_into()?);
+        }
+
         Ok(Select {
             select_token: AttachedToken(select_token),
             optimizer_hints,
@@ -14921,6 +19178,28 @@ impl<'a> Parser<'a> {
                 break;
             };
             match ws {
+                Whitespace::MySqlComment(source) => {
+                    let bytes = source.bytes().map_err(ParserError::ParserError)?;
+                    if bytes.starts_with(b"/*+") {
+                        let raw = self.tokens.raw().ok_or_else(|| {
+                            ParserError::ParserError(
+                                "native optimizer hint has no admitted token owner".into(),
+                            )
+                        })?;
+                        raw.cursor
+                            .borrow_mut()
+                            .admit_retained(core::mem::size_of::<OptimizerHint>())?;
+                        hints.push(OptimizerHint {
+                            prefix: String::new(),
+                            text: String::new(),
+                            style: raw
+                                .get(self.index)
+                                .and_then(|token| token.optimizer_hint.clone())
+                                .unwrap_or_else(|| OptimizerHintStyle::MySqlSource(source.clone())),
+                        });
+                    }
+                    self.next_token_no_skip();
+                }
                 Whitespace::SingleLineComment { comment, prefix } => {
                     if let Some((hint_prefix, text)) = Self::extract_hint_prefix_and_text(comment) {
                         hints.push(OptimizerHint {
@@ -15144,7 +19423,7 @@ impl<'a> Parser<'a> {
         let role_name = if self.parse_keyword(Keyword::NONE) {
             None
         } else {
-            Some(self.parse_identifier()?)
+            Some(self.parse_account_identifier()?)
         };
         Ok(Statement::Set(Set::SetRole {
             context_modifier: modifier,
@@ -15190,10 +19469,62 @@ impl<'a> Parser<'a> {
         Self::keyword_to_modifier(modifier)
     }
 
+    /// Parse a MySQL grammar word that is intentionally not reserved by the
+    /// shared keyword table. Quoted identifiers never match grammar words.
+    fn parse_mysql_word(&mut self, expected: &str) -> bool {
+        let matches = matches!(
+            &self.peek_token_ref().token,
+            Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+        );
+        if matches {
+            self.next_token();
+        }
+        matches
+    }
+
+    fn peek_mysql_words(&mut self, expected: &[&str]) -> bool {
+        let index = self.index;
+        let matches = expected.iter().all(|word| self.parse_mysql_word(word));
+        self.restore_token_index(index);
+        matches
+    }
+
+    fn expect_mysql_word(&mut self, expected: &str) -> Result<(), ParserError> {
+        if self.parse_mysql_word(expected) {
+            Ok(())
+        } else {
+            self.expected_ref(expected, self.peek_token_ref())
+        }
+    }
+
     /// Parse a single SET statement assignment `var = expr`.
-    fn parse_set_assignment(&mut self) -> Result<SetAssignment, ParserError> {
+    /// Parse the existing SET assignment production on this token frontier.
+    /// Used by the MySQL PSM grammar; does not resolve or evaluate a target.
+    pub fn parse_set_assignment(&mut self) -> Result<SetAssignment, ParserError> {
+        let (scope, name, value) = self.parse_set_assignment_with(|_, _, value| Ok(value))?;
+        Ok(SetAssignment { scope, name, value })
+    }
+
+    /// Consume the same SET assignment production, then hand its parsed RHS
+    /// to the caller at the actual consumed token frontier. `start` is after
+    /// the operator; only this parser can issue a raw/CPP receipt for it.
+    /// The callback is borrowed synchronously and cannot outlive this parse.
+    fn parse_set_assignment_with<T>(
+        &mut self,
+        build: impl FnOnce(&Self, usize, Expr) -> Result<T, ParserError>,
+    ) -> Result<(Option<ContextModifier>, ObjectName, T), ParserError> {
         let scope = self.parse_context_modifier();
 
+        let (name, value) = self.parse_set_assignment_value_with(scope.is_some(), build)?;
+        Ok((scope, name, value))
+    }
+
+    fn parse_set_assignment_value_with<T>(
+        &mut self,
+        keyword_scope: bool,
+        build: impl FnOnce(&Self, usize, Expr) -> Result<T, ParserError>,
+    ) -> Result<(ObjectName, T), ParserError> {
         let name = if self.dialect.supports_parenthesized_set_variables()
             && self.consume_token(&Token::LParen)
         {
@@ -15201,17 +19532,139 @@ impl<'a> Parser<'a> {
             // trying to parse list of assignments using this function.
             // If a dialect supports both, and we find a LParen, we early exit from this function.
             self.expected_ref("Unparenthesized assignment", self.peek_token_ref())?
+        } else if dialect_of!(self is MySqlDialect) {
+            self.parse_mysql_variable_target(true)?
         } else {
             self.parse_object_name(false)?
         };
 
-        if !(self.consume_token(&Token::Eq) || self.parse_keyword(Keyword::TO)) {
+        if dialect_of!(self is MySqlDialect)
+            && keyword_scope
+            && name.0.first().is_some_and(|part| {
+                part.as_user_variable().is_some()
+                    || part.as_ident().is_some_and(|name| {
+                        name.quote_style.is_none() && name.value.starts_with("@@")
+                    })
+            })
+        {
+            return self.expected_ref(
+                "unqualified system or stored-program variable",
+                self.peek_token_ref(),
+            );
+        }
+        if !(self.consume_token(&Token::Eq)
+            || self.parse_keyword(Keyword::TO)
+            || (dialect_of!(self is MySqlDialect) && self.consume_token(&Token::Assignment)))
+        {
             return self.expected_ref("assignment operator", self.peek_token_ref());
         }
 
-        let value = self.parse_expr()?;
+        let start = self.index;
+        let expression = self.parse_expr()?;
+        if dialect_of!(self is MySqlDialect)
+            && name
+                .0
+                .first()
+                .is_some_and(|part| part.as_user_variable().is_some())
+            && matches!(&expression, Expr::Identifier(name)
+                if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("DEFAULT"))
+        {
+            return self.expected_ref(
+                "user-variable expression (not DEFAULT)",
+                self.peek_token_ref(),
+            );
+        }
+        let value = build(self, start, expression)?;
+        Ok((name, value))
+    }
 
-        Ok(SetAssignment { scope, name, value })
+    /// Parse the actual ordered MySQL assignment list after SET, retaining a
+    /// caller-owned RHS beside each real target rather than reparsing suffixes
+    /// or rendering AST values. Special SET productions use `parse_statement`.
+    /// Container growth is admitted by this same raw token owner.
+    pub fn parse_mysql_set_assignments_with<T>(
+        &mut self,
+        mut build: impl FnMut(&Self, usize, Expr) -> Result<T, ParserError>,
+    ) -> Result<Vec<(Option<ContextModifier>, ObjectName, T)>, ParserError> {
+        if !dialect_of!(self is MySqlDialect) {
+            return self.expected_ref("MySQL SET assignment", self.peek_token_ref());
+        }
+        let mut assignments = Vec::new();
+        loop {
+            let assignment = self.parse_set_assignment_with(&mut build)?;
+            self.mysql_source_push(&mut assignments, assignment)?;
+            if !self.consume_token(&Token::Comma) {
+                return Ok(assignments);
+            }
+        }
+    }
+
+    /// The complete native option-value list, after SET. Each RHS is reduced
+    /// once and handed to the original source callback at its consumed range.
+    /// No target lookup, VALUE, or suffix reparsing occurs here.
+    pub fn parse_mysql_set_options_with<T>(
+        &mut self,
+        mut build: impl FnMut(&Self, usize, Expr) -> Result<T, ParserError>,
+    ) -> Result<Vec<MySqlSetAssignment<T>>, ParserError> {
+        if !dialect_of!(self is MySqlDialect) {
+            return self.expected_ref("MySQL SET option", self.peek_token_ref());
+        }
+        let mut assignments = Vec::new();
+        loop {
+            let keyword = if self.parse_mysql_word("GLOBAL") {
+                Some(MySqlSetOption::Global)
+            } else if self.parse_mysql_word("SESSION") || self.parse_mysql_word("LOCAL") {
+                Some(MySqlSetOption::Session)
+            } else if self.parse_mysql_word("PERSIST") {
+                Some(MySqlSetOption::Persist)
+            } else if self.parse_mysql_word("PERSIST_ONLY") {
+                Some(MySqlSetOption::PersistOnly)
+            } else {
+                None
+            };
+            let assignment = if keyword.is_none() && self.parse_mysql_word("NAMES") {
+                if self.parse_keyword(Keyword::DEFAULT) {
+                    MySqlSetAssignment::Names {
+                        character_set: None,
+                        collation: None,
+                    }
+                } else {
+                    let character_set = self.parse_mysql_character_identifier()?;
+                    let collation = if self.parse_keyword(Keyword::COLLATE) {
+                        Some(self.parse_mysql_character_identifier()?)
+                    } else {
+                        None
+                    };
+                    MySqlSetAssignment::Names {
+                        character_set: Some(character_set),
+                        collation,
+                    }
+                }
+            } else if keyword.is_none()
+                && (self.parse_mysql_word("CHARSET")
+                    || self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]))
+            {
+                MySqlSetAssignment::CharacterSet {
+                    character_set: if self.parse_keyword(Keyword::DEFAULT) {
+                        None
+                    } else {
+                        Some(self.parse_mysql_character_identifier()?)
+                    },
+                }
+            } else {
+                let (target, value) =
+                    self.parse_set_assignment_value_with(keyword.is_some(), &mut build)?;
+                MySqlSetAssignment::Variable {
+                    keyword,
+                    target,
+                    value,
+                }
+            };
+            self.mysql_source_push(&mut assignments, assignment)?;
+            if !self.consume_token(&Token::Comma) {
+                return Ok(assignments);
+            }
+        }
     }
 
     fn parse_set(&mut self) -> Result<Statement, ParserError> {
@@ -15230,6 +19683,32 @@ impl<'a> Parser<'a> {
 
         if let Some(set_role_stmt) = self.maybe_parse(|parser| parser.parse_set_role(scope))? {
             return Ok(set_role_stmt);
+        }
+
+        if self.parse_keyword(Keyword::CONSTRAINTS) {
+            if scope.is_some() {
+                return self.expected_ref(
+                    "constraint name or ALL after SET CONSTRAINTS",
+                    self.peek_token_ref(),
+                );
+            }
+            let constraints = if self.parse_keyword(Keyword::ALL) {
+                None
+            } else {
+                Some(self.parse_comma_separated(|parser| parser.parse_object_name(false))?)
+            };
+            let deferred = if self.parse_keyword(Keyword::DEFERRED) {
+                true
+            } else if self.parse_keyword(Keyword::IMMEDIATE) {
+                false
+            } else {
+                return self.expected_ref("DEFERRED or IMMEDIATE", self.peek_token_ref());
+            };
+            return Ok(Set::SetConstraints {
+                constraints,
+                deferred,
+            }
+            .into());
         }
 
         // Handle special cases first
@@ -15258,7 +19737,7 @@ impl<'a> Parser<'a> {
             if self.parse_keyword(Keyword::DEFAULT) {
                 return Ok(Set::SetNamesDefault {}.into());
             }
-            let charset_name = self.parse_identifier()?;
+            let charset_name = self.parse_mysql_character_identifier()?;
             let collation_name = if self.parse_one_of_keywords(&[Keyword::COLLATE]).is_some() {
                 Some(self.parse_literal_string()?)
             } else {
@@ -15279,6 +19758,16 @@ impl<'a> Parser<'a> {
             }
             .into());
         } else if self.parse_keyword(Keyword::TRANSACTION) {
+            if scope == Some(ContextModifier::Global) && dialect_of!(self is MySqlDialect) {
+                let modes = self.parse_transaction_modes()?;
+                if modes.is_empty() {
+                    return self.expected_ref(
+                        "ISOLATION LEVEL, READ ONLY, or READ WRITE after SET GLOBAL TRANSACTION",
+                        self.peek_token_ref(),
+                    );
+                }
+                return Ok(Set::SetGlobalTransaction { modes }.into());
+            }
             if self.parse_keyword(Keyword::SNAPSHOT) {
                 let snapshot_id = self.parse_value()?;
                 return Ok(Set::SetTransaction {
@@ -15301,7 +19790,7 @@ impl<'a> Parser<'a> {
                     return self.expected_at(
                         "SESSION, LOCAL, or other scope modifier before AUTHORIZATION",
                         self.get_current_index(),
-                    )
+                    );
                 }
             };
             let auth_value = if self.parse_keyword(Keyword::DEFAULT) {
@@ -15356,10 +19845,17 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::RParen)?;
             vars
         } else {
-            OneOrManyWithParens::One(self.parse_object_name(false)?)
+            OneOrManyWithParens::One(if dialect_of!(self is MySqlDialect) {
+                self.parse_mysql_variable_target(true)?
+            } else {
+                self.parse_object_name(false)?
+            })
         };
 
-        if self.consume_token(&Token::Eq) || self.parse_keyword(Keyword::TO) {
+        if self.consume_token(&Token::Eq)
+            || self.parse_keyword(Keyword::TO)
+            || (dialect_of!(self is MySqlDialect) && self.consume_token(&Token::Assignment))
+        {
             let stmt = match variables {
                 OneOrManyWithParens::One(var) => Set::SingleAssignment {
                     scope,
@@ -15459,19 +19955,167 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_mysql_profile_limit_atom(&mut self) -> Result<Expr, ParserError> {
+        let expression = self.parse_expr()?;
+        match &expression {
+            Expr::Value(value) if matches!(&value.value, Value::Placeholder(_)) => Ok(expression),
+            Expr::Value(value) if matches!(&value.value, Value::Number(n, _) if n.parse::<u64>().is_ok()) => {
+                Ok(expression)
+            }
+            _ => self.expected_ref("unsigned LIMIT integer or parameter", self.peek_token_ref()),
+        }
+    }
+
     /// Parse a `SHOW` statement and dispatch to specific SHOW handlers.
     pub fn parse_show(&mut self) -> Result<Statement, ParserError> {
+        if dialect_of!(self is MySqlDialect | GenericDialect) {
+            if self.parse_mysql_word("PROFILES") {
+                if let Some(raw) = self.tokens.raw() {
+                    raw.cursor
+                        .borrow()
+                        .deprecated_character_syntax("SHOW PROFILES", "Performance Schema");
+                }
+                return Ok(Statement::MySqlShowProfile {
+                    profiles: true,
+                    options: 0,
+                    query_id: 0,
+                    limit: None,
+                    offset: None,
+                });
+            }
+            if self.parse_mysql_word("PROFILE") {
+                let mut options = 0;
+                loop {
+                    let bit = if self.parse_mysql_word("CPU") {
+                        1
+                    } else if self.parse_mysql_word("MEMORY") {
+                        2
+                    } else if self.parse_mysql_word("BLOCK") {
+                        self.expect_mysql_word("IO")?;
+                        4
+                    } else if self.parse_mysql_word("CONTEXT") {
+                        self.expect_mysql_word("SWITCHES")?;
+                        8
+                    } else if self.parse_mysql_word("PAGE") {
+                        self.expect_mysql_word("FAULTS")?;
+                        16
+                    } else if self.parse_mysql_word("IPC") {
+                        32
+                    } else if self.parse_mysql_word("SWAPS") {
+                        64
+                    } else if self.parse_mysql_word("SOURCE") {
+                        65536
+                    } else if self.parse_keyword(Keyword::ALL) {
+                        u32::MAX
+                    } else {
+                        break;
+                    };
+                    options |= bit;
+                    if !self.consume_token(&Token::Comma) {
+                        break;
+                    }
+                    let word = self.peek_token().token.to_string().to_ascii_uppercase();
+                    if ![
+                        "CPU", "MEMORY", "BLOCK", "CONTEXT", "PAGE", "IPC", "SWAPS", "SOURCE",
+                        "ALL",
+                    ]
+                    .contains(&word.as_str())
+                    {
+                        return self.expected_ref("profile option", self.peek_token_ref());
+                    }
+                }
+                let query_id = if self.parse_keyword(Keyword::FOR) {
+                    self.expect_mysql_word("QUERY")?;
+                    let number = self.parse_literal_uint()?;
+                    if number > i32::MAX as u64 {
+                        return self.expected_ref("native NUM query id", self.peek_token_ref());
+                    }
+                    number as u32
+                } else {
+                    0
+                };
+                let mut limit = None;
+                let mut offset = None;
+                if self.parse_keyword(Keyword::LIMIT) {
+                    let first = self.parse_mysql_profile_limit_atom()?;
+                    if self.consume_token(&Token::Comma) {
+                        offset = Some(first);
+                        limit = Some(self.parse_mysql_profile_limit_atom()?);
+                    } else {
+                        limit = Some(first);
+                        if self.parse_keyword(Keyword::OFFSET) {
+                            offset = Some(self.parse_mysql_profile_limit_atom()?);
+                        }
+                    }
+                }
+                return Ok(Statement::MySqlShowProfile {
+                    profiles: false,
+                    options,
+                    query_id,
+                    limit,
+                    offset,
+                });
+            }
+        }
         let terse = self.parse_keyword(Keyword::TERSE);
         let extended = self.parse_keyword(Keyword::EXTENDED);
         let full = self.parse_keyword(Keyword::FULL);
         let session = self.parse_keyword(Keyword::SESSION);
         let global = self.parse_keyword(Keyword::GLOBAL);
         let external = self.parse_keyword(Keyword::EXTERNAL);
+        if dialect_of!(self is MySqlDialect | GenericDialect) {
+            let kind = if self.parse_keywords(&[Keyword::TABLE, Keyword::STATUS]) {
+                Some(ShowSchemaMetadataKind::TableStatus)
+            } else if self.parse_mysql_word("TRIGGERS") {
+                Some(ShowSchemaMetadataKind::Triggers)
+            } else if self.parse_mysql_word("EVENTS") {
+                Some(ShowSchemaMetadataKind::Events)
+            } else if self.parse_keywords(&[Keyword::OPEN, Keyword::TABLES]) {
+                Some(ShowSchemaMetadataKind::OpenTables)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                if terse || extended || full || session || global || external {
+                    return self.expected_ref("SHOW schema metadata", self.peek_token_ref());
+                }
+                let database = if self
+                    .parse_one_of_keywords(&[Keyword::FROM, Keyword::IN])
+                    .is_some()
+                {
+                    Some(self.parse_identifier()?)
+                } else {
+                    None
+                };
+                let filter = if self.parse_keyword(Keyword::LIKE) {
+                    Some(ShowStatementFilter::Like(self.parse_literal_string()?))
+                } else if self.parse_keyword(Keyword::WHERE) {
+                    Some(ShowStatementFilter::Where(self.parse_expr()?))
+                } else {
+                    None
+                };
+                return Ok(Statement::ShowSchemaMetadata {
+                    kind,
+                    database,
+                    filter,
+                });
+            }
+        }
         if self
             .parse_one_of_keywords(&[Keyword::COLUMNS, Keyword::FIELDS])
             .is_some()
         {
             Ok(self.parse_show_columns(extended, full)?)
+        } else if dialect_of!(self is MySqlDialect | GenericDialect)
+            && (self
+                .parse_one_of_keywords(&[Keyword::INDEX, Keyword::KEYS])
+                .is_some()
+                || self.parse_mysql_word("INDEXES"))
+        {
+            if full || terse || session || global || external {
+                return self.expected_ref("SHOW [EXTENDED] INDEX", self.peek_token_ref());
+            }
+            self.parse_show_indexes(extended)
         } else if self.parse_keyword(Keyword::TABLES) {
             Ok(self.parse_show_tables(terse, extended, full, external)?)
         } else if self.parse_keywords(&[Keyword::MATERIALIZED, Keyword::VIEWS]) {
@@ -15564,6 +20208,7 @@ impl<'a> Parser<'a> {
     /// Parse `SHOW CREATE <object>` returning the corresponding `ShowCreate` statement.
     pub fn parse_show_create(&mut self) -> Result<Statement, ParserError> {
         let obj_type = match self.expect_one_of_keywords(&[
+            Keyword::DATABASE,
             Keyword::TABLE,
             Keyword::TRIGGER,
             Keyword::FUNCTION,
@@ -15571,6 +20216,7 @@ impl<'a> Parser<'a> {
             Keyword::EVENT,
             Keyword::VIEW,
         ])? {
+            Keyword::DATABASE => Ok(ShowCreateObject::Database),
             Keyword::TABLE => Ok(ShowCreateObject::Table),
             Keyword::TRIGGER => Ok(ShowCreateObject::Trigger),
             Keyword::FUNCTION => Ok(ShowCreateObject::Function),
@@ -15598,6 +20244,39 @@ impl<'a> Parser<'a> {
             extended,
             full,
             show_options,
+        })
+    }
+
+    /// Parse the native MySQL SHOW INDEX target and optional WHERE expression.
+    pub fn parse_show_indexes(&mut self, extended: bool) -> Result<Statement, ParserError> {
+        if self
+            .parse_one_of_keywords(&[Keyword::FROM, Keyword::IN])
+            .is_none()
+        {
+            return self.expected_ref("FROM or IN", self.peek_token_ref());
+        }
+        let table_name = self.parse_object_name(false)?;
+        if !(1..=2).contains(&table_name.0.len()) {
+            return self.expected_ref("one- or two-component table name", self.peek_token_ref());
+        }
+        let database = if self
+            .parse_one_of_keywords(&[Keyword::FROM, Keyword::IN])
+            .is_some()
+        {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let filter = if self.parse_keyword(Keyword::WHERE) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::ShowIndexes {
+            extended,
+            table_name,
+            database,
+            filter,
         })
     }
 
@@ -15669,6 +20348,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse MySQL's single `ident_or_text` HELP mask, without admitting
+    /// arbitrary expressions, introduced strings, parameters or adjacent literals.
+    pub fn parse_mysql_help(&mut self) -> Result<Statement, ParserError> {
+        let token = self.peek_token().clone();
+        let mask = match &token.token {
+            Token::MySqlText(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_) => {
+                Expr::Value(self.parse_mysql_load_text(MySqlTextRole::System, false)?)
+            }
+            Token::Word(word)
+                if word.quote_style.is_some()
+                    || !crate::mysql_keywords::mysql_8_0_46_keyword(
+                        &word.value.to_ascii_uppercase(),
+                    )
+                    .is_some_and(|keyword| keyword.reserved) =>
+            {
+                Expr::Identifier(self.parse_identifier()?)
+            }
+            _ => return self.expected("HELP identifier or system text", token),
+        };
+        Ok(Statement::Help { mask })
+    }
+
     /// Parse a `USE` statement (database/catalog/schema/warehouse/role selection).
     pub fn parse_use(&mut self) -> Result<Statement, ParserError> {
         // Determine which keywords are recognized by the current dialect
@@ -15734,6 +20435,7 @@ impl<'a> Parser<'a> {
     fn parse_joins(&mut self) -> Result<Vec<Join>, ParserError> {
         let mut joins = vec![];
         loop {
+            self.check_cancelled()?;
             let global = self.parse_keyword(Keyword::GLOBAL);
             let join = if self.parse_keyword(Keyword::CROSS) {
                 let join_operator = if self.parse_keyword(Keyword::JOIN) {
@@ -15868,7 +20570,7 @@ impl<'a> Parser<'a> {
                             _ => {
                                 return Err(ParserError::ParserError(format!(
                                     "expected OUTER, SEMI, ANTI or JOIN after {kw:?}"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -16000,9 +20702,11 @@ impl<'a> Parser<'a> {
                     table = match kw {
                         Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
                         Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                        unexpected_keyword => return Err(ParserError::ParserError(
-                            format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"),
-                        )),
+                        unexpected_keyword => {
+                            return Err(ParserError::ParserError(format!(
+                                "Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"
+                            )));
+                        }
                     }
                 }
                 return Ok(table);
@@ -16053,6 +20757,7 @@ impl<'a> Parser<'a> {
                         TableFactor::Derived { alias, .. }
                         | TableFactor::Table { alias, .. }
                         | TableFactor::Function { alias, .. }
+                        | TableFactor::RowsFrom { alias, .. }
                         | TableFactor::UNNEST { alias, .. }
                         | TableFactor::JsonTable { alias, .. }
                         | TableFactor::XmlTable { alias, .. }
@@ -16103,6 +20808,7 @@ impl<'a> Parser<'a> {
             let values = SetExpr::Values(self.parse_values(false, false)?);
             let alias = self.maybe_parse_table_alias()?;
             Ok(TableFactor::Derived {
+                origin: DerivedTableOrigin::Source,
                 lateral: false,
                 subquery: Box::new(Query {
                     with: None,
@@ -16118,6 +20824,25 @@ impl<'a> Parser<'a> {
                 }),
                 alias,
                 sample: None,
+            })
+        } else if dialect_of!(self is PostgreSqlDialect | GenericDialect)
+            && self.parse_keywords(&[Keyword::ROWS, Keyword::FROM])
+        {
+            self.expect_token(&Token::LParen)?;
+            let items = self.parse_comma_separated(Parser::parse_rows_from_item)?;
+            self.expect_token(&Token::RParen)?;
+            if items.is_empty() {
+                return parser_err!(
+                    "ROWS FROM requires at least one function",
+                    self.peek_token_ref().span.start
+                );
+            }
+            let with_ordinality = self.parse_keywords(&[Keyword::WITH, Keyword::ORDINALITY]);
+            let alias = self.maybe_parse_table_alias()?;
+            Ok(TableFactor::RowsFrom {
+                items,
+                with_ordinality,
+                alias,
             })
         } else if dialect_of!(self is BigQueryDialect | PostgreSqlDialect | GenericDialect)
             && self.parse_keyword(Keyword::UNNEST)
@@ -16158,7 +20883,7 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword_with_tokens(Keyword::JSON_TABLE, &[Token::LParen]) {
             let json_expr = self.parse_expr()?;
             self.expect_token(&Token::Comma)?;
-            let json_path = self.parse_value()?;
+            let json_path = Expr::Value(self.parse_value()?);
             self.expect_keyword_is(Keyword::COLUMNS)?;
             self.expect_token(&Token::LParen)?;
             let columns = self.parse_comma_separated(Parser::parse_json_table_column_def)?;
@@ -16195,7 +20920,14 @@ impl<'a> Parser<'a> {
             let partitions: Vec<Ident> = if dialect_of!(self is MySqlDialect | GenericDialect)
                 && self.parse_keyword(Keyword::PARTITION)
             {
-                self.parse_parenthesized_identifiers()?
+                let partitions = self.parse_parenthesized_identifiers()?;
+                if partitions.is_empty() {
+                    return parser_err!(
+                        "PARTITION selection requires at least one partition",
+                        self.peek_token_ref().span.start
+                    );
+                }
+                partitions
             } else {
                 vec![]
             };
@@ -16264,9 +20996,11 @@ impl<'a> Parser<'a> {
                 table = match kw {
                     Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
                     Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"),
-                    )),
+                    unexpected_keyword => {
+                        return Err(ParserError::ParserError(format!(
+                            "Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"
+                        )));
+                    }
                 }
             }
 
@@ -16278,6 +21012,96 @@ impl<'a> Parser<'a> {
 
             Ok(table)
         }
+    }
+
+    fn parse_rows_from_item(&mut self) -> Result<RowsFromItem, ParserError> {
+        let expression = self.parse_expr()?;
+        let Expr::Function(function) = expression else {
+            return parser_err!(
+                "ROWS FROM item must be a function call",
+                self.peek_token_ref().span.start
+            );
+        };
+        if function.parameters != FunctionArguments::None
+            || function.filter.is_some()
+            || function.null_treatment.is_some()
+            || function.over.is_some()
+            || !function.within_group.is_empty()
+        {
+            return parser_err!(
+                "invalid set-returning function in ROWS FROM",
+                self.peek_token_ref().span.start
+            );
+        }
+        let FunctionArguments::List(arguments) = function.args else {
+            return parser_err!(
+                "ROWS FROM function requires an argument list",
+                self.peek_token_ref().span.start
+            );
+        };
+        if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+            return parser_err!(
+                "invalid set-returning function arguments in ROWS FROM",
+                self.peek_token_ref().span.start
+            );
+        }
+        let name = function
+            .name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .cloned()
+            .expect("function names contain at least one identifier");
+        let unnest = name.value.eq_ignore_ascii_case("unnest")
+            && (function.name.0.len() == 1
+                || function
+                    .name
+                    .0
+                    .first()
+                    .and_then(|part| part.as_ident())
+                    .is_some_and(|schema| schema.value.eq_ignore_ascii_case("pg_catalog")));
+        let factor = if unnest {
+            let array_exprs = arguments
+                .args
+                .into_iter()
+                .map(|argument| match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
+                    _ => parser_err!(
+                        "UNNEST in ROWS FROM requires positional array arguments",
+                        self.peek_token_ref().span.start
+                    ),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Box::new(TableFactor::UNNEST {
+                alias: None,
+                array_exprs,
+                with_offset: false,
+                with_offset_alias: None,
+                with_ordinality: false,
+            })
+        } else {
+            Box::new(TableFactor::Function {
+                lateral: true,
+                name: function.name,
+                args: arguments.args,
+                with_ordinality: false,
+                alias: None,
+            })
+        };
+        let columns = self
+            .maybe_parse(|parser| {
+                let _ = parser.parse_keyword(Keyword::AS);
+                parser.expect_token(&Token::LParen)?;
+                let columns = parser.parse_comma_separated(Parser::parse_column_def)?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(columns)
+            })?
+            .unwrap_or_default();
+        Ok(RowsFromItem {
+            name,
+            factor,
+            columns,
+        })
     }
 
     /// Parse a Snowflake stage reference as a table factor.
@@ -16895,7 +21719,7 @@ impl<'a> Parser<'a> {
     pub fn parse_json_table_column_def(&mut self) -> Result<JsonTableColumn, ParserError> {
         if self.parse_keyword(Keyword::NESTED) {
             let _has_path_keyword = self.parse_keyword(Keyword::PATH);
-            let path = self.parse_value()?;
+            let path = Expr::Value(self.parse_value()?);
             self.expect_keyword_is(Keyword::COLUMNS)?;
             let columns = self.parse_parenthesized(|p| {
                 p.parse_comma_separated(Self::parse_json_table_column_def)
@@ -16911,26 +21735,57 @@ impl<'a> Parser<'a> {
             return Ok(JsonTableColumn::ForOrdinality(name));
         }
         let r#type = self.parse_data_type()?;
+        let character_set = if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET])
+            || self.parse_keyword(Keyword::CHARSET)
+        {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let collation = if self.parse_keyword(Keyword::COLLATE) {
+            Some(self.parse_object_name(false)?)
+        } else {
+            None
+        };
         let exists = self.parse_keyword(Keyword::EXISTS);
         self.expect_keyword_is(Keyword::PATH)?;
-        let path = self.parse_value()?;
+        let path = Expr::Value(self.parse_value()?);
         let mut on_empty = None;
         let mut on_error = None;
-        while let Some(error_handling) = self.parse_json_table_column_error_handling()? {
+        let mut on_error_before_empty = false;
+        for _ in 0..2 {
+            let Some(error_handling) = self.parse_json_table_column_error_handling()? else {
+                break;
+            };
             if self.parse_keyword(Keyword::EMPTY) {
+                if on_empty.is_some() {
+                    return self.expected("ON ERROR after ON EMPTY", self.peek_token());
+                }
+                if on_error.is_some() {
+                    on_error_before_empty = true;
+                    if let Some(raw) = self.tokens.raw() {
+                        raw.cursor.borrow().json_table_on_error_before_empty();
+                    }
+                }
                 on_empty = Some(error_handling);
             } else {
                 self.expect_keyword_is(Keyword::ERROR)?;
+                if on_error.is_some() {
+                    return self.expected("ON EMPTY after ON ERROR", self.peek_token());
+                }
                 on_error = Some(error_handling);
             }
         }
         Ok(JsonTableColumn::Named(JsonTableNamedColumn {
             name,
             r#type,
+            character_set,
+            collation,
             path,
             exists,
             on_empty,
             on_error,
+            on_error_before_empty,
         }))
     }
 
@@ -16970,7 +21825,49 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::ERROR) {
             JsonTableColumnErrorHandling::Error
         } else if self.parse_keyword(Keyword::DEFAULT) {
-            JsonTableColumnErrorHandling::Default(self.parse_value()?)
+            let expression = if matches!(self.peek_token().token,
+                Token::Word(ref word) if matches!(word.keyword, Keyword::DATE | Keyword::TIME | Keyword::TIMESTAMP))
+            {
+                let data_type = self.parse_data_type()?;
+                let value = self.parse_value()?;
+                if !matches!(
+                    &value.value,
+                    Value::MySqlText(_)
+                        | Value::SingleQuotedString(_)
+                        | Value::DoubleQuotedString(_)
+                ) {
+                    return self.expected("temporal string literal", self.peek_token());
+                }
+                Expr::TypedString(TypedString {
+                    data_type,
+                    value,
+                    uses_odbc_syntax: false,
+                })
+            } else {
+                let sign = if self.consume_token(&Token::Minus) {
+                    Some(UnaryOperator::Minus)
+                } else if self.consume_token(&Token::Plus) {
+                    Some(UnaryOperator::Plus)
+                } else {
+                    None
+                };
+                let value = self.parse_value()?;
+                if matches!(&value.value, Value::Null)
+                    || (sign.is_some() && !matches!(&value.value, Value::Number(..)))
+                {
+                    return self.expected("signed literal (not NULL)", self.peek_token());
+                }
+                let expression = Expr::Value(value);
+                if let Some(op) = sign {
+                    Expr::UnaryOp {
+                        op,
+                        expr: Box::new(expression),
+                    }
+                } else {
+                    expression
+                }
+            };
+            JsonTableColumnErrorHandling::Default(expression)
         } else {
             return Ok(None);
         };
@@ -16993,6 +21890,7 @@ impl<'a> Parser<'a> {
             .map(TableSampleKind::AfterTableAlias);
 
         Ok(TableFactor::Derived {
+            origin: DerivedTableOrigin::Source,
             lateral: match lateral {
                 Lateral => true,
                 NotLateral => false,
@@ -17189,7 +22087,7 @@ impl<'a> Parser<'a> {
             };
 
         let as_grantor = if self.parse_keywords(&[Keyword::AS]) {
-            Some(self.parse_identifier()?)
+            Some(self.parse_account_identifier()?)
         } else {
             None
         };
@@ -17456,9 +22354,11 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Some(Keyword::TABLE) | None => Some(GrantObjects::Tables(objects?)),
-                    Some(unexpected_keyword) => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in grant objects"),
-                    )),
+                    Some(unexpected_keyword) => {
+                        return Err(ParserError::ParserError(format!(
+                            "Internal parser error: unexpected keyword `{unexpected_keyword}` in grant objects"
+                        )));
+                    }
                 }
             }
         } else {
@@ -17745,16 +22645,105 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume character text only in the account/role grammar. Ordinary
+    /// identifiers still reject MySqlText; decoding uses the admitted cursor's
+    /// system-text service and preserves quoted CURRENT_USER as an account.
+    fn parse_account_identifier(&mut self) -> Result<Ident, ParserError> {
+        if dialect_of!(self is MySqlDialect) {
+            if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                let text = text.clone();
+                let token = self.next_token();
+                if text.introducer().is_some() {
+                    return self.expected("account identifier without an introducer", token);
+                }
+                return Ok(Ident::with_quote_and_span(
+                    text.quote(),
+                    token.span,
+                    self.mysql_system_text(&text)?,
+                ));
+            }
+        }
+        self.parse_identifier()
+    }
+
+    fn parse_account_object_name(&mut self) -> Result<ObjectName, ParserError> {
+        if dialect_of!(self is MySqlDialect)
+            && matches!(self.peek_token_ref().token, Token::MySqlText(_))
+        {
+            return Ok(ObjectName::from(self.parse_account_identifier()?));
+        }
+        self.parse_object_name(false)
+    }
+
+    fn parse_mysql_account_name(&mut self) -> Result<GranteeName, ParserError> {
+        let name = if self.parse_keyword(Keyword::CURRENT_USER) {
+            // CURRENT_USER [()] is an account grammar marker, not a
+            // quoted account or an arbitrary scalar expression.
+            if self.consume_token(&Token::LParen) {
+                self.expect_token(&Token::RParen)?;
+            }
+            GranteeName::ObjectName(ObjectName::from(Ident::new("CURRENT_USER")))
+        } else {
+            let mut user = self.parse_account_identifier()?;
+            // The existing MySQL tokenizer includes @ in unquoted
+            // Words (also used by user variables). Account grammar
+            // consumes its real separator here, not an expression.
+            let host = if user.quote_style.is_none() && user.value.contains('@') {
+                let (name, host) = user.value.split_once('@').unwrap();
+                if name.is_empty()
+                    || name.eq_ignore_ascii_case("CURRENT_USER")
+                    || host.contains('@')
+                {
+                    return self.expected_ref("user@host account", self.peek_token_ref());
+                }
+                let name = name.to_owned();
+                let host = if host.is_empty() {
+                    self.parse_account_identifier()?
+                } else {
+                    Ident::new(host)
+                };
+                user.value = name;
+                Some(host)
+            } else if self.consume_token(&Token::AtSign) {
+                Some(self.parse_account_identifier()?)
+            } else if matches!(&self.peek_token_ref().token,
+                Token::Word(word) if word.quote_style.is_none()
+                    && word.value.starts_with('@') && !word.value.starts_with("@@"))
+            {
+                let token = self.next_token();
+                let Token::Word(word) = token.token else {
+                    unreachable!()
+                };
+                let host = &word.value[1..];
+                if host.is_empty() || host.contains('@') {
+                    return self.expected_ref("account host", self.peek_token_ref());
+                }
+                Some(Ident::new(host))
+            } else {
+                None
+            };
+            if let Some(host) = host {
+                GranteeName::UserHost { user, host }
+            } else {
+                GranteeName::ObjectName(ObjectName::from(user))
+            }
+        };
+        Ok(name)
+    }
+
     /// Parse a grantee name, possibly with a host qualifier (user@host).
     pub fn parse_grantee_name(&mut self) -> Result<GranteeName, ParserError> {
-        let mut name = self.parse_object_name(false)?;
+        if dialect_of!(self is MySqlDialect) {
+            return self.parse_mysql_account_name();
+        }
+        let mut name = self.parse_account_object_name()?;
         if self.dialect.supports_user_host_grantee()
             && name.0.len() == 1
             && name.0[0].as_ident().is_some()
             && self.consume_token(&Token::AtSign)
         {
             let user = name.0.pop().unwrap().as_ident().unwrap().clone();
-            let host = self.parse_identifier()?;
+            let host = self.parse_account_identifier()?;
             Ok(GranteeName::UserHost { user, host })
         } else {
             Ok(GranteeName::ObjectName(name))
@@ -17772,7 +22761,7 @@ impl<'a> Parser<'a> {
                 return parser_err!(
                     "DENY statements must specify an object",
                     self.peek_token_ref().span.start
-                )
+                );
             }
         };
 
@@ -17796,22 +22785,68 @@ impl<'a> Parser<'a> {
 
     /// Parse a REVOKE statement
     pub fn parse_revoke(&mut self) -> Result<Revoke, ParserError> {
+        let mysql = dialect_of!(self is MySqlDialect);
+        let if_exists = mysql && self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         let (privileges, objects) = self.parse_grant_deny_revoke_privileges_objects()?;
+        if mysql && matches!(&privileges, Privileges::All { .. }) {
+            let native_object = match &objects {
+                None => true,
+                Some(GrantObjects::Tables(names)) => names.len() == 1,
+                Some(GrantObjects::Function { arg_types, .. })
+                | Some(GrantObjects::Procedure { arg_types, .. }) => arg_types.is_empty(),
+                _ => false,
+            };
+            if !native_object {
+                return self.expected_ref("one MySQL privilege object", self.peek_token_ref());
+            }
+        }
+
+        let revoke_all_grant_option = mysql
+            && matches!(&privileges, Privileges::All { .. })
+            && objects.is_none()
+            && self.consume_token(&Token::Comma);
+        if revoke_all_grant_option {
+            self.expect_keywords(&[Keyword::GRANT, Keyword::OPTION])?;
+        } else if mysql && matches!(&privileges, Privileges::All { .. }) && objects.is_none() {
+            return self.expected_ref("ON or , GRANT OPTION", self.peek_token_ref());
+        }
 
         self.expect_keyword_is(Keyword::FROM)?;
-        let grantees = self.parse_grantees()?;
+        let grantees = if mysql {
+            self.parse_comma_separated(|parser| {
+                let name = parser.parse_grantee_name()?;
+                Ok(Grantee {
+                    grantee_type: GranteesType::None,
+                    name: Some(name),
+                })
+            })?
+        } else {
+            self.parse_grantees()?
+        };
 
-        let granted_by = if self.parse_keywords(&[Keyword::GRANTED, Keyword::BY]) {
+        let ignore_unknown_user = mysql && self.parse_keyword(Keyword::IGNORE);
+        if ignore_unknown_user {
+            self.expect_keywords(&[Keyword::UNKNOWN, Keyword::USER])?;
+        }
+
+        let granted_by = if !mysql && self.parse_keywords(&[Keyword::GRANTED, Keyword::BY]) {
             Some(self.parse_identifier()?)
         } else {
             None
         };
 
-        let cascade = self.parse_cascade_option();
+        let cascade = if mysql {
+            None
+        } else {
+            self.parse_cascade_option()
+        };
 
         Ok(Revoke {
             privileges,
             objects,
+            revoke_all_grant_option,
+            if_exists,
+            ignore_unknown_user,
             grantees,
             granted_by,
             cascade,
@@ -17897,7 +22932,7 @@ impl<'a> Parser<'a> {
             let table_alias = if self.dialect.supports_insert_table_alias()
                 && !self.peek_sub_query()
                 && self
-                    .peek_one_of_keywords(&[Keyword::DEFAULT, Keyword::VALUES])
+                    .peek_one_of_keywords(&[Keyword::DEFAULT, Keyword::VALUES, Keyword::OVERRIDING])
                     .is_none()
             {
                 if self.parse_keyword(Keyword::AS) {
@@ -17918,6 +22953,7 @@ impl<'a> Parser<'a> {
 
             let is_mysql = dialect_of!(self is MySqlDialect);
 
+            let mut overriding = None;
             let (columns, partitioned, after_columns, output, source, assignments) = if self
                 .parse_keywords(&[Keyword::DEFAULT, Keyword::VALUES])
             {
@@ -17938,6 +22974,18 @@ impl<'a> Parser<'a> {
                 } else {
                     Default::default()
                 };
+
+                if dialect_of!(self is PostgreSqlDialect | GenericDialect)
+                    && self.parse_keyword(Keyword::OVERRIDING)
+                {
+                    overriding = Some(if self.parse_keyword(Keyword::SYSTEM) {
+                        InsertOverriding::SystemValue
+                    } else {
+                        self.expect_keyword_is(Keyword::USER)?;
+                        InsertOverriding::UserValue
+                    });
+                    self.expect_keyword_is(Keyword::VALUE)?;
+                }
 
                 let output = self.maybe_parse_output_clause()?;
 
@@ -18052,6 +23100,7 @@ impl<'a> Parser<'a> {
                 ignore,
                 into,
                 overwrite,
+                overriding,
                 partitioned,
                 columns,
                 after_columns,
@@ -18090,6 +23139,9 @@ impl<'a> Parser<'a> {
     /// Returns true if the immediate tokens look like the
     /// beginning of a subquery. `(SELECT ...`
     fn peek_subquery_start(&mut self) -> bool {
+        if self.peek_token_ref().token != Token::LParen {
+            return false;
+        }
         matches!(
             self.peek_tokens_ref(),
             [
@@ -18112,6 +23164,9 @@ impl<'a> Parser<'a> {
     /// beginning of a subquery possibly preceded by CTEs;
     /// i.e. `(WITH ...` or `(SELECT ...`.
     fn peek_subquery_or_cte_start(&mut self) -> bool {
+        if self.peek_token_ref().token != Token::LParen {
+            return false;
+        }
         matches!(
             self.peek_tokens_ref(),
             [
@@ -18152,9 +23207,15 @@ impl<'a> Parser<'a> {
     pub fn parse_insert_partition(&mut self) -> Result<Option<Vec<Expr>>, ParserError> {
         if self.parse_keyword(Keyword::PARTITION) {
             self.expect_token(&Token::LParen)?;
-            let partition_cols = Some(self.parse_comma_separated(Parser::parse_expr)?);
+            let partition_cols = self.parse_comma_separated(Parser::parse_expr)?;
             self.expect_token(&Token::RParen)?;
-            Ok(partition_cols)
+            if partition_cols.is_empty() {
+                return parser_err!(
+                    "PARTITION selection requires at least one partition",
+                    self.peek_token_ref().span.start
+                );
+            }
+            Ok(Some(partition_cols))
         } else {
             Ok(None)
         }
@@ -18190,8 +23251,21 @@ impl<'a> Parser<'a> {
     /// Parse an `UPDATE` statement and return `Statement::Update`.
     pub fn parse_update(&mut self, update_token: TokenWithSpan) -> Result<Statement, ParserError> {
         let optimizer_hints = self.maybe_parse_optimizer_hints()?;
-        let or = self.parse_conflict_clause();
-        let table = self.parse_table_and_joins()?;
+        let or = if dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.parse_keyword(Keyword::IGNORE)
+        {
+            Some(SqliteOnConflict::Ignore)
+        } else {
+            self.parse_conflict_clause()
+        };
+        let (table, postgres_target_inheritance) = if dialect_of!(self is PostgreSqlDialect) {
+            self.parse_postgres_dml_target()?
+        } else {
+            (
+                self.parse_table_and_joins()?,
+                PostgresTargetInheritance::Default,
+            )
+        };
         let from_before_set = if self.parse_keyword(Keyword::FROM) {
             Some(UpdateTableFromKind::BeforeSet(
                 self.parse_table_with_joins()?,
@@ -18237,6 +23311,7 @@ impl<'a> Parser<'a> {
             update_token: update_token.into(),
             optimizer_hints,
             table,
+            postgres_target_inheritance,
             assignments,
             from,
             selection,
@@ -18271,6 +23346,34 @@ impl<'a> Parser<'a> {
 
     /// Parse a single function argument, handling named and unnamed variants.
     pub fn parse_function_args(&mut self) -> Result<FunctionArg, ParserError> {
+        if dialect_of!(self is PostgreSqlDialect | GenericDialect)
+            && self.parse_keyword(Keyword::VARIADIC)
+        {
+            let argument = self.parse_expr()?;
+            return Ok(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Function(
+                Function {
+                    name: ObjectName::from(vec![Ident::new(
+                        "pg_gateway_explicit_variadic_argument",
+                    )]),
+                    uses_odbc_syntax: false,
+                    mysql_literal_source: None,
+                    // This node represents the VARIADIC keyword, not a
+                    // source function bearing the marker's spelling.
+                    origin: crate::ast::FunctionOrigin::Compiler,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::List(FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    from_first_last: None,
+                    over: None,
+                    within_group: vec![],
+                },
+            ))));
+        }
         let arg = if self.dialect.supports_named_fn_args_with_expr_name() {
             self.maybe_parse(|p| {
                 let name = p.parse_expr()?;
@@ -18389,6 +23492,13 @@ impl<'a> Parser<'a> {
     /// FIRST_VALUE(x IGNORE NULL);
     /// ```
     fn parse_function_argument_list(&mut self) -> Result<FunctionArgumentList, ParserError> {
+        self.parse_function_argument_list_with_mysql_char(false)
+    }
+
+    fn parse_function_argument_list_with_mysql_char(
+        &mut self,
+        mysql_char: bool,
+    ) -> Result<FunctionArgumentList, ParserError> {
         let mut clauses = vec![];
 
         // Handle clauses that may exist with an empty argument list
@@ -18436,9 +23546,11 @@ impl<'a> Parser<'a> {
             let kind = match self.expect_one_of_keywords(&[Keyword::MIN, Keyword::MAX])? {
                 Keyword::MIN => HavingBoundKind::Min,
                 Keyword::MAX => HavingBoundKind::Max,
-                unexpected_keyword => return Err(ParserError::ParserError(
-                    format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in having bound"),
-                )),
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in having bound"
+                    )));
+                }
             };
             clauses.push(FunctionArgumentClause::Having(HavingBound(
                 kind,
@@ -18450,6 +23562,14 @@ impl<'a> Parser<'a> {
             && self.parse_keyword(Keyword::SEPARATOR)
         {
             clauses.push(FunctionArgumentClause::Separator(self.parse_value()?));
+        }
+
+        if dialect_of!(self is MySqlDialect) && self.parse_keyword(Keyword::USING) {
+            let charset = self.parse_mysql_character_identifier()?;
+            if mysql_char {
+                self.mysql_charset_identifier_condition(&charset);
+            }
+            clauses.push(FunctionArgumentClause::UsingCharacterSet(charset));
         }
 
         if let Some(on_overflow) = self.parse_listagg_on_overflow()? {
@@ -18510,6 +23630,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a comma-delimited list of projections after SELECT
     pub fn parse_select_item(&mut self) -> Result<SelectItem, ParserError> {
+        let source_start = self.index;
         let prefix = self
             .parse_one_of_keywords(
                 self.dialect
@@ -18571,6 +23692,42 @@ impl<'a> Parser<'a> {
                     aliases,
                 })
             }
+            expr if self.tokens.raw().is_some() => {
+                let expression_end = self.index;
+                let (source_occurrence, cpp_piece_range) =
+                    self.mysql_source_range(source_start, expression_end)?;
+                let explicit = self.parse_keyword(Keyword::AS);
+                let alias = if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                    let text = text.clone();
+                    self.advance_token();
+                    Some(text.with_role(MySqlTextRole::Alias))
+                } else {
+                    if explicit {
+                        self.prev_token();
+                    }
+                    let identifier = self.maybe_parse_select_item_alias()?;
+                    if identifier.is_some() {
+                        let raw = self.tokens.raw().expect("raw projection");
+                        raw.get(self.get_current_index())
+                            .and_then(|token| token.identifier_text.clone())
+                            .ok_or_else(|| {
+                                ParserError::ParserError("alias has no native source text".into())
+                            })?
+                            .with_role(MySqlTextRole::Alias)
+                            .into()
+                    } else {
+                        None
+                    }
+                };
+                Ok(SelectItem::MySqlProjection {
+                    expr: maybe_prefixed_expr(expr, prefix),
+                    alias,
+                    source_occurrence,
+                    cpp_piece_range,
+                    bound_cpp: None,
+                    source_literal: None,
+                })
+            }
             expr => self
                 .maybe_parse_select_item_alias()
                 .map(|alias| match alias {
@@ -18620,6 +23777,15 @@ impl<'a> Parser<'a> {
         let opt_alias = if self.dialect.supports_select_wildcard_with_alias() {
             self.maybe_parse_select_item_alias()?
         } else {
+            // MySQL rejects a wildcard alias at AS itself.  Leaving AS for
+            // the enclosing SELECT/INSERT parser reports the following comma
+            // or FROM instead, which changes the SQL-visible error location.
+            if dialect_of!(self is MySqlDialect) && self.peek_keyword(Keyword::AS) {
+                return parser_err!(
+                    "wildcard projections cannot have an alias",
+                    self.peek_token_ref().span.start
+                );
+            }
             None
         };
 
@@ -18988,9 +24154,11 @@ impl<'a> Parser<'a> {
         let lock_type = match self.expect_one_of_keywords(&[Keyword::UPDATE, Keyword::SHARE])? {
             Keyword::UPDATE => LockType::Update,
             Keyword::SHARE => LockType::Share,
-            unexpected_keyword => return Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{UPDATE, SHARE}}, got {unexpected_keyword:?}"),
-            )),
+            unexpected_keyword => {
+                return Err(ParserError::ParserError(format!(
+                    "Internal parser error: expected any of {{UPDATE, SHARE}}, got {unexpected_keyword:?}"
+                )));
+            }
         };
         let of = if self.parse_keyword(Keyword::OF) {
             Some(self.parse_object_name(false)?)
@@ -19103,8 +24271,43 @@ impl<'a> Parser<'a> {
     /// Parse a 'START TRANSACTION' statement
     pub fn parse_start_transaction(&mut self) -> Result<Statement, ParserError> {
         self.expect_keyword_is(Keyword::TRANSACTION)?;
+        let mut modes = Vec::new();
+        let mut consistent_snapshot = None;
+        let mut required = false;
+        loop {
+            if self.peek_keyword(Keyword::WITH) {
+                if consistent_snapshot.is_some() {
+                    return self.expected_ref(
+                        "a single WITH CONSISTENT SNAPSHOT characteristic",
+                        self.peek_token_ref(),
+                    );
+                }
+                let with_token = AttachedToken(self.expect_keyword(Keyword::WITH)?);
+                let consistent = self.next_token();
+                if !matches!(&consistent.token, Token::Word(word)
+                    if word.quote_style.is_none()
+                        && word.value.eq_ignore_ascii_case("CONSISTENT"))
+                {
+                    return self.expected("CONSISTENT", consistent);
+                }
+                let snapshot_token = AttachedToken(self.expect_keyword(Keyword::SNAPSHOT)?);
+                consistent_snapshot = Some(StartTransactionSnapshot {
+                    with_token,
+                    consistent_token: AttachedToken(consistent),
+                    snapshot_token,
+                });
+            } else if let Some(mode) = self.parse_transaction_mode()? {
+                modes.push(mode);
+            } else if required {
+                return self.expected_ref("transaction characteristic", self.peek_token_ref());
+            } else {
+                break;
+            }
+            required = self.consume_token(&Token::Comma);
+        }
         Ok(Statement::StartTransaction {
-            modes: self.parse_transaction_modes()?,
+            modes,
+            consistent_snapshot,
             begin: false,
             transaction: Some(BeginTransactionKind::Transaction),
             modifier: None,
@@ -19146,6 +24349,7 @@ impl<'a> Parser<'a> {
             };
         Ok(Statement::StartTransaction {
             modes: self.parse_transaction_modes()?,
+            consistent_snapshot: None,
             begin: true,
             transaction,
             modifier,
@@ -19198,6 +24402,7 @@ impl<'a> Parser<'a> {
             transaction: None,
             modifier: None,
             modes: Default::default(),
+            consistent_snapshot: None,
         })
     }
 
@@ -19213,7 +24418,7 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Statement::Commit {
-            chain: self.parse_commit_rollback_chain()?,
+            completion: self.parse_transaction_completion()?,
             end: true,
             modifier,
         })
@@ -19224,28 +24429,10 @@ impl<'a> Parser<'a> {
         let mut modes = vec![];
         let mut required = false;
         loop {
-            let mode = if self.parse_keywords(&[Keyword::ISOLATION, Keyword::LEVEL]) {
-                let iso_level = if self.parse_keywords(&[Keyword::READ, Keyword::UNCOMMITTED]) {
-                    TransactionIsolationLevel::ReadUncommitted
-                } else if self.parse_keywords(&[Keyword::READ, Keyword::COMMITTED]) {
-                    TransactionIsolationLevel::ReadCommitted
-                } else if self.parse_keywords(&[Keyword::REPEATABLE, Keyword::READ]) {
-                    TransactionIsolationLevel::RepeatableRead
-                } else if self.parse_keyword(Keyword::SERIALIZABLE) {
-                    TransactionIsolationLevel::Serializable
-                } else if self.parse_keyword(Keyword::SNAPSHOT) {
-                    TransactionIsolationLevel::Snapshot
-                } else {
-                    self.expected_ref("isolation level", self.peek_token_ref())?
-                };
-                TransactionMode::IsolationLevel(iso_level)
-            } else if self.parse_keywords(&[Keyword::READ, Keyword::ONLY]) {
-                TransactionMode::AccessMode(TransactionAccessMode::ReadOnly)
-            } else if self.parse_keywords(&[Keyword::READ, Keyword::WRITE]) {
-                TransactionMode::AccessMode(TransactionAccessMode::ReadWrite)
-            } else if required {
-                self.expected_ref("transaction mode", self.peek_token_ref())?
-            } else {
+            let Some(mode) = self.parse_transaction_mode()? else {
+                if required {
+                    return self.expected_ref("transaction mode", self.peek_token_ref());
+                }
                 break;
             };
             modes.push(mode);
@@ -19258,10 +24445,36 @@ impl<'a> Parser<'a> {
         Ok(modes)
     }
 
+    fn parse_transaction_mode(&mut self) -> Result<Option<TransactionMode>, ParserError> {
+        let mode = if self.parse_keywords(&[Keyword::ISOLATION, Keyword::LEVEL]) {
+            let iso_level = if self.parse_keywords(&[Keyword::READ, Keyword::UNCOMMITTED]) {
+                TransactionIsolationLevel::ReadUncommitted
+            } else if self.parse_keywords(&[Keyword::READ, Keyword::COMMITTED]) {
+                TransactionIsolationLevel::ReadCommitted
+            } else if self.parse_keywords(&[Keyword::REPEATABLE, Keyword::READ]) {
+                TransactionIsolationLevel::RepeatableRead
+            } else if self.parse_keyword(Keyword::SERIALIZABLE) {
+                TransactionIsolationLevel::Serializable
+            } else if self.parse_keyword(Keyword::SNAPSHOT) {
+                TransactionIsolationLevel::Snapshot
+            } else {
+                self.expected_ref("isolation level", self.peek_token_ref())?
+            };
+            TransactionMode::IsolationLevel(iso_level)
+        } else if self.parse_keywords(&[Keyword::READ, Keyword::ONLY]) {
+            TransactionMode::AccessMode(TransactionAccessMode::ReadOnly)
+        } else if self.parse_keywords(&[Keyword::READ, Keyword::WRITE]) {
+            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite)
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(mode))
+    }
+
     /// Parse a 'COMMIT' statement
     pub fn parse_commit(&mut self) -> Result<Statement, ParserError> {
         Ok(Statement::Commit {
-            chain: self.parse_commit_rollback_chain()?,
+            completion: self.parse_transaction_completion()?,
             end: false,
             modifier: None,
         })
@@ -19269,21 +24482,38 @@ impl<'a> Parser<'a> {
 
     /// Parse a 'ROLLBACK' statement
     pub fn parse_rollback(&mut self) -> Result<Statement, ParserError> {
-        let chain = self.parse_commit_rollback_chain()?;
+        let completion = self.parse_transaction_completion()?;
         let savepoint = self.parse_rollback_savepoint()?;
+        if savepoint.is_some() && completion != TransactionCompletion::Default {
+            return Err(ParserError::ParserError(
+                "transaction completion clauses are not valid with ROLLBACK TO SAVEPOINT".into(),
+            ));
+        }
 
-        Ok(Statement::Rollback { chain, savepoint })
+        Ok(Statement::Rollback {
+            completion,
+            savepoint,
+        })
     }
 
-    /// Parse an optional `AND [NO] CHAIN` clause for `COMMIT` and `ROLLBACK` statements
-    pub fn parse_commit_rollback_chain(&mut self) -> Result<bool, ParserError> {
+    /// Parse one optional MySQL transaction completion clause.
+    pub fn parse_transaction_completion(&mut self) -> Result<TransactionCompletion, ParserError> {
         let _ = self.parse_one_of_keywords(&[Keyword::TRANSACTION, Keyword::WORK, Keyword::TRAN]);
         if self.parse_keyword(Keyword::AND) {
-            let chain = !self.parse_keyword(Keyword::NO);
+            let no = self.parse_keyword(Keyword::NO);
             self.expect_keyword_is(Keyword::CHAIN)?;
-            Ok(chain)
+            Ok(if no {
+                TransactionCompletion::NoChain
+            } else {
+                TransactionCompletion::Chain
+            })
+        } else if self.parse_keyword(Keyword::NO) {
+            self.expect_keyword_is(Keyword::RELEASE)?;
+            Ok(TransactionCompletion::NoRelease)
+        } else if self.parse_keyword(Keyword::RELEASE) {
+            Ok(TransactionCompletion::Release)
         } else {
-            Ok(false)
+            Ok(TransactionCompletion::Default)
         }
     }
 
@@ -19485,18 +24715,141 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_into(&mut self) -> Result<SelectInto, ParserError> {
+        if dialect_of!(self is MySqlDialect | GenericDialect) {
+            let destination = self.parse_one_of_keywords(&[Keyword::OUTFILE, Keyword::DUMPFILE]);
+            if let Some(destination) = destination {
+                if self.tokens.raw().is_some() {
+                    let path = self.parse_mysql_load_text(MySqlTextRole::FileSystem, false)?;
+                    let dumpfile = destination == Keyword::DUMPFILE;
+                    let character_set = if dumpfile {
+                        None
+                    } else {
+                        self.parse_mysql_file_charset()?
+                    };
+                    let (fields, lines) = if dumpfile {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        self.parse_mysql_file_separators()?
+                    };
+                    return Ok(SelectInto {
+                        temporary: false,
+                        unlogged: false,
+                        table: false,
+                        target: SelectIntoTarget::MySqlFile(MySqlSelectIntoFile {
+                            path,
+                            dumpfile,
+                            character_set,
+                            fields,
+                            lines,
+                        }),
+                    });
+                }
+                let path = self.parse_literal_string()?;
+                let character_set = if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
+                    Some(self.parse_object_name(false)?)
+                } else {
+                    None
+                };
+                let mut fields_terminated_by = None;
+                let mut fields_enclosed_by = None;
+                let mut fields_optionally_enclosed = false;
+                let mut fields_escaped_by = None;
+                let mut lines_starting_by = None;
+                let mut lines_terminated_by = None;
+                while destination == Keyword::OUTFILE {
+                    if self
+                        .parse_one_of_keywords(&[Keyword::FIELDS, Keyword::COLUMNS])
+                        .is_some()
+                    {
+                        loop {
+                            if self.parse_keywords(&[Keyword::TERMINATED, Keyword::BY]) {
+                                fields_terminated_by = Some(self.parse_literal_string()?);
+                            } else {
+                                let optionally = self.parse_keyword(Keyword::OPTIONALLY);
+                                if self.parse_keywords(&[Keyword::ENCLOSED, Keyword::BY]) {
+                                    fields_optionally_enclosed = optionally;
+                                    fields_enclosed_by = Some(self.parse_literal_string()?);
+                                } else if optionally {
+                                    return self.expected_ref(
+                                        "ENCLOSED BY after OPTIONALLY",
+                                        self.peek_token_ref(),
+                                    );
+                                } else if self.parse_keywords(&[Keyword::ESCAPED, Keyword::BY]) {
+                                    fields_escaped_by = Some(self.parse_literal_string()?);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    } else if self.parse_keyword(Keyword::LINES) {
+                        loop {
+                            if self.parse_keywords(&[Keyword::STARTING, Keyword::BY]) {
+                                lines_starting_by = Some(self.parse_literal_string()?);
+                            } else if self.parse_keywords(&[Keyword::TERMINATED, Keyword::BY]) {
+                                lines_terminated_by = Some(self.parse_literal_string()?);
+                            } else {
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                return Ok(SelectInto {
+                    temporary: false,
+                    unlogged: false,
+                    table: false,
+                    target: SelectIntoTarget::File(SelectIntoFile {
+                        path,
+                        dumpfile: destination == Keyword::DUMPFILE,
+                        character_set,
+                        fields_terminated_by,
+                        fields_enclosed_by,
+                        fields_optionally_enclosed,
+                        fields_escaped_by,
+                        lines_starting_by,
+                        lines_terminated_by,
+                    }),
+                });
+            }
+        }
         let temporary = self
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
         let unlogged = self.parse_keyword(Keyword::UNLOGGED);
         let table = self.parse_keyword(Keyword::TABLE);
-        let name = self.parse_object_name(false)?;
+        let name = if dialect_of!(self is MySqlDialect) && !temporary && !unlogged && !table {
+            self.parse_mysql_variable_target(false)?
+        } else {
+            self.parse_object_name(false)?
+        };
+        let target = if !temporary
+            && !unlogged
+            && !table
+            && (dialect_of!(self is MySqlDialect)
+                || (dialect_of!(self is GenericDialect)
+                    && name.0.as_slice().first().is_some_and(|part| {
+                        part.as_ident()
+                            .is_some_and(|ident| ident.value.starts_with('@'))
+                    }))) {
+            let mut variables = vec![name];
+            while self.consume_token(&Token::Comma) {
+                variables.push(if dialect_of!(self is MySqlDialect) {
+                    self.parse_mysql_variable_target(false)?
+                } else {
+                    self.parse_object_name(false)?
+                });
+            }
+            SelectIntoTarget::Variables(variables)
+        } else {
+            SelectIntoTarget::Table(name)
+        };
 
         Ok(SelectInto {
             temporary,
             unlogged,
             table,
-            name,
+            target,
         })
     }
 
@@ -19547,8 +24900,35 @@ impl<'a> Parser<'a> {
         Ok(Statement::Install { extension_name })
     }
 
+    fn parse_mysql_component(&mut self, install: bool) -> Result<Statement, ParserError> {
+        let component = self.next_token();
+        if !matches!(&component.token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("COMPONENT"))
+        {
+            return self.expected("COMPONENT", component);
+        }
+        let mut urns = Vec::new();
+        loop {
+            let token = self.next_token();
+            let urn = match token.token {
+                Token::MySqlText(text) => self.mysql_system_text(&text)?,
+                Token::SingleQuotedString(value) => value,
+                // The original lexer decides ANSI_QUOTES before this parser.
+                Token::DoubleQuotedString(value) => value,
+                _ => return self.expected("component string literal", token),
+            };
+            urns.push(urn);
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(Statement::MySqlComponent { install, urns })
+    }
+
     /// Parse a SQL LOAD statement
     pub fn parse_load(&mut self) -> Result<Statement, ParserError> {
+        if dialect_of!(self is MySqlDialect) {
+            return self.parse_mysql_load();
+        }
         if self.dialect.supports_load_extension() {
             let extension_name = self.parse_identifier()?;
             Ok(Statement::Load { extension_name })
@@ -19576,6 +24956,348 @@ impl<'a> Parser<'a> {
                 self.peek_token_ref(),
             )
         }
+    }
+
+    /// Admit growth of a compile-local container through this parser's actual
+    /// source budget before allocating. This issues no Source or SQL authority;
+    /// raw guards move with the same final parsed bundle/CPP owner.
+    pub fn mysql_source_push<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        value: T,
+    ) -> Result<(), ParserError> {
+        if values.len() == values.capacity() {
+            let capacity = values.capacity().max(2).checked_mul(2).ok_or_else(|| {
+                ParserError::ParserError("MySQL source structure capacity overflow".into())
+            })?;
+            if let Some(raw) = self.tokens.raw() {
+                let bytes = capacity
+                    .checked_mul(core::mem::size_of::<T>())
+                    .ok_or_else(|| {
+                        ParserError::ParserError("MySQL source structure capacity overflow".into())
+                    })?;
+                raw.cursor.borrow_mut().admit_retained(bytes)?;
+            }
+            values.reserve_exact(capacity - values.len());
+        }
+        values.push(value);
+        Ok(())
+    }
+
+    /// TEXT_STRING_filesystem and text_string preserve their own native role;
+    /// only text_string admits HEX_NUM/BIN_NUM (sql_yacc.yy14645+).
+    fn parse_mysql_load_text(
+        &mut self,
+        role: MySqlTextRole,
+        binary_forms: bool,
+    ) -> Result<ValueWithSpan, ParserError> {
+        let token = self.peek_token().clone();
+        if (matches!(&token.token, Token::MySqlText(text) if text.introducer().is_none())
+            || matches!(
+                token.token,
+                Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+            ))
+            || (binary_forms
+                && matches!(
+                    token.token,
+                    Token::HexStringLiteral(_)
+                        | Token::MySqlHexStringLiteral(_, _)
+                        | Token::SingleQuotedByteStringLiteral(_)
+                ))
+        {
+            let token = self.next_token();
+            let value = match token.token {
+                Token::MySqlText(text) => Value::MySqlText(text.with_role(role)),
+                Token::SingleQuotedString(text) => Value::SingleQuotedString(text),
+                Token::DoubleQuotedString(text) => Value::DoubleQuotedString(text),
+                Token::MySqlHexStringLiteral(digits, kind) if self.tokens.raw().is_some() => {
+                    Value::MySqlText(
+                        self.mysql_binary_text_string(digits, kind, token.span)?
+                            .with_role(role),
+                    )
+                }
+                Token::HexStringLiteral(text) | Token::MySqlHexStringLiteral(text, _) => {
+                    Value::HexStringLiteral(text)
+                }
+                Token::SingleQuotedByteStringLiteral(text) => {
+                    Value::SingleQuotedByteStringLiteral(text)
+                }
+                _ => unreachable!("checked LOAD text token"),
+            };
+            Ok(value.with_span(token.span))
+        } else {
+            self.expected("native MySQL LOAD text", token)
+        }
+    }
+
+    fn parse_mysql_file_charset(&mut self) -> Result<Option<Expr>, ParserError> {
+        let has_charset = if self.parse_mysql_word("CHARACTER") || self.parse_mysql_word("CHAR") {
+            self.expect_mysql_word("SET")?;
+            true
+        } else {
+            self.parse_mysql_word("CHARSET")
+        };
+        let character_set = if has_charset {
+            let token = self.peek_token().clone();
+            Some(
+                if matches!(
+                    token.token,
+                    Token::MySqlText(_)
+                        | Token::SingleQuotedString(_)
+                        | Token::DoubleQuotedString(_)
+                ) {
+                    Expr::Value(self.parse_mysql_load_text(MySqlTextRole::System, false)?)
+                } else {
+                    Expr::Identifier(self.parse_identifier()?)
+                },
+            )
+        } else {
+            None
+        };
+        Ok(character_set)
+    }
+
+    fn parse_mysql_file_separators(
+        &mut self,
+    ) -> Result<(Vec<MySqlLoadFieldOption>, Vec<MySqlLoadLineOption>), ParserError> {
+        let mut fields = Vec::new();
+        if self.parse_mysql_word("FIELDS") || self.parse_mysql_word("COLUMNS") {
+            loop {
+                let field = if self.parse_mysql_word("TERMINATED") {
+                    self.expect_mysql_word("BY")?;
+                    MySqlLoadFieldOption::TerminatedBy(
+                        self.parse_mysql_load_text(MySqlTextRole::Literal, true)?,
+                    )
+                } else if self.peek_mysql_words(&["OPTIONALLY", "ENCLOSED"])
+                    || self.peek_mysql_words(&["ENCLOSED"])
+                {
+                    let optionally = self.parse_mysql_word("OPTIONALLY");
+                    self.expect_mysql_word("ENCLOSED")?;
+                    self.expect_mysql_word("BY")?;
+                    MySqlLoadFieldOption::EnclosedBy {
+                        optionally,
+                        value: self.parse_mysql_load_text(MySqlTextRole::Literal, true)?,
+                    }
+                } else if self.parse_mysql_word("ESCAPED") {
+                    self.expect_mysql_word("BY")?;
+                    MySqlLoadFieldOption::EscapedBy(
+                        self.parse_mysql_load_text(MySqlTextRole::Literal, true)?,
+                    )
+                } else {
+                    break;
+                };
+                self.mysql_source_push(&mut fields, field)?;
+            }
+            if fields.is_empty() {
+                return self.expected_ref("LOAD field separator", self.peek_token_ref());
+            }
+        }
+        let mut lines = Vec::new();
+        if self.parse_mysql_word("LINES") {
+            loop {
+                let line = if self.parse_mysql_word("STARTING") {
+                    self.expect_mysql_word("BY")?;
+                    MySqlLoadLineOption::StartingBy(
+                        self.parse_mysql_load_text(MySqlTextRole::Literal, true)?,
+                    )
+                } else if self.parse_mysql_word("TERMINATED") {
+                    self.expect_mysql_word("BY")?;
+                    MySqlLoadLineOption::TerminatedBy(
+                        self.parse_mysql_load_text(MySqlTextRole::Literal, true)?,
+                    )
+                } else {
+                    break;
+                };
+                self.mysql_source_push(&mut lines, line)?;
+            }
+            if lines.is_empty() {
+                return self.expected_ref("LOAD line separator", self.peek_token_ref());
+            }
+        }
+        Ok((fields, lines))
+    }
+
+    fn parse_mysql_load(&mut self) -> Result<Statement, ParserError> {
+        let xml = if self.parse_mysql_word("DATA") {
+            false
+        } else {
+            self.expect_mysql_word("XML")?;
+            true
+        };
+        let lock = if self.parse_mysql_word("LOW_PRIORITY") {
+            MySqlLoadLock::LowPriority
+        } else if self.parse_mysql_word("CONCURRENT") {
+            MySqlLoadLock::Concurrent
+        } else {
+            MySqlLoadLock::Default
+        };
+        let from_keyword = self.parse_mysql_word("FROM");
+        let local = self.parse_mysql_word("LOCAL");
+        let source_type = if self.parse_mysql_word("INFILE") {
+            MySqlLoadSourceType::Infile
+        } else {
+            self.expect_mysql_word("URL")?;
+            MySqlLoadSourceType::Url
+        };
+        let filename = self.parse_mysql_load_text(MySqlTextRole::FileSystem, false)?;
+        let source_count = if self.parse_mysql_word("COUNT") {
+            Some(self.parse_literal_uint()?)
+        } else {
+            None
+        };
+        let primary_key_order = if self.parse_mysql_word("IN") {
+            self.expect_mysql_word("PRIMARY")?;
+            self.expect_mysql_word("KEY")?;
+            self.expect_mysql_word("ORDER")?;
+            true
+        } else {
+            false
+        };
+        let duplicate = if self.parse_mysql_word("REPLACE") {
+            MySqlLoadDuplicate::Replace
+        } else if self.parse_mysql_word("IGNORE") {
+            MySqlLoadDuplicate::Ignore
+        } else {
+            MySqlLoadDuplicate::Error
+        };
+        self.expect_mysql_word("INTO")?;
+        self.expect_mysql_word("TABLE")?;
+        let table = self.parse_object_name(false)?;
+        let mut partitions = Vec::new();
+        if self.parse_mysql_word("PARTITION") {
+            self.expect_token(&Token::LParen)?;
+            loop {
+                let name = self.parse_identifier()?;
+                self.mysql_source_push(&mut partitions, name)?;
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RParen)?;
+        }
+        let character_set = self.parse_mysql_file_charset()?;
+        let xml_rows_identified_by = if self.parse_mysql_word("ROWS") {
+            self.expect_mysql_word("IDENTIFIED")?;
+            self.expect_mysql_word("BY")?;
+            Some(self.parse_mysql_load_text(MySqlTextRole::Literal, true)?)
+        } else {
+            None
+        };
+        let (fields, lines) = self.parse_mysql_file_separators()?;
+        let ignore = if self.parse_mysql_word("IGNORE") {
+            let count = self.parse_literal_uint()?;
+            let rows = if self.parse_mysql_word("ROWS") {
+                true
+            } else {
+                self.expect_mysql_word("LINES")?;
+                false
+            };
+            Some((count, rows))
+        } else {
+            None
+        };
+        let inputs = if self.consume_token(&Token::LParen) {
+            let mut inputs = Vec::new();
+            if !self.consume_token(&Token::RParen) {
+                loop {
+                    let token = self.peek_token().clone();
+                    let input = if self.consume_token(&Token::AtSign) {
+                        if let Token::MySqlText(text) = &self.peek_token_ref().token {
+                            let value = MySqlLoadInput::RawUserVariable(
+                                text.clone().with_role(MySqlTextRole::System),
+                            );
+                            self.advance_token();
+                            value
+                        } else {
+                            MySqlLoadInput::UserVariable(
+                                self.parse_mysql_user_variable_name(token.span.start)?,
+                            )
+                        }
+                    } else if matches!(&token.token, Token::Word(word) if word.quote_style.is_none() && word.value.starts_with('@'))
+                    {
+                        let name = self.parse_mysql_variable_target(false)?;
+                        let Some(ident) = name.0.first().and_then(ObjectNamePart::as_user_variable)
+                        else {
+                            return self.expected("LOAD user variable", token);
+                        };
+                        MySqlLoadInput::UserVariable(ident.clone())
+                    } else {
+                        MySqlLoadInput::Column(self.parse_object_name(false)?)
+                    };
+                    self.mysql_source_push(&mut inputs, input)?;
+                    if !self.consume_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect_token(&Token::RParen)?;
+            }
+            Some(inputs)
+        } else {
+            None
+        };
+        let mut assignments = Vec::new();
+        if self.parse_mysql_word("SET") {
+            loop {
+                let target = AssignmentTarget::ColumnName(self.parse_object_name(false)?);
+                let start = self.index;
+                if !self.consume_token(&Token::Eq) && !self.consume_token(&Token::Assignment) {
+                    return self.expected_ref("LOAD assignment equal", self.peek_token_ref());
+                }
+                let assignment = Assignment {
+                    target,
+                    value: self.parse_expr()?,
+                };
+                if !matches!(&assignment.target, AssignmentTarget::ColumnName(name) if name.0.iter().all(|part| part.as_ident().is_some()))
+                {
+                    return self.expected_ref("LOAD column assignment", self.peek_token_ref());
+                }
+                let (source_occurrence, cpp_piece_range) = if self.tokens.raw().is_some() {
+                    let (source, cpp) = self.mysql_source_range(start, self.index)?;
+                    (Some(source), Some(cpp))
+                } else {
+                    (None, None)
+                };
+                self.mysql_source_push(
+                    &mut assignments,
+                    MySqlLoadAssignment {
+                        assignment,
+                        source_occurrence,
+                        cpp_piece_range,
+                    },
+                )?;
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        let bulk = if self.parse_mysql_word("ALGORITHM") {
+            self.expect_token(&Token::Eq)?;
+            self.expect_mysql_word("BULK")?;
+            true
+        } else {
+            false
+        };
+        Ok(Statement::MySqlLoadData(MySqlLoadData {
+            xml,
+            lock,
+            from_keyword,
+            local,
+            source_type,
+            filename,
+            source_count,
+            primary_key_order,
+            duplicate,
+            table,
+            partitions,
+            character_set,
+            xml_rows_identified_by,
+            fields,
+            lines,
+            ignore,
+            inputs,
+            assignments,
+            bulk,
+        }))
     }
 
     /// ClickHouse:
@@ -19685,44 +25407,32 @@ impl<'a> Parser<'a> {
 
     fn parse_create_sequence_options(&mut self) -> Result<Vec<SequenceOptions>, ParserError> {
         let mut sequence_options = vec![];
-        //[ INCREMENT [ BY ] increment ]
-        if self.parse_keywords(&[Keyword::INCREMENT]) {
-            if self.parse_keywords(&[Keyword::BY]) {
-                sequence_options.push(SequenceOptions::IncrementBy(self.parse_number()?, true));
+        loop {
+            // PostgreSQL accepts sequence options in any order. Duplicate options
+            // are preserved here so the semantic layer can report them uniformly.
+            if self.parse_keyword(Keyword::INCREMENT) {
+                let by = self.parse_keyword(Keyword::BY);
+                sequence_options.push(SequenceOptions::IncrementBy(self.parse_number()?, by));
+            } else if self.parse_keyword(Keyword::MINVALUE) {
+                sequence_options.push(SequenceOptions::MinValue(Some(self.parse_number()?)));
+            } else if self.parse_keywords(&[Keyword::NO, Keyword::MINVALUE]) {
+                sequence_options.push(SequenceOptions::MinValue(None));
+            } else if self.parse_keyword(Keyword::MAXVALUE) {
+                sequence_options.push(SequenceOptions::MaxValue(Some(self.parse_number()?)));
+            } else if self.parse_keywords(&[Keyword::NO, Keyword::MAXVALUE]) {
+                sequence_options.push(SequenceOptions::MaxValue(None));
+            } else if self.parse_keyword(Keyword::START) {
+                let with = self.parse_keyword(Keyword::WITH);
+                sequence_options.push(SequenceOptions::StartWith(self.parse_number()?, with));
+            } else if self.parse_keyword(Keyword::CACHE) {
+                sequence_options.push(SequenceOptions::Cache(self.parse_number()?));
+            } else if self.parse_keywords(&[Keyword::NO, Keyword::CYCLE]) {
+                sequence_options.push(SequenceOptions::Cycle(true));
+            } else if self.parse_keyword(Keyword::CYCLE) {
+                sequence_options.push(SequenceOptions::Cycle(false));
             } else {
-                sequence_options.push(SequenceOptions::IncrementBy(self.parse_number()?, false));
+                break;
             }
-        }
-        //[ MINVALUE minvalue | NO MINVALUE ]
-        if self.parse_keyword(Keyword::MINVALUE) {
-            sequence_options.push(SequenceOptions::MinValue(Some(self.parse_number()?)));
-        } else if self.parse_keywords(&[Keyword::NO, Keyword::MINVALUE]) {
-            sequence_options.push(SequenceOptions::MinValue(None));
-        }
-        //[ MAXVALUE maxvalue | NO MAXVALUE ]
-        if self.parse_keywords(&[Keyword::MAXVALUE]) {
-            sequence_options.push(SequenceOptions::MaxValue(Some(self.parse_number()?)));
-        } else if self.parse_keywords(&[Keyword::NO, Keyword::MAXVALUE]) {
-            sequence_options.push(SequenceOptions::MaxValue(None));
-        }
-
-        //[ START [ WITH ] start ]
-        if self.parse_keywords(&[Keyword::START]) {
-            if self.parse_keywords(&[Keyword::WITH]) {
-                sequence_options.push(SequenceOptions::StartWith(self.parse_number()?, true));
-            } else {
-                sequence_options.push(SequenceOptions::StartWith(self.parse_number()?, false));
-            }
-        }
-        //[ CACHE cache ]
-        if self.parse_keywords(&[Keyword::CACHE]) {
-            sequence_options.push(SequenceOptions::Cache(self.parse_number()?));
-        }
-        // [ [ NO ] CYCLE ]
-        if self.parse_keywords(&[Keyword::NO, Keyword::CYCLE]) {
-            sequence_options.push(SequenceOptions::Cycle(true));
-        } else if self.parse_keywords(&[Keyword::CYCLE]) {
-            sequence_options.push(SequenceOptions::Cycle(false));
         }
 
         Ok(sequence_options)
@@ -19793,7 +25503,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `CREATE PROCEDURE` statement.
-    pub fn parse_create_procedure(&mut self, or_alter: bool) -> Result<Statement, ParserError> {
+    pub fn parse_create_procedure(
+        &mut self,
+        or_alter: bool,
+        or_replace: bool,
+    ) -> Result<Statement, ParserError> {
+        if dialect_of!(self is PostgreSqlDialect | GenericDialect) {
+            return self
+                .parse_postgres_create_procedure(or_alter, or_replace)
+                .map(Statement::CreateProcedure);
+        }
         let name = self.parse_object_name(false)?;
         let params = self.parse_optional_procedure_parameters()?;
 
@@ -19807,11 +25526,124 @@ impl<'a> Parser<'a> {
 
         let body = self.parse_conditional_statements(&[Keyword::END])?;
 
-        Ok(Statement::CreateProcedure {
+        Ok(Statement::CreateProcedure(CreateProcedure {
+            mysql_body: None,
             name,
             or_alter,
-            params,
+            or_replace: false,
+            args: params.unwrap_or_default(),
             language,
+            security: None,
+            set_params: Vec::new(),
+            body: Some(CreateProcedureBody::Statements(body)),
+        }))
+    }
+
+    fn parse_postgres_create_procedure(
+        &mut self,
+        or_alter: bool,
+        or_replace: bool,
+    ) -> Result<CreateProcedure, ParserError> {
+        let name = self.parse_object_name(false)?;
+        self.expect_token(&Token::LParen)?;
+        let args = if self.peek_token_ref().token == Token::RParen {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(Parser::parse_function_arg)?
+        };
+        self.expect_token(&Token::RParen)?;
+
+        let mut language = None;
+        let mut security = None;
+        let mut set_params = Vec::new();
+        let mut body = None;
+        loop {
+            if self.parse_keyword(Keyword::AS) {
+                if body.is_some() {
+                    return parser_err!(
+                        "AS specified more than once",
+                        self.peek_token_ref().span.start
+                    );
+                }
+                let CreateFunctionBody::AsBeforeOptions {
+                    body: source,
+                    link_symbol,
+                } = self.parse_create_function_body_string()?
+                else {
+                    unreachable!("string procedure bodies parse as AS bodies")
+                };
+                body = Some(CreateProcedureBody::PostgresAs {
+                    body: source,
+                    link_symbol,
+                });
+            } else if self.parse_keyword(Keyword::LANGUAGE) {
+                if language.is_some() {
+                    return parser_err!(
+                        "LANGUAGE specified more than once",
+                        self.peek_token_ref().span.start
+                    );
+                }
+                language = Some(self.parse_identifier()?);
+            } else if self.parse_keyword(Keyword::SECURITY) {
+                if security.is_some() {
+                    return parser_err!(
+                        "SECURITY specified more than once",
+                        self.peek_token_ref().span.start
+                    );
+                }
+                security = if self.parse_keyword(Keyword::DEFINER) {
+                    Some(FunctionSecurity::Definer)
+                } else if self.parse_keyword(Keyword::INVOKER) {
+                    Some(FunctionSecurity::Invoker)
+                } else {
+                    return self.expected_ref("DEFINER or INVOKER", self.peek_token_ref());
+                };
+            } else if self.parse_keyword(Keyword::SET) {
+                let name = self.parse_object_name(false)?;
+                let value = if self.parse_keywords(&[Keyword::FROM, Keyword::CURRENT]) {
+                    FunctionSetValue::FromCurrent
+                } else {
+                    if !self.consume_token(&Token::Eq) && !self.parse_keyword(Keyword::TO) {
+                        return self.expected_ref("= or TO", self.peek_token_ref());
+                    }
+                    if self.parse_keyword(Keyword::DEFAULT) {
+                        FunctionSetValue::Default
+                    } else {
+                        FunctionSetValue::Values(self.parse_comma_separated(Parser::parse_expr)?)
+                    }
+                };
+                set_params.push(FunctionDefinitionSetParam { name, value });
+            } else if self.peek_keyword(Keyword::BEGIN) {
+                if body.is_some() {
+                    return parser_err!(
+                        "procedure body specified more than once",
+                        self.peek_token_ref().span.start
+                    );
+                }
+                let begin_token = self.expect_keyword(Keyword::BEGIN)?;
+                self.expect_keyword_is(Keyword::ATOMIC)?;
+                let statements = self.parse_statement_list(&[Keyword::END])?;
+                let end_token = self.expect_keyword(Keyword::END)?;
+                body = Some(CreateProcedureBody::PostgresBeginAtomic(
+                    BeginEndStatements {
+                        begin_token: AttachedToken(begin_token),
+                        statements,
+                        end_token: AttachedToken(end_token),
+                    },
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(CreateProcedure {
+            mysql_body: None,
+            or_alter,
+            or_replace,
+            name,
+            args,
+            language,
+            security,
+            set_params,
             body,
         })
     }
@@ -19819,7 +25651,20 @@ impl<'a> Parser<'a> {
     /// Parse a window specification.
     pub fn parse_window_spec(&mut self) -> Result<WindowSpec, ParserError> {
         let window_name = match &self.peek_token_ref().token {
-            Token::Word(word) if word.keyword == Keyword::NoKeyword => {
+            Token::Word(word)
+                if word.keyword == Keyword::NoKeyword
+                    || (dialect_of!(self is MySqlDialect)
+                        && !self.dialect.is_reserved_for_identifier(word.keyword)
+                        && !matches!(
+                            word.keyword,
+                            Keyword::PARTITION
+                                | Keyword::ORDER
+                                | Keyword::ROWS
+                                | Keyword::RANGE
+                                | Keyword::GROUPS
+                                | Keyword::EXCLUDE
+                        )) =>
+            {
                 self.parse_optional_ident()?
             }
             _ => None,
@@ -20309,7 +26154,7 @@ impl<'a> Parser<'a> {
 
     /// Consume the parser and return its underlying token buffer
     pub fn into_tokens(self) -> Vec<TokenWithSpan> {
-        self.tokens
+        self.tokens.into_filled()
     }
 
     /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
@@ -20387,7 +26232,7 @@ impl<'a> Parser<'a> {
                         return self.expected_ref(
                             "one of ACCOUNT, DATABASE, SCHEMA, TABLE or VIEW",
                             self.peek_token_ref(),
-                        )
+                        );
                     }
                 }
             }
@@ -20399,9 +26244,12 @@ impl<'a> Parser<'a> {
                     .parse_one_of_keywords(&[Keyword::FROM, Keyword::IN])
                     .is_some()
                 {
-                    parent_name
-                        .0
-                        .insert(0, ObjectNamePart::Identifier(self.parse_identifier()?));
+                    let database = ObjectNamePart::Identifier(self.parse_identifier()?);
+                    if dialect_of!(self is MySqlDialect) && parent_name.0.len() == 2 {
+                        parent_name.0[0] = database;
+                    } else {
+                        parent_name.0.insert(0, database);
+                    }
                 }
                 (None, Some(parent_name))
             }
@@ -20481,7 +26329,7 @@ impl<'a> Parser<'a> {
                     return self.expected_ref(
                         "another option, EOF, SemiColon, Comma or ')'",
                         self.peek_token_ref(),
-                    )
+                    );
                 }
             };
         }
@@ -20601,7 +26449,18 @@ impl Word {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{all_dialects, TestedDialects};
+    mod mysql_keywords;
+    mod mysql_precedence;
+    mod mysql_statement_identity;
+    mod mysql_utc_temporal;
+    #[path = "mod.rs"]
+    mod optimizer_hint_cases;
+    mod postgres_data_type;
+    mod postgres_merge;
+    mod postgres_procedure;
+    mod postgres_table_definition;
+
+    use crate::test_utils::{TestedDialects, all_dialects};
 
     use super::*;
 
@@ -21342,6 +27201,61 @@ mod tests {
         } else {
             panic!("fail to parse mysql partition selection");
         }
+    }
+
+    #[test]
+    fn test_mysql_advanced_index_syntax() {
+        let dialect = MySqlDialect {};
+        for sql in [
+            "CREATE FULLTEXT INDEX ft_body ON posts (body) WITH PARSER ngram INVISIBLE",
+            "CREATE SPATIAL INDEX sx_shape ON places (shape) VISIBLE",
+            "CREATE TABLE posts (body TEXT, FULLTEXT KEY ft_body (body) WITH PARSER ngram INVISIBLE)",
+            "ALTER TABLE posts ALTER INDEX ft_body VISIBLE",
+            "SHOW CREATE DATABASE application",
+        ] {
+            let statements = Parser::parse_sql(&dialect, sql).unwrap();
+            assert_eq!(statements.len(), 1);
+            assert_eq!(statements[0].to_string(), sql);
+        }
+    }
+
+    #[test]
+    fn test_mysql_json_value_clauses_have_dedicated_ast() {
+        let sql = "SELECT JSON_VALUE(document, '$.name' RETURNING VARCHAR(32) DEFAULT 'unknown' ON EMPTY ERROR ON ERROR)";
+        let statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        assert_eq!(statements[0].to_string(), sql);
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT");
+        };
+        let [SelectItem::UnnamedExpr(Expr::JsonValue(json_value))] = select.projection.as_slice()
+        else {
+            panic!("expected JSON_VALUE AST");
+        };
+        assert_eq!(
+            json_value.returning.as_ref().map(ToString::to_string),
+            Some("VARCHAR(32)".into())
+        );
+        assert!(matches!(
+            &json_value.on_empty,
+            Some(JsonValueClause::Default(_))
+        ));
+        assert_eq!(&json_value.on_error, &Some(JsonValueClause::Error));
+
+        let nulls = "SELECT JSON_VALUE(document, '$.name' NULL ON EMPTY NULL ON ERROR)";
+        assert_eq!(
+            Parser::parse_sql(&MySqlDialect {}, nulls).unwrap()[0].to_string(),
+            nulls
+        );
+        assert!(
+            Parser::parse_sql(
+                &MySqlDialect {},
+                "SELECT JSON_VALUE(document, '$' NULL ON EMPTY ERROR ON EMPTY)"
+            )
+            .is_err()
+        );
     }
 
     #[test]

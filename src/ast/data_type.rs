@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "visitor")]
 use sqlparser_derive::{Visit, VisitMut};
 
-use crate::ast::{display_comma_separated, Expr, ObjectName, StructField, UnionField};
+use crate::ast::{Expr, ObjectName, StructField, UnionField, display_comma_separated};
 
-use super::{value::escape_single_quote_string, ColumnDef};
+use super::{ColumnDef, value::escape_single_quote_string};
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -46,6 +46,7 @@ pub enum EnumMember {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+#[cfg_attr(feature = "visitor", visit(with = "visit_data_type"))]
 pub enum DataType {
     /// Table type in [PostgreSQL], e.g. CREATE FUNCTION RETURNS TABLE(...).
     ///
@@ -73,6 +74,8 @@ pub enum DataType {
     Varchar(Option<CharacterLength>),
     /// Variable-length character type, e.g. NVARCHAR(10).
     Nvarchar(Option<CharacterLength>),
+    /// MySQL national fixed-length character type, e.g. NCHAR(10).
+    Nchar(Option<CharacterLength>),
     /// Uuid type.
     Uuid,
     /// Large character object with optional length,
@@ -453,8 +456,14 @@ pub enum DataType {
     Nested(Vec<ColumnDef>),
     /// Enum type.
     Enum(Vec<EnumMember>, Option<u8>),
+    /// Actual byte members with their admitted MySQL character domain.
+    MySqlEnum(Vec<super::MySqlText>),
     /// Set type.
     Set(Vec<String>),
+    /// Native MySQL SET members retaining admitted byte semantics and individual
+    /// charset/introducer facts. Member binding and field-domain policy belong
+    /// to the consumer; generic decoded SET remains [`Self::Set`].
+    MySqlSet(Vec<super::MySqlText>),
     /// Struct type, see [Hive], [BigQuery].
     ///
     /// [Hive]: https://docs.cloudera.com/cdw-runtime/cloud/impala-sql-reference/topics/impala-struct.html
@@ -509,6 +518,7 @@ impl fmt::Display for DataType {
             DataType::CharVarying(size) => format_character_string_type(f, "CHAR VARYING", size),
             DataType::Varchar(size) => format_character_string_type(f, "VARCHAR", size),
             DataType::Nvarchar(size) => format_character_string_type(f, "NVARCHAR", size),
+            DataType::Nchar(size) => format_character_string_type(f, "NCHAR", size),
             DataType::Uuid => write!(f, "UUID"),
             DataType::CharacterLargeObject(size) => {
                 format_type_with_optional_length(f, "CHARACTER LARGE OBJECT", size, false)
@@ -726,6 +736,20 @@ impl fmt::Display for DataType {
                 } else {
                     write!(f, "{}({})", ty, modifiers.join(", "))
                 }
+            }
+            DataType::MySqlEnum(vals) | DataType::MySqlSet(vals) => {
+                f.write_str(if matches!(self, DataType::MySqlEnum(_)) {
+                    "ENUM("
+                } else {
+                    "SET("
+                })?;
+                for (i, value) in vals.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    value.fmt(f)?;
+                }
+                f.write_str(")")
             }
             DataType::Enum(vals, bits) => {
                 match bits {

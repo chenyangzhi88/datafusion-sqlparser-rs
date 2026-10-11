@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::{
-    ClusteredBy, ColumnDef, CommentDef, CreateTable, CreateTableLikeKind, CreateTableOptions,
-    DistStyle, Expr, FileFormat, ForValues, HiveDistributionStyle, HiveFormat, Ident,
-    InitializeKind, ObjectName, OnCommit, OneOrManyWithParens, Query, RefreshModeKind,
-    RowAccessPolicy, Statement, StorageLifecyclePolicy, StorageSerializationPolicy,
+    ClusteredBy, ColumnDef, CommentDef, CreateTable, CreateTableElement, CreateTableLikeKind,
+    CreateTableOptions, DistStyle, Expr, FileFormat, ForValues, HiveDistributionStyle, HiveFormat,
+    Ident, InitializeKind, ObjectName, OnCommit, OneOrManyWithParens, Query, RefreshModeKind,
+    RowAccessPolicy, SqlOption, Statement, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableConstraint, TableVersion, Tag, WrappedCollection,
 };
 
@@ -91,6 +91,8 @@ pub struct CreateTableBuilder {
     pub columns: Vec<ColumnDef>,
     /// Table-level constraints.
     pub constraints: Vec<TableConstraint>,
+    /// Source-ordered parenthesized definition items.
+    pub elements: Vec<CreateTableElement>,
     /// Hive distribution style.
     pub hive_distribution: HiveDistributionStyle,
     /// Optional Hive format settings.
@@ -121,6 +123,8 @@ pub struct CreateTableBuilder {
     pub order_by: Option<OneOrManyWithParens<Expr>>,
     /// Optional `PARTITION BY` expression.
     pub partition_by: Option<Box<Expr>>,
+    /// MySQL's complete typed partition declaration.
+    pub mysql_partitioning: Option<crate::ast::MySqlPartitionBy>,
     /// Optional `CLUSTER BY` expressions.
     pub cluster_by: Option<WrappedCollection<Vec<Expr>>>,
     /// Optional `CLUSTERED BY` clause.
@@ -202,6 +206,7 @@ impl CreateTableBuilder {
             name,
             columns: vec![],
             constraints: vec![],
+            elements: vec![],
             hive_distribution: HiveDistributionStyle::NONE,
             hive_formats: None,
             file_format: None,
@@ -217,6 +222,7 @@ impl CreateTableBuilder {
             primary_key: None,
             order_by: None,
             partition_by: None,
+            mysql_partitioning: None,
             cluster_by: None,
             clustered_by: None,
             inherits: None,
@@ -310,6 +316,11 @@ impl CreateTableBuilder {
         self.constraints = constraints;
         self
     }
+    /// Set source-ordered parenthesized definition items.
+    pub fn elements(mut self, elements: Vec<CreateTableElement>) -> Self {
+        self.elements = elements;
+        self
+    }
     /// Set Hive distribution style.
     pub fn hive_distribution(mut self, hive_distribution: HiveDistributionStyle) -> Self {
         self.hive_distribution = hive_distribution;
@@ -384,6 +395,14 @@ impl CreateTableBuilder {
     /// Set `PARTITION BY` expression.
     pub fn partition_by(mut self, partition_by: Option<Box<Expr>>) -> Self {
         self.partition_by = partition_by;
+        self
+    }
+    /// Set the one MySQL partition declaration issued by the native grammar.
+    pub fn mysql_partitioning(
+        mut self,
+        partitioning: Option<crate::ast::MySqlPartitionBy>,
+    ) -> Self {
+        self.mysql_partitioning = partitioning;
         self
     }
     /// Set `CLUSTER BY` expression(s).
@@ -557,7 +576,31 @@ impl CreateTableBuilder {
         self
     }
     /// Consume the builder and produce a `CreateTable`.
-    pub fn build(self) -> CreateTable {
+    pub fn build(mut self) -> CreateTable {
+        // A plain COMMENT is the same table semantic value, not a second
+        // option-side authority. Move each clause in source order; native
+        // MySQL permits repeats and the last clause wins.
+        if let CreateTableOptions::Plain(options) = &mut self.table_options {
+            if let Some(last) = options
+                .iter()
+                .rposition(|option| matches!(option, SqlOption::Comment(_)))
+            {
+                if let SqlOption::Comment(comment) = options.remove(last) {
+                    self.comment = Some(comment);
+                }
+                // One removal plus stable retention is linear even for a
+                // packet with many repeated clauses; no mirror option vector.
+                options.retain(|option| !matches!(option, SqlOption::Comment(_)));
+            }
+        }
+        let elements = if self.elements.is_empty() {
+            (0..self.columns.len())
+                .map(CreateTableElement::Column)
+                .chain((0..self.constraints.len()).map(CreateTableElement::Constraint))
+                .collect()
+        } else {
+            self.elements
+        };
         CreateTable {
             or_replace: self.or_replace,
             temporary: self.temporary,
@@ -572,6 +615,7 @@ impl CreateTableBuilder {
             name: self.name,
             columns: self.columns,
             constraints: self.constraints,
+            elements,
             hive_distribution: self.hive_distribution,
             hive_formats: self.hive_formats,
             file_format: self.file_format,
@@ -587,6 +631,7 @@ impl CreateTableBuilder {
             primary_key: self.primary_key,
             order_by: self.order_by,
             partition_by: self.partition_by,
+            mysql_partitioning: self.mysql_partitioning,
             cluster_by: self.cluster_by,
             clustered_by: self.clustered_by,
             inherits: self.inherits,
@@ -653,6 +698,7 @@ impl From<CreateTable> for CreateTableBuilder {
             name: table.name,
             columns: table.columns,
             constraints: table.constraints,
+            elements: table.elements,
             hive_distribution: table.hive_distribution,
             hive_formats: table.hive_formats,
             file_format: table.file_format,
@@ -668,6 +714,7 @@ impl From<CreateTable> for CreateTableBuilder {
             primary_key: table.primary_key,
             order_by: table.order_by,
             partition_by: table.partition_by,
+            mysql_partitioning: table.mysql_partitioning,
             cluster_by: table.cluster_by,
             clustered_by: table.clustered_by,
             inherits: table.inherits,
@@ -713,34 +760,5 @@ pub(crate) struct CreateTableConfiguration {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::ast::helpers::stmt_create_table::CreateTableBuilder;
-    use crate::ast::{Ident, ObjectName, Statement};
-    use crate::parser::ParserError;
-
-    #[test]
-    pub fn test_from_valid_statement() {
-        let builder = CreateTableBuilder::new(ObjectName::from(vec![Ident::new("table_name")]));
-
-        let create_table = builder.clone().build();
-        let stmt: Statement = create_table.into();
-
-        assert_eq!(builder, CreateTableBuilder::try_from(stmt).unwrap());
-    }
-
-    #[test]
-    pub fn test_from_invalid_statement() {
-        let stmt = Statement::Commit {
-            chain: false,
-            end: false,
-            modifier: None,
-        };
-
-        assert_eq!(
-            CreateTableBuilder::try_from(stmt).unwrap_err(),
-            ParserError::ParserError(
-                "Expected create table statement, but received: COMMIT".to_owned()
-            )
-        );
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;

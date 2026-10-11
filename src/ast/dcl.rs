@@ -354,42 +354,46 @@ impl fmt::Display for CreateRole {
         write!(
             f,
             "CREATE ROLE {if_not_exists}{names}{superuser}{create_db}{create_role}{inherit}{login}{replication}{bypassrls}",
-            if_not_exists = if self.if_not_exists { "IF NOT EXISTS " } else { "" },
+            if_not_exists = if self.if_not_exists {
+                "IF NOT EXISTS "
+            } else {
+                ""
+            },
             names = display_separated(&self.names, ", "),
             superuser = match self.superuser {
                 Some(true) => " SUPERUSER",
                 Some(false) => " NOSUPERUSER",
-                None => ""
+                None => "",
             },
             create_db = match self.create_db {
                 Some(true) => " CREATEDB",
                 Some(false) => " NOCREATEDB",
-                None => ""
+                None => "",
             },
             create_role = match self.create_role {
                 Some(true) => " CREATEROLE",
                 Some(false) => " NOCREATEROLE",
-                None => ""
+                None => "",
             },
             inherit = match self.inherit {
                 Some(true) => " INHERIT",
                 Some(false) => " NOINHERIT",
-                None => ""
+                None => "",
             },
             login = match self.login {
                 Some(true) => " LOGIN",
                 Some(false) => " NOLOGIN",
-                None => ""
+                None => "",
             },
             replication = match self.replication {
                 Some(true) => " REPLICATION",
                 Some(false) => " NOREPLICATION",
-                None => ""
+                None => "",
             },
             bypassrls = match self.bypassrls {
                 Some(true) => " BYPASSRLS",
                 Some(false) => " NOBYPASSRLS",
-                None => ""
+                None => "",
             }
         )?;
         if let Some(limit) = &self.connection_limit {
@@ -494,6 +498,13 @@ pub struct Revoke {
     pub privileges: Privileges,
     /// Optional objects from which to revoke.
     pub objects: Option<GrantObjects>,
+    /// MySQL's independent `ALL [PRIVILEGES], GRANT OPTION` form.
+    /// This is not a per-object GRANT OPTION privilege.
+    pub revoke_all_grant_option: bool,
+    /// MySQL's `REVOKE IF EXISTS` grammar modifier.
+    pub if_exists: bool,
+    /// MySQL's trailing `IGNORE UNKNOWN USER` modifier.
+    pub ignore_unknown_user: bool,
     /// Grantees affected by the revoke.
     pub grantees: Vec<Grantee>,
     /// Optional `GRANTED BY` identifier.
@@ -506,7 +517,14 @@ pub struct Revoke {
 
 impl fmt::Display for Revoke {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "REVOKE {privileges}", privileges = self.privileges)?;
+        write!(f, "REVOKE ")?;
+        if self.if_exists {
+            write!(f, "IF EXISTS ")?;
+        }
+        write!(f, "{}", self.privileges)?;
+        if self.revoke_all_grant_option {
+            write!(f, ", GRANT OPTION")?;
+        }
         if let Some(ref objects) = self.objects {
             write!(f, " ON {objects}")?;
         }
@@ -516,6 +534,9 @@ impl fmt::Display for Revoke {
         }
         if let Some(ref cascade) = self.cascade {
             write!(f, " {cascade}")?;
+        }
+        if self.ignore_unknown_user {
+            write!(f, " IGNORE UNKNOWN USER")?;
         }
         Ok(())
     }

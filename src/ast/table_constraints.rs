@@ -18,9 +18,9 @@
 //! SQL Abstract Syntax Tree (AST) types for table constraints
 
 use crate::ast::{
-    display_comma_separated, display_separated, ConstraintCharacteristics,
-    ConstraintReferenceMatchKind, Expr, Ident, IndexColumn, IndexOption, IndexType,
-    KeyOrIndexDisplay, NullsDistinctOption, ObjectName, ReferentialAction,
+    ConstraintCharacteristics, ConstraintReferenceMatchKind, Expr, Ident, IndexColumn, IndexOption,
+    IndexType, KeyOrIndexDisplay, NullsDistinctOption, ObjectName, ReferentialAction,
+    display_comma_separated, display_separated,
 };
 use crate::tokenizer::Span;
 use core::fmt;
@@ -80,6 +80,9 @@ pub enum TableConstraint {
     ForeignKey(ForeignKeyConstraint),
     /// `[ CONSTRAINT <name> ] CHECK (<expr>) [[NOT] ENFORCED]`
     Check(CheckConstraint),
+    /// PostgreSQL `EXCLUDE [ USING method ] (key WITH operator [, ...])`
+    /// with its own index and deferral characteristics.
+    Exclude(ExcludeConstraint),
     /// MySQLs [index definition][1] for index creation. Not present on ANSI so, for now, the usage
     /// is restricted to MySQL, as no other dialects that support this syntax were found.
     ///
@@ -162,11 +165,90 @@ impl fmt::Display for TableConstraint {
             TableConstraint::PrimaryKey(constraint) => constraint.fmt(f),
             TableConstraint::ForeignKey(constraint) => constraint.fmt(f),
             TableConstraint::Check(constraint) => constraint.fmt(f),
+            TableConstraint::Exclude(constraint) => constraint.fmt(f),
             TableConstraint::Index(constraint) => constraint.fmt(f),
             TableConstraint::FulltextOrSpatial(constraint) => constraint.fmt(f),
             TableConstraint::PrimaryKeyUsingIndex(c) => c.fmt_with_keyword(f, "PRIMARY KEY"),
             TableConstraint::UniqueUsingIndex(c) => c.fmt_with_keyword(f, "UNIQUE"),
         }
+    }
+}
+
+/// One PostgreSQL exclusion-index key and its exact SQL operator name.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ExcludeConstraintElement {
+    /// Indexed column or expression, COLLATE and operator class included.
+    pub key: IndexColumn,
+    /// Operator applied to the pair of indexed key values.
+    pub operator: ObjectName,
+}
+
+impl fmt::Display for ExcludeConstraintElement {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} WITH {}", self.key, self.operator)
+    }
+}
+
+/// PostgreSQL table-level exclusion constraint.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ExcludeConstraint {
+    /// Optional constraint and generated index name.
+    pub name: Option<Ident>,
+    /// Optional index access method; PostgreSQL defaults to B-tree.
+    pub using: Option<IndexType>,
+    /// Ordered indexed expressions and exclusion operators.
+    pub elements: Vec<ExcludeConstraintElement>,
+    /// Non-key columns stored in the SQL-visible index.
+    pub include: Vec<Ident>,
+    /// Index storage parameters following `WITH (...)`.
+    pub with: Vec<Expr>,
+    /// Index tablespace specified by the constraint.
+    pub tablespace: Option<Ident>,
+    /// Optional partial-index predicate.
+    pub predicate: Option<Box<Expr>>,
+    /// Optional DEFERRABLE / INITIALLY clause.
+    pub characteristics: Option<ConstraintCharacteristics>,
+}
+
+impl fmt::Display for ExcludeConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use crate::ast::ddl::display_constraint_name;
+        write!(f, "{}EXCLUDE", display_constraint_name(&self.name))?;
+        if let Some(using) = &self.using {
+            write!(f, " USING {using}")?;
+        }
+        write!(f, " ({})", display_comma_separated(&self.elements))?;
+        if !self.include.is_empty() {
+            write!(f, " INCLUDE ({})", display_comma_separated(&self.include))?;
+        }
+        if !self.with.is_empty() {
+            write!(f, " WITH ({})", display_comma_separated(&self.with))?;
+        }
+        if let Some(tablespace) = &self.tablespace {
+            write!(f, " USING INDEX TABLESPACE {tablespace}")?;
+        }
+        if let Some(predicate) = &self.predicate {
+            write!(f, " WHERE ({predicate})")?;
+        }
+        if let Some(characteristics) = &self.characteristics {
+            write!(f, " {characteristics}")?;
+        }
+        Ok(())
+    }
+}
+
+impl crate::ast::Spanned for ExcludeConstraint {
+    fn span(&self) -> Span {
+        Span::union_iter(
+            self.name
+                .iter()
+                .map(|name| name.span)
+                .chain(self.elements.iter().map(|element| element.key.span())),
+        )
     }
 }
 
@@ -315,6 +397,8 @@ pub struct FullTextOrSpatialConstraint {
     pub opt_index_name: Option<Ident>,
     /// Referred column identifier list.
     pub columns: Vec<IndexColumn>,
+    /// MySQL parser, comment and visibility options.
+    pub index_options: Vec<IndexOption>,
 }
 
 impl fmt::Display for FullTextOrSpatialConstraint {
@@ -332,6 +416,10 @@ impl fmt::Display for FullTextOrSpatialConstraint {
         }
 
         write!(f, " ({})", display_comma_separated(&self.columns))?;
+
+        if !self.index_options.is_empty() {
+            write!(f, " {}", display_separated(&self.index_options, " "))?;
+        }
 
         Ok(())
     }
