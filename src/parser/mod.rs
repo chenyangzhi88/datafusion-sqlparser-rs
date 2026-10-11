@@ -21734,121 +21734,7 @@ impl<'a> Parser<'a> {
             let alias = self.maybe_parse_table_alias()?;
             Ok(TableFactor::TableFunction { expr, alias })
         } else if self.consume_token(&Token::LParen) {
-            // A left paren introduces either a derived table (i.e., a subquery)
-            // or a nested join. It's nearly impossible to determine ahead of
-            // time which it is... so we just try to parse both.
-            //
-            // Here's an example that demonstrates the complexity:
-            //                     /-------------------------------------------------------\
-            //                     | /-----------------------------------\                 |
-            //     SELECT * FROM ( ( ( (SELECT 1) UNION (SELECT 2) ) AS t1 NATURAL JOIN t2 ) )
-            //                   ^ ^ ^ ^
-            //                   | | | |
-            //                   | | | |
-            //                   | | | (4) belongs to a SetExpr::Query inside the subquery
-            //                   | | (3) starts a derived table (subquery)
-            //                   | (2) starts a nested join
-            //                   (1) an additional set of parens around a nested join
-            //
-
-            // If the recently consumed '(' starts a derived table, the call to
-            // `parse_derived_table_factor` below will return success after parsing the
-            // subquery, followed by the closing ')', and the alias of the derived table.
-            // In the example above this is case (3).
-            if let Some(mut table) =
-                self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))?
-            {
-                while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT])
-                {
-                    table = match kw {
-                        Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
-                        Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                        unexpected_keyword => {
-                            return Err(ParserError::ParserError(format!(
-                                "Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"
-                            )));
-                        }
-                    }
-                }
-                return Ok(table);
-            }
-
-            // A parsing error from `parse_derived_table_factor` indicates that the '(' we've
-            // recently consumed does not start a derived table (cases 1, 2, or 4).
-            // `maybe_parse` will ignore such an error and rewind to be after the opening '('.
-
-            // Inside the parentheses we expect to find an (A) table factor
-            // followed by some joins or (B) another level of nesting.
-            let mut table_and_joins = self.parse_table_and_joins()?;
-
-            #[allow(clippy::if_same_then_else)]
-            if !table_and_joins.joins.is_empty() {
-                self.expect_token(&Token::RParen)?;
-                let alias = self.maybe_parse_table_alias()?;
-                Ok(TableFactor::NestedJoin {
-                    table_with_joins: Box::new(table_and_joins),
-                    alias,
-                }) // (A)
-            } else if let TableFactor::NestedJoin {
-                table_with_joins: _,
-                alias: _,
-            } = &table_and_joins.relation
-            {
-                // (B): `table_and_joins` (what we found inside the parentheses)
-                // is a nested join `(foo JOIN bar)`, not followed by other joins.
-                self.expect_token(&Token::RParen)?;
-                let alias = self.maybe_parse_table_alias()?;
-                Ok(TableFactor::NestedJoin {
-                    table_with_joins: Box::new(table_and_joins),
-                    alias,
-                })
-            } else if self.dialect.supports_parens_around_table_factor() {
-                // Dialect-specific behavior: Snowflake diverges from the
-                // standard and from most of the other implementations by
-                // allowing extra parentheses not only around a join (B), but
-                // around lone table names (e.g. `FROM (mytable [AS alias])`)
-                // and around derived tables (e.g. `FROM ((SELECT ...)
-                // [AS alias])`) as well.
-                self.expect_token(&Token::RParen)?;
-
-                if let Some(outer_alias) = self.maybe_parse_table_alias()? {
-                    // Snowflake also allows specifying an alias *after* parens
-                    // e.g. `FROM (mytable) AS alias`
-                    match &mut table_and_joins.relation {
-                        TableFactor::Derived { alias, .. }
-                        | TableFactor::Table { alias, .. }
-                        | TableFactor::Function { alias, .. }
-                        | TableFactor::RowsFrom { alias, .. }
-                        | TableFactor::UNNEST { alias, .. }
-                        | TableFactor::JsonTable { alias, .. }
-                        | TableFactor::XmlTable { alias, .. }
-                        | TableFactor::OpenJsonTable { alias, .. }
-                        | TableFactor::TableFunction { alias, .. }
-                        | TableFactor::Pivot { alias, .. }
-                        | TableFactor::Unpivot { alias, .. }
-                        | TableFactor::MatchRecognize { alias, .. }
-                        | TableFactor::SemanticView { alias, .. }
-                        | TableFactor::NestedJoin { alias, .. } => {
-                            // but not `FROM (mytable AS alias1) AS alias2`.
-                            if let Some(inner_alias) = alias {
-                                return Err(ParserError::ParserError(format!(
-                                    "duplicate alias {inner_alias}"
-                                )));
-                            }
-                            // Act as if the alias was specified normally next
-                            // to the table name: `(mytable) AS alias` ->
-                            // `(mytable AS alias)`
-                            alias.replace(outer_alias);
-                        }
-                    };
-                }
-                // Do not store the extra set of parens in the AST
-                Ok(table_and_joins.relation)
-            } else {
-                // The SQL spec prohibits derived tables and bare tables from
-                // appearing alone in parentheses (e.g. `FROM (mytable)`)
-                self.expected_ref("joined table", self.peek_token_ref())
-            }
+            self.parse_parenthesized_table_factor()
         } else if self.dialect.supports_values_as_table_factor()
             && matches!(
                 self.peek_tokens(),
@@ -21861,31 +21747,7 @@ impl<'a> Parser<'a> {
                 ]
             )
         {
-            self.expect_keyword_is(Keyword::VALUES)?;
-
-            // Snowflake and Databricks allow syntax like below:
-            // SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t (col1, col2)
-            // where there are no parentheses around the VALUES clause.
-            let values = SetExpr::Values(self.parse_values(false, false)?);
-            let alias = self.maybe_parse_table_alias()?;
-            Ok(TableFactor::Derived {
-                origin: DerivedTableOrigin::Source,
-                lateral: false,
-                subquery: Box::new(Query {
-                    with: None,
-                    body: Box::new(values),
-                    order_by: None,
-                    limit_clause: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                }),
-                alias,
-                sample: None,
-            })
+            self.parse_values_table_factor()
         } else if dialect_of!(self is PostgreSqlDialect | GenericDialect)
             && self.parse_keywords(&[Keyword::ROWS, Keyword::FROM])
         {
@@ -21971,95 +21833,35 @@ impl<'a> Parser<'a> {
             // Stage reference: @mystage or @namespace.stage (e.g. Snowflake)
             self.parse_snowflake_stage_table_factor()
         } else {
-            let name = self.parse_object_name(true)?;
-            // PostgreSQL's qualified_name * explicitly requests the same
-            // descendant relation set as the plain relation's default.
-            let descendants =
-                dialect_of!(self is PostgreSqlDialect) && self.consume_token(&Token::Mul);
-            if descendants && self.peek_token_ref().token == Token::LParen {
-                return self.expected_ref("a relation alias after *", self.peek_token_ref());
-            }
+            self.parse_named_table_factor()
+        }
+    }
 
-            let json_path = match &self.peek_token_ref().token {
-                Token::LBracket if self.dialect.supports_partiql() => Some(self.parse_json_path()?),
-                _ => None,
-            };
+    fn parse_parenthesized_table_factor(&mut self) -> Result<TableFactor, ParserError> {
+        // A left paren introduces either a derived table (i.e., a subquery)
+        // or a nested join. It's nearly impossible to determine ahead of
+        // time which it is... so we just try to parse both.
+        //
+        // Here's an example that demonstrates the complexity:
+        //                     /-------------------------------------------------------\
+        //                     | /-----------------------------------\                 |
+        //     SELECT * FROM ( ( ( (SELECT 1) UNION (SELECT 2) ) AS t1 NATURAL JOIN t2 ) )
+        //                   ^ ^ ^ ^
+        //                   | | | |
+        //                   | | | |
+        //                   | | | (4) belongs to a SetExpr::Query inside the subquery
+        //                   | | (3) starts a derived table (subquery)
+        //                   | (2) starts a nested join
+        //                   (1) an additional set of parens around a nested join
+        //
 
-            let partitions: Vec<Ident> = if dialect_of!(self is MySqlDialect | GenericDialect)
-                && self.parse_keyword(Keyword::PARTITION)
-            {
-                let partitions = self.parse_parenthesized_identifiers()?;
-                if partitions.is_empty() {
-                    return parser_err!(
-                        "PARTITION selection requires at least one partition",
-                        self.peek_token_ref().span.start
-                    );
-                }
-                partitions
-            } else {
-                vec![]
-            };
-
-            // Parse potential version qualifier
-            let version = self.maybe_parse_table_version()?;
-
-            // Postgres, MSSQL, ClickHouse: table-valued functions:
-            let args = if self.consume_token(&Token::LParen) {
-                Some(self.parse_table_function_args()?)
-            } else {
-                None
-            };
-
-            let with_ordinality = self.parse_keywords(&[Keyword::WITH, Keyword::ORDINALITY]);
-
-            let mut sample = None;
-            if self.dialect.supports_table_sample_before_alias() {
-                if let Some(parsed_sample) = self.maybe_parse_table_sample()? {
-                    sample = Some(TableSampleKind::BeforeTableAlias(parsed_sample));
-                }
-            }
-
-            let alias = self.maybe_parse_table_alias()?;
-
-            // MYSQL-specific table hints:
-            let index_hints = if self.dialect.supports_table_hints() {
-                self.maybe_parse(|p| p.parse_table_index_hints())?
-                    .unwrap_or(vec![])
-            } else {
-                vec![]
-            };
-
-            // MSSQL-specific table hints:
-            let mut with_hints = vec![];
-            if self.parse_keyword(Keyword::WITH) {
-                if self.consume_token(&Token::LParen) {
-                    with_hints = self.parse_comma_separated(Parser::parse_expr)?;
-                    self.expect_token(&Token::RParen)?;
-                } else {
-                    // rewind, as WITH may belong to the next statement's CTE
-                    self.prev_token();
-                }
-            };
-
-            if !self.dialect.supports_table_sample_before_alias() {
-                if let Some(parsed_sample) = self.maybe_parse_table_sample()? {
-                    sample = Some(TableSampleKind::AfterTableAlias(parsed_sample));
-                }
-            }
-
-            let mut table = TableFactor::Table {
-                name,
-                alias,
-                args,
-                with_hints,
-                version,
-                partitions,
-                with_ordinality,
-                json_path,
-                sample,
-                index_hints,
-            };
-
+        // If the recently consumed '(' starts a derived table, the call to
+        // `parse_derived_table_factor` below will return success after parsing the
+        // subquery, followed by the closing ')', and the alias of the derived table.
+        // In the example above this is case (3).
+        if let Some(mut table) =
+            self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))?
+        {
             while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT]) {
                 table = match kw {
                     Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
@@ -22071,15 +21873,221 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-
-            if self.dialect.supports_match_recognize()
-                && self.parse_keyword(Keyword::MATCH_RECOGNIZE)
-            {
-                table = self.parse_match_recognize(table)?;
-            }
-
-            Ok(table)
+            return Ok(table);
         }
+
+        // A parsing error from `parse_derived_table_factor` indicates that the '(' we've
+        // recently consumed does not start a derived table (cases 1, 2, or 4).
+        // `maybe_parse` will ignore such an error and rewind to be after the opening '('.
+
+        // Inside the parentheses we expect to find an (A) table factor
+        // followed by some joins or (B) another level of nesting.
+        let mut table_and_joins = self.parse_table_and_joins()?;
+
+        #[allow(clippy::if_same_then_else)]
+        if !table_and_joins.joins.is_empty() {
+            self.expect_token(&Token::RParen)?;
+            let alias = self.maybe_parse_table_alias()?;
+            Ok(TableFactor::NestedJoin {
+                table_with_joins: Box::new(table_and_joins),
+                alias,
+            }) // (A)
+        } else if let TableFactor::NestedJoin {
+            table_with_joins: _,
+            alias: _,
+        } = &table_and_joins.relation
+        {
+            // (B): `table_and_joins` (what we found inside the parentheses)
+            // is a nested join `(foo JOIN bar)`, not followed by other joins.
+            self.expect_token(&Token::RParen)?;
+            let alias = self.maybe_parse_table_alias()?;
+            Ok(TableFactor::NestedJoin {
+                table_with_joins: Box::new(table_and_joins),
+                alias,
+            })
+        } else if self.dialect.supports_parens_around_table_factor() {
+            // Dialect-specific behavior: Snowflake diverges from the
+            // standard and from most of the other implementations by
+            // allowing extra parentheses not only around a join (B), but
+            // around lone table names (e.g. `FROM (mytable [AS alias])`)
+            // and around derived tables (e.g. `FROM ((SELECT ...)
+            // [AS alias])`) as well.
+            self.expect_token(&Token::RParen)?;
+
+            if let Some(outer_alias) = self.maybe_parse_table_alias()? {
+                // Snowflake also allows specifying an alias *after* parens
+                // e.g. `FROM (mytable) AS alias`
+                match &mut table_and_joins.relation {
+                    TableFactor::Derived { alias, .. }
+                    | TableFactor::Table { alias, .. }
+                    | TableFactor::Function { alias, .. }
+                    | TableFactor::RowsFrom { alias, .. }
+                    | TableFactor::UNNEST { alias, .. }
+                    | TableFactor::JsonTable { alias, .. }
+                    | TableFactor::XmlTable { alias, .. }
+                    | TableFactor::OpenJsonTable { alias, .. }
+                    | TableFactor::TableFunction { alias, .. }
+                    | TableFactor::Pivot { alias, .. }
+                    | TableFactor::Unpivot { alias, .. }
+                    | TableFactor::MatchRecognize { alias, .. }
+                    | TableFactor::SemanticView { alias, .. }
+                    | TableFactor::NestedJoin { alias, .. } => {
+                        // but not `FROM (mytable AS alias1) AS alias2`.
+                        if let Some(inner_alias) = alias {
+                            return Err(ParserError::ParserError(format!(
+                                "duplicate alias {inner_alias}"
+                            )));
+                        }
+                        // Act as if the alias was specified normally next
+                        // to the table name: `(mytable) AS alias` ->
+                        // `(mytable AS alias)`
+                        alias.replace(outer_alias);
+                    }
+                };
+            }
+            // Do not store the extra set of parens in the AST
+            Ok(table_and_joins.relation)
+        } else {
+            // The SQL spec prohibits derived tables and bare tables from
+            // appearing alone in parentheses (e.g. `FROM (mytable)`)
+            self.expected_ref("joined table", self.peek_token_ref())
+        }
+    }
+
+    fn parse_values_table_factor(&mut self) -> Result<TableFactor, ParserError> {
+        self.expect_keyword_is(Keyword::VALUES)?;
+
+        // Snowflake and Databricks allow syntax like below:
+        // SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t (col1, col2)
+        // where there are no parentheses around the VALUES clause.
+        let values = SetExpr::Values(self.parse_values(false, false)?);
+        let alias = self.maybe_parse_table_alias()?;
+        Ok(TableFactor::Derived {
+            origin: DerivedTableOrigin::Source,
+            lateral: false,
+            subquery: Box::new(Query {
+                with: None,
+                body: Box::new(values),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            }),
+            alias,
+            sample: None,
+        })
+    }
+
+    fn parse_named_table_factor(&mut self) -> Result<TableFactor, ParserError> {
+        let name = self.parse_object_name(true)?;
+        // PostgreSQL's qualified_name * explicitly requests the same
+        // descendant relation set as the plain relation's default.
+        let descendants = dialect_of!(self is PostgreSqlDialect) && self.consume_token(&Token::Mul);
+        if descendants && self.peek_token_ref().token == Token::LParen {
+            return self.expected_ref("a relation alias after *", self.peek_token_ref());
+        }
+
+        let json_path = match &self.peek_token_ref().token {
+            Token::LBracket if self.dialect.supports_partiql() => Some(self.parse_json_path()?),
+            _ => None,
+        };
+
+        let partitions: Vec<Ident> = if dialect_of!(self is MySqlDialect | GenericDialect)
+            && self.parse_keyword(Keyword::PARTITION)
+        {
+            let partitions = self.parse_parenthesized_identifiers()?;
+            if partitions.is_empty() {
+                return parser_err!(
+                    "PARTITION selection requires at least one partition",
+                    self.peek_token_ref().span.start
+                );
+            }
+            partitions
+        } else {
+            vec![]
+        };
+
+        // Parse potential version qualifier
+        let version = self.maybe_parse_table_version()?;
+
+        // Postgres, MSSQL, ClickHouse: table-valued functions:
+        let args = if self.consume_token(&Token::LParen) {
+            Some(self.parse_table_function_args()?)
+        } else {
+            None
+        };
+
+        let with_ordinality = self.parse_keywords(&[Keyword::WITH, Keyword::ORDINALITY]);
+
+        let mut sample = None;
+        if self.dialect.supports_table_sample_before_alias() {
+            if let Some(parsed_sample) = self.maybe_parse_table_sample()? {
+                sample = Some(TableSampleKind::BeforeTableAlias(parsed_sample));
+            }
+        }
+
+        let alias = self.maybe_parse_table_alias()?;
+
+        // MYSQL-specific table hints:
+        let index_hints = if self.dialect.supports_table_hints() {
+            self.maybe_parse(|p| p.parse_table_index_hints())?
+                .unwrap_or(vec![])
+        } else {
+            vec![]
+        };
+
+        // MSSQL-specific table hints:
+        let mut with_hints = vec![];
+        if self.parse_keyword(Keyword::WITH) {
+            if self.consume_token(&Token::LParen) {
+                with_hints = self.parse_comma_separated(Parser::parse_expr)?;
+                self.expect_token(&Token::RParen)?;
+            } else {
+                // rewind, as WITH may belong to the next statement's CTE
+                self.prev_token();
+            }
+        };
+
+        if !self.dialect.supports_table_sample_before_alias() {
+            if let Some(parsed_sample) = self.maybe_parse_table_sample()? {
+                sample = Some(TableSampleKind::AfterTableAlias(parsed_sample));
+            }
+        }
+
+        let mut table = TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            partitions,
+            with_ordinality,
+            json_path,
+            sample,
+            index_hints,
+        };
+
+        while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT]) {
+            table = match kw {
+                Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
+                Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
+                unexpected_keyword => {
+                    return Err(ParserError::ParserError(format!(
+                        "Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"
+                    )));
+                }
+            }
+        }
+
+        if self.dialect.supports_match_recognize() && self.parse_keyword(Keyword::MATCH_RECOGNIZE) {
+            table = self.parse_match_recognize(table)?;
+        }
+
+        Ok(table)
     }
 
     fn parse_rows_from_item(&mut self) -> Result<RowsFromItem, ParserError> {
