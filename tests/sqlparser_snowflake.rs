@@ -566,20 +566,19 @@ fn test_snowflake_create_table_comment() {
     match snowflake().verified_stmt("CREATE TABLE my_table (a INT) COMMENT = 'some comment'") {
         Statement::CreateTable(CreateTable {
             name,
+            comment,
             table_options,
             ..
         }) => {
             assert_eq!("my_table", name.to_string());
-            let plain_options = match table_options {
-                CreateTableOptions::Plain(options) => options,
+            assert_eq!(
+                comment,
+                Some(CommentDef::WithEq("some comment".to_string()))
+            );
+            match table_options {
+                CreateTableOptions::Plain(options) => assert!(options.is_empty()),
                 _ => unreachable!(),
-            };
-            let comment = match plain_options.first().unwrap() {
-                SqlOption::Comment(CommentDef::WithEq(c))
-                | SqlOption::Comment(CommentDef::WithoutEq(c)) => c,
-                _ => unreachable!(),
-            };
-            assert_eq!("some comment", comment);
+            }
         }
         _ => unreachable!(),
     }

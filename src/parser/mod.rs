@@ -2030,7 +2030,8 @@ impl<'a> Parser<'a> {
     ///
     /// See [Statement::Comment]
     pub fn parse_comment(&mut self) -> Result<Statement, ParserError> {
-        let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let if_exists = !dialect_of!(self is PostgreSqlDialect)
+            && self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
 
         self.expect_keyword_is(Keyword::ON)?;
         let token = self.next_token();
@@ -2110,7 +2111,9 @@ impl<'a> Parser<'a> {
         } else if matches!(
             object_type,
             CommentObject::Function | CommentObject::Procedure
-        ) {
+        ) && (!dialect_of!(self is PostgreSqlDialect)
+            || self.peek_token_ref().token == Token::LParen)
+        {
             self.expect_token(&Token::LParen)?;
             let arguments = if self.consume_token(&Token::RParen) {
                 Vec::new()
@@ -2799,6 +2802,7 @@ impl<'a> Parser<'a> {
 
     /// Tries to parse an expression by matching the specified word to known keywords that have a special meaning in the dialect.
     /// Returns `None if no match is found.
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn parse_expr_prefix_by_reserved_word(
         &mut self,
         w: &Word,
@@ -3029,20 +3033,10 @@ impl<'a> Parser<'a> {
             Token::LParen
                 if dialect_of!(self is PostgreSqlDialect)
                     && w.quote_style.is_none()
-                    && w.value.eq_ignore_ascii_case("JSON_ARRAYAGG") =>
+                    && (w.value.eq_ignore_ascii_case("JSON_ARRAYAGG")
+                        || w.value.eq_ignore_ascii_case("JSON_OBJECTAGG")) =>
             {
-                // JSON_ARRAY(query)'s durable native representation contains
-                // this actual aggregate constructor, not a pg_proc alias.
-                self.expect_token(&Token::LParen)?;
-                let input = self.parse_postgres_json_input()?;
-                let null_clause = self.parse_json_null_clause();
-                let returning = self.parse_postgres_json_output()?;
-                self.expect_token(&Token::RParen)?;
-                Ok(Expr::JsonArray(JsonArrayExpr {
-                    source: JsonArraySource::Aggregate(Box::new(input)),
-                    null_clause,
-                    returning,
-                }))
+                self.parse_postgres_json_aggregate(w.value.eq_ignore_ascii_case("JSON_OBJECTAGG"))
             }
             Token::LParen
                 if dialect_of!(self is PostgreSqlDialect)
@@ -3062,10 +3056,43 @@ impl<'a> Parser<'a> {
                     Ok(object) => Ok(object),
                     Err(error) => {
                         match self.try_parse(|parser| {
-                            parser.parse_function(ObjectName::from(vec![
+                            let function = parser.parse_function(ObjectName::from(vec![
                                 Ident::new("pg_catalog"),
                                 Ident::new("json_object"),
-                            ]))
+                            ]))?;
+                            // gram.y's legacy branch is func_arg_list only.
+                            // Constructor entries/options and aggregate/window
+                            // modifiers must not survive a failed constructor.
+                            let Expr::Function(call) = &function else {
+                                unreachable!("ordinary function call")
+                            };
+                            let FunctionArguments::List(arguments) = &call.args else {
+                                return parser.expected_ref(
+                                    "legacy JSON_OBJECT expression arguments",
+                                    parser.peek_token_ref(),
+                                );
+                            };
+                            if arguments.duplicate_treatment.is_some()
+                                || !arguments.clauses.is_empty()
+                                || arguments.args.iter().any(|argument| {
+                                    !matches!(
+                                        argument,
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(_))
+                                            | FunctionArg::Named { .. }
+                                    )
+                                })
+                                || call.filter.is_some()
+                                || call.over.is_some()
+                                || call.null_treatment.is_some()
+                                || call.from_first_last.is_some()
+                                || !call.within_group.is_empty()
+                            {
+                                return parser.expected_ref(
+                                    "legacy JSON_OBJECT expression arguments",
+                                    parser.peek_token_ref(),
+                                );
+                            }
+                            Ok(function)
                         }) {
                             Ok(function) => Ok(function),
                             Err(_) => Err(error),
@@ -3080,7 +3107,47 @@ impl<'a> Parser<'a> {
             {
                 self.parse_json_value_expr()
             }
+            // These are native special expressions, not ordinary func_name
+            // productions. Retain their existing expression owner before the
+            // type_function_name check, as for CAST/EXTRACT/TRIM above.
+            Token::LParen
+                if dialect_of!(self is PostgreSqlDialect)
+                    && w.quote_style.is_none()
+                    && [
+                        "COALESCE",
+                        "GREATEST",
+                        "LEAST",
+                        "NULLIF",
+                        "NORMALIZE",
+                        "GROUPING",
+                        "ROW",
+                        "XMLCONCAT",
+                        "XMLELEMENT",
+                        "XMLEXISTS",
+                        "XMLFOREST",
+                        "XMLPARSE",
+                        "XMLPI",
+                        "XMLROOT",
+                        "XMLSERIALIZE",
+                    ]
+                    .iter()
+                    .any(|keyword| w.value.eq_ignore_ascii_case(keyword)) =>
+            {
+                self.parse_function(ObjectName::from(vec![w.to_ident(w_span)]))
+            }
             Token::LParen if !is_outer_join => {
+                if dialect_of!(self is PostgreSqlDialect)
+                    && w.quote_style.is_none()
+                    && !crate::keywords::is_postgresql_function_identifier(&w.value)
+                {
+                    return self.expected(
+                        "a function name",
+                        TokenWithSpan {
+                            token: Token::Word(w.clone()),
+                            span: w_span,
+                        },
+                    );
+                }
                 let id_parts = vec![w.to_ident(w_span)];
                 self.parse_function(ObjectName::from(id_parts))
             }
@@ -3129,6 +3196,18 @@ impl<'a> Parser<'a> {
                     syntax: LambdaSyntax::Arrow,
                 }))
             }
+            _ if dialect_of!(self is PostgreSqlDialect)
+                && w.quote_style.is_none()
+                && !crate::keywords::is_postgresql_column_identifier(&w.value) =>
+            {
+                self.expected(
+                    "an expression",
+                    TokenWithSpan {
+                        token: Token::Word(w.clone()),
+                        span: w_span,
+                    },
+                )
+            }
             _ => Ok(Expr::Identifier(w.to_ident(w_span))),
         }
     }
@@ -3170,6 +3249,60 @@ impl<'a> Parser<'a> {
         let expr = self.parse_expr()?;
         let format = self.parse_postgres_json_format()?;
         Ok(JsonInput { expr, format })
+    }
+
+    fn parse_postgres_json_aggregate(&mut self, object: bool) -> Result<Expr, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let source = if object {
+            let key = self.parse_expr()?;
+            if !self.parse_keyword(Keyword::VALUE) {
+                self.expect_token(&Token::Colon)?;
+            }
+            let value = self.parse_postgres_json_input()?;
+            JsonAggregateSource::Object(Box::new(JsonKeyValue { key, value }))
+        } else {
+            JsonAggregateSource::Array(Box::new(self.parse_postgres_json_input()?))
+        };
+        let order_by = if !object && self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
+            self.parse_comma_separated(|parser| parser.parse_order_by_expr())?
+        } else {
+            Vec::new()
+        };
+        let null_clause = self.parse_json_null_clause();
+        let unique_keys = if object {
+            self.parse_postgres_json_unique()
+        } else {
+            None
+        };
+        let returning = self.parse_postgres_json_output()?;
+        self.expect_token(&Token::RParen)?;
+        let filter = if self.parse_keyword(Keyword::FILTER) {
+            self.expect_token(&Token::LParen)?;
+            self.expect_keyword_is(Keyword::WHERE)?;
+            let expression = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            Some(Box::new(expression))
+        } else {
+            None
+        };
+        let over = if self.parse_keyword(Keyword::OVER) {
+            Some(if self.consume_token(&Token::LParen) {
+                WindowType::WindowSpec(self.parse_window_spec()?)
+            } else {
+                WindowType::NamedWindow(self.parse_identifier()?)
+            })
+        } else {
+            None
+        };
+        Ok(Expr::JsonAggregate(JsonAggregateExpr {
+            source,
+            order_by,
+            null_clause,
+            unique_keys,
+            returning,
+            filter,
+            over,
+        }))
     }
 
     fn parse_postgres_json_array(&mut self) -> Result<Expr, ParserError> {
@@ -3563,6 +3696,16 @@ impl<'a> Parser<'a> {
                     // we rollback and return the parsing error we got from trying to parse a
                     // special expression (to maintain backwards compatibility of parsing errors).
                     Err(e) => {
+                        // An unquoted native TRIM call has its own grammar.
+                        // A malformed argument list cannot become an ordinary
+                        // MySQL function call after that grammar rejects it.
+                        if dialect_is!(dialect is MySqlDialect)
+                            && w.quote_style.is_none()
+                            && w.keyword == Keyword::TRIM
+                            && self.peek_token_ref().token == Token::LParen
+                        {
+                            return Err(e);
+                        }
                         if !self.dialect.is_reserved_for_identifier(w.keyword) {
                             if let Ok(Some(expr)) = self.maybe_parse(|parser| {
                                 parser.parse_expr_prefix_by_unreserved_word(&w, span)
@@ -3609,14 +3752,17 @@ impl<'a> Parser<'a> {
                     self.dialect.prec_value(Precedence::UnaryNot)
                 })?),
             }),
-            tok @ Token::DoubleExclamationMark
-            | tok @ Token::PGSquareRoot
-            | tok @ Token::PGCubeRoot
-            | tok @ Token::AtSign
-                if dialect_is!(dialect is PostgreSqlDialect) =>
+            Token::DoubleExclamationMark if dialect_is!(dialect is PostgreSqlDialect) => {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::PGCustomUnaryOperator(vec!["!!".into()]),
+                    expr: Box::new(
+                        self.parse_subexpr(self.dialect.prec_value(Precedence::PgOther))?,
+                    ),
+                })
+            }
+            tok @ Token::PGSquareRoot | tok @ Token::PGCubeRoot | tok @ Token::AtSign if dialect_is!(dialect is PostgreSqlDialect) =>
             {
                 let op = match tok {
-                    Token::DoubleExclamationMark => UnaryOperator::PGPrefixFactorial,
                     Token::PGSquareRoot => UnaryOperator::PGSquareRoot,
                     Token::PGCubeRoot => UnaryOperator::PGCubeRoot,
                     Token::AtSign => UnaryOperator::PGAbs,
@@ -4083,18 +4229,76 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_utility_option(&mut self) -> Result<UtilityOption, ParserError> {
+        if dialect_of!(self is PostgreSqlDialect) {
+            let token = self.peek_token_ref();
+            if !matches!(&token.token, Token::Word(word)
+                if word.quote_style.is_some()
+                    || crate::keywords::is_postgresql_non_reserved_word(&word.value)
+                    || word.value.eq_ignore_ascii_case("ANALYZE")
+                    || word.value.eq_ignore_ascii_case("ANALYSE"))
+            {
+                return self.expected_ref("a utility option name", token);
+            }
+        }
         let name = self.parse_identifier()?;
 
         let next_token = self.peek_token_ref();
         if next_token == &Token::Comma || next_token == &Token::RParen {
             return Ok(UtilityOption { name, arg: None });
         }
-        let arg = self.parse_expr()?;
+        let arg = if dialect_of!(self is PostgreSqlDialect) {
+            self.parse_postgres_utility_option_arg()?
+        } else {
+            self.parse_expr()?
+        };
 
         Ok(UtilityOption {
             name,
             arg: Some(arg),
         })
+    }
+
+    // Native utility_option_arg is one boolean/string/NonReservedWord or
+    // NumericOnly atom. It is not an expression or a column reference.
+    fn parse_postgres_utility_option_arg(&mut self) -> Result<Expr, ParserError> {
+        self.check_cancelled()?;
+        match &self.peek_token_ref().token {
+            Token::Word(word) if matches!(word.keyword, Keyword::TRUE | Keyword::FALSE) => {
+                self.parse_value().map(Expr::Value)
+            }
+            Token::Word(word)
+                if word.quote_style.is_some()
+                    || word.keyword == Keyword::ON
+                    || crate::keywords::is_postgresql_non_reserved_word(&word.value) =>
+            {
+                let token = self.next_token();
+                let Token::Word(word) = token.token else {
+                    unreachable!("utility word token must be a word");
+                };
+                Ok(Expr::Identifier(word.to_ident(token.span)))
+            }
+            Token::SingleQuotedString(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::DollarQuotedString(_)
+            | Token::Number(..) => self.parse_value().map(Expr::Value),
+            Token::Plus | Token::Minus => {
+                let op = if self.next_token().token == Token::Plus {
+                    UnaryOperator::Plus
+                } else {
+                    UnaryOperator::Minus
+                };
+                if !matches!(self.peek_token_ref().token, Token::Number(..)) {
+                    return self
+                        .expected_ref("a numeric utility option value", self.peek_token_ref());
+                }
+                Ok(Expr::UnaryOp {
+                    op,
+                    expr: Box::new(Expr::Value(self.parse_value()?)),
+                })
+            }
+            _ => self.expected_ref("a utility option value", self.peek_token_ref()),
+        }
     }
 
     fn try_parse_expr_sub_query(&mut self) -> Result<Option<Expr>, ParserError> {
@@ -5432,7 +5636,7 @@ impl<'a> Parser<'a> {
             // one must use the special format:
             //     `SECOND [( <leading precision> [ , <fractional seconds precision>] )]`
             let (leading_precision, fsec_precision) = self.parse_optional_precision_scale()?;
-            if self.parse_keyword(Keyword::TO) {
+            if dialect_of!(self is MySqlDialect) && self.parse_keyword(Keyword::TO) {
                 if fsec_precision.is_some() {
                     return self
                         .expected_ref("no fractional precision before TO", self.peek_token_ref());
@@ -5893,6 +6097,9 @@ impl<'a> Parser<'a> {
             Token::Minus => Some(BinaryOperator::Minus),
             Token::Mul => Some(BinaryOperator::Multiply),
             Token::Mod => Some(BinaryOperator::Modulo),
+            Token::ExclamationMark if dialect_is!(dialect is PostgreSqlDialect) => {
+                Some(BinaryOperator::Custom("!".into()))
+            }
             Token::StringConcat => Some(BinaryOperator::StringConcat),
             Token::Pipe => Some(BinaryOperator::BitwiseOr),
             Token::Caret => {
@@ -7579,6 +7786,12 @@ impl<'a> Parser<'a> {
             self.parse_create_secret(or_replace, temporary, persistent)
         } else if self.parse_keyword(Keyword::USER) {
             if dialect_of!(self is PostgreSqlDialect) {
+                if or_replace || or_alter {
+                    return self.expected_ref(
+                        "USER without OR REPLACE or OR ALTER",
+                        self.get_current_token(),
+                    );
+                }
                 let mut role = self.parse_create_role()?;
                 role.login = Some(role.login.unwrap_or(true));
                 Ok(role.into())
@@ -11948,7 +12161,7 @@ impl<'a> Parser<'a> {
                 columns.push(column);
             } else {
                 return self.expected_ref(
-                    "column, constraint, or LIKE definition",
+                    "column name or constraint definition",
                     self.peek_token_ref(),
                 );
             }
@@ -11956,7 +12169,7 @@ impl<'a> Parser<'a> {
             let rparen = self.peek_token_ref().token == Token::RParen;
             if !comma && !rparen {
                 return self
-                    .expected_ref("',' or ')' after table definition", self.peek_token_ref());
+                    .expected_ref("',' or ')' after column definition", self.peek_token_ref());
             }
             if rparen
                 && (!comma
@@ -20203,9 +20416,9 @@ impl<'a> Parser<'a> {
 
     /// Parses optimizer hints at the current token position.
     ///
-    /// Collects all `/*prefix+...*/` and `--prefix+...` patterns.
-    /// The `prefix` is any run of ASCII alphanumeric characters between the
-    /// comment marker and `+` (e.g. `""` for `/*+...*/`, `"abc"` for `/*abc+...*/`).
+    /// Collects `/*+...*/` and `--+...` patterns. The `+` must immediately
+    /// follow the comment delimiter; a `+` inside an ordinary comment is not
+    /// an optimizer hint.
     ///
     /// [MySQL](https://dev.mysql.com/doc/refman/8.4/en/optimizer-hints.html#optimizer-hints-overview)
     /// [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Comments.html#GUID-D316D545-89E2-4D54-977F-FC97815CD62E)
@@ -20273,15 +20486,11 @@ impl<'a> Parser<'a> {
         Ok(hints)
     }
 
-    /// Checks if a comment's content starts with `[ASCII-alphanumeric]*+`
-    /// and returns `(prefix, text_after_plus)` if so.
+    /// Returns the hint text only when `+` immediately follows the delimiter.
     fn extract_hint_prefix_and_text(comment: &str) -> Option<(String, String)> {
-        let (before_plus, text) = comment.split_once('+')?;
-        if before_plus.chars().all(|c| c.is_ascii_alphanumeric()) {
-            Some((before_plus.to_string(), text.to_string()))
-        } else {
-            None
-        }
+        comment
+            .strip_prefix('+')
+            .map(|text| (String::new(), text.to_string()))
     }
 
     /// Parses MySQL SELECT modifiers and DISTINCT/ALL in any order.
@@ -20477,6 +20686,12 @@ impl<'a> Parser<'a> {
         &mut self,
         parenthesized_assignment: bool,
     ) -> Result<Vec<Expr>, ParserError> {
+        if dialect_of!(self is PostgreSqlDialect) && self.peek_keyword(Keyword::DEFAULT) {
+            // Native SET's DEFAULT branch supplies the whole value, not a list
+            // element or expression operand. Leave any suffix for rejection.
+            return Ok(vec![self.parse_contextually_typed_expr()?]);
+        }
+
         let mut values = vec![];
 
         if parenthesized_assignment {
@@ -20602,7 +20817,7 @@ impl<'a> Parser<'a> {
         }
 
         let start = self.index;
-        let expression = self.parse_expr()?;
+        let expression = self.parse_contextually_typed_expr()?;
         if dialect_of!(self is MySqlDialect)
             && name
                 .0
@@ -20771,7 +20986,7 @@ impl<'a> Parser<'a> {
                 // but we allow it for all the dialects
                 return Ok(Set::SetTimeZone {
                     local: scope == Some(ContextModifier::Local),
-                    value: self.parse_expr()?,
+                    value: self.parse_contextually_typed_expr()?,
                 }
                 .into());
             }
@@ -20779,8 +20994,34 @@ impl<'a> Parser<'a> {
             if self.parse_keyword(Keyword::DEFAULT) {
                 return Ok(Set::SetNamesDefault {}.into());
             }
-            let charset_name = self.parse_mysql_character_identifier()?;
-            let collation_name = if self.parse_one_of_keywords(&[Keyword::COLLATE]).is_some() {
+            let charset_name = if self.dialect.supports_set_names_identifier() {
+                self.parse_mysql_character_identifier()?
+            } else {
+                // Native opt_encoding is Sconst | DEFAULT | EMPTY. EMPTY is
+                // reached only at the actual end of this statement.
+                match &self.peek_token_ref().token {
+                    Token::EOF | Token::SemiColon => {
+                        return Ok(Set::SetNamesDefault {}.into());
+                    }
+                    Token::SingleQuotedString(_)
+                    | Token::EscapedStringLiteral(_)
+                    | Token::UnicodeStringLiteral(_)
+                    | Token::DollarQuotedString(_) => {
+                        let encoding = self
+                            .parse_value()?
+                            .into_string()
+                            .expect("SET NAMES checked an encoding string token");
+                        Ident::with_quote('\'', encoding)
+                    }
+                    _ => {
+                        return self
+                            .expected_ref("encoding string or DEFAULT", self.peek_token_ref());
+                    }
+                }
+            };
+            let collation_name = if self.dialect.supports_set_names_collation()
+                && self.parse_keyword(Keyword::COLLATE)
+            {
                 Some(self.parse_literal_string()?)
             } else {
                 None
@@ -24489,12 +24730,63 @@ impl<'a> Parser<'a> {
         .into())
     }
 
+    // DEFAULT is a contextual value, carried by the existing unquoted
+    // Identifier AST for downstream column-default binding, not a ColId.
+    fn parse_contextually_typed_expr(&mut self) -> Result<Expr, ParserError> {
+        if dialect_of!(self is PostgreSqlDialect) && self.peek_keyword(Keyword::DEFAULT) {
+            self.check_cancelled()?;
+            let _guard = self.recursion_counter.try_decrease()?;
+            let token = self.next_token();
+            let Token::Word(word) = token.token else {
+                unreachable!("DEFAULT keyword token must be a word");
+            };
+            return Ok(Expr::Identifier(word.to_ident(token.span)));
+        }
+        self.parse_expr()
+    }
+
     /// Parse a `var = expr` assignment, used in an UPDATE statement
     pub fn parse_assignment(&mut self) -> Result<Assignment, ParserError> {
         let target = self.parse_assignment_target()?;
         self.expect_token(&Token::Eq)?;
-        let value = self.parse_expr()?;
+        let value = if dialect_of!(self is PostgreSqlDialect)
+            && matches!(&target, AssignmentTarget::Tuple(_))
+        {
+            self.parse_postgres_multi_assignment_value()?
+        } else {
+            self.parse_contextually_typed_expr()?
+        };
         Ok(Assignment { target, value })
+    }
+
+    // MultiAssignRef accepts a RowExpr with DEFAULT items, or a subquery.
+    // The contextual permission belongs to these direct assignment fields,
+    // never to an arbitrary ROW/function expression or a nested row field.
+    fn parse_postgres_multi_assignment_value(&mut self) -> Result<Expr, ParserError> {
+        self.check_cancelled()?;
+        let explicit_row = self.parse_keyword(Keyword::ROW);
+        if explicit_row {
+            self.expect_token(&Token::LParen)?;
+        } else if self.consume_token(&Token::LParen) {
+            if self.peek_sub_query() {
+                self.prev_token();
+                return self.parse_expr();
+            }
+        } else {
+            return self.parse_contextually_typed_expr();
+        }
+        let _guard = self.recursion_counter.try_decrease()?;
+        let values = if explicit_row && self.peek_token_ref().token == Token::RParen {
+            vec![]
+        } else {
+            self.parse_comma_separated(Self::parse_contextually_typed_expr)?
+        };
+        self.expect_token(&Token::RParen)?;
+        if !explicit_row && values.len() == 1 {
+            Ok(Expr::Nested(Box::new(values.into_iter().next().unwrap())))
+        } else {
+            Ok(Expr::Tuple(values))
+        }
     }
 
     /// Parse the left-hand side of an assignment, used in an UPDATE statement
@@ -24690,14 +24982,15 @@ impl<'a> Parser<'a> {
 
         // Handle clauses that may exist with an empty argument list
 
-        if let Some(null_clause) = self.parse_json_null_clause() {
-            clauses.push(FunctionArgumentClause::JsonNullClause(null_clause));
-        }
-
-        if let Some(json_returning_clause) = self.maybe_parse_json_returning_clause()? {
-            clauses.push(FunctionArgumentClause::JsonReturningClause(
-                json_returning_clause,
-            ));
+        if !dialect_of!(self is PostgreSqlDialect) {
+            if let Some(null_clause) = self.parse_json_null_clause() {
+                clauses.push(FunctionArgumentClause::JsonNullClause(null_clause));
+            }
+            if let Some(json_returning_clause) = self.maybe_parse_json_returning_clause()? {
+                clauses.push(FunctionArgumentClause::JsonReturningClause(
+                    json_returning_clause,
+                ));
+            }
         }
 
         if self.consume_token(&Token::RParen) {
@@ -24763,14 +25056,15 @@ impl<'a> Parser<'a> {
             clauses.push(FunctionArgumentClause::OnOverflow(on_overflow));
         }
 
-        if let Some(null_clause) = self.parse_json_null_clause() {
-            clauses.push(FunctionArgumentClause::JsonNullClause(null_clause));
-        }
-
-        if let Some(json_returning_clause) = self.maybe_parse_json_returning_clause()? {
-            clauses.push(FunctionArgumentClause::JsonReturningClause(
-                json_returning_clause,
-            ));
+        if !dialect_of!(self is PostgreSqlDialect) {
+            if let Some(null_clause) = self.parse_json_null_clause() {
+                clauses.push(FunctionArgumentClause::JsonNullClause(null_clause));
+            }
+            if let Some(json_returning_clause) = self.maybe_parse_json_returning_clause()? {
+                clauses.push(FunctionArgumentClause::JsonReturningClause(
+                    json_returning_clause,
+                ));
+            }
         }
 
         self.expect_token(&Token::RParen)?;
@@ -24825,6 +25119,15 @@ impl<'a> Parser<'a> {
             )
             .map(|keyword| Ident::new(format!("{keyword:?}")));
 
+        if let Token::Word(word) = &self.peek_token_ref().token {
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("from") {
+                return parser_err!(
+                    format!("Expected an expression, found: {}", word.value),
+                    self.peek_token_ref().span.start
+                );
+            }
+        }
+
         match self.parse_wildcard_expr()? {
             Expr::QualifiedWildcard(prefix, token) => Ok(SelectItem::QualifiedWildcard(
                 SelectItemQualifiedWildcardKind::ObjectName(prefix),
@@ -24833,12 +25136,6 @@ impl<'a> Parser<'a> {
             Expr::Wildcard(token) => Ok(SelectItem::Wildcard(
                 self.parse_wildcard_additional_options(token.0)?,
             )),
-            Expr::Identifier(v) if v.value.to_lowercase() == "from" && v.quote_style.is_none() => {
-                parser_err!(
-                    format!("Expected an expression, found: {}", v),
-                    self.peek_token_ref().span.start
-                )
-            }
             Expr::BinaryOp {
                 left,
                 op: BinaryOperator::Eq,
@@ -25464,7 +25761,7 @@ impl<'a> Parser<'a> {
                 content: if allow_empty && parser.peek_token_ref().token == Token::RParen {
                     vec![]
                 } else {
-                    parser.parse_comma_separated(Parser::parse_expr)?
+                    parser.parse_comma_separated(Parser::parse_contextually_typed_expr)?
                 },
                 closing_token: parser.expect_token(&Token::RParen)?.into(),
             })
@@ -26166,7 +26463,19 @@ impl<'a> Parser<'a> {
             return self.parse_mysql_load();
         }
         if self.dialect.supports_load_extension() {
-            let extension_name = self.parse_identifier()?;
+            let extension_name = if self.dialect.supports_postgres_string_constants() {
+                let next = self.next_token();
+                let value = match next.token {
+                    Token::SingleQuotedString(value)
+                    | Token::EscapedStringLiteral(value)
+                    | Token::UnicodeStringLiteral(value) => value,
+                    Token::DollarQuotedString(value) => value.value,
+                    _ => return self.expected("filename string literal after LOAD", next),
+                };
+                Ident::with_quote_and_span('\'', next.span, value)
+            } else {
+                self.parse_identifier()?
+            };
             Ok(Statement::Load { extension_name })
         } else if self.parse_keyword(Keyword::DATA) && self.dialect.supports_load_data() {
             let local = self.parse_one_of_keywords(&[Keyword::LOCAL]).is_some();
@@ -26744,7 +27053,63 @@ impl<'a> Parser<'a> {
         or_alter: bool,
         or_replace: bool,
     ) -> Result<Statement, ParserError> {
-        if dialect_of!(self is PostgreSqlDialect | GenericDialect) {
+        let postgres_body = if dialect_of!(self is GenericDialect) {
+            // Generic accepts both statement and PostgreSQL procedure bodies.
+            // Inspect the actual outer body token on this same cursor; do not
+            // discard a syntax error and retry an unrelated body grammar.
+            let checkpoint = self.index;
+            self.parse_object_name(false)?;
+            let parenthesized = self.consume_token(&Token::LParen);
+            if parenthesized {
+                let mut depth = 1_usize;
+                while depth != 0 {
+                    self.check_cancelled()?;
+                    self.check_source_error()?;
+                    let token = self.next_token();
+                    self.check_source_error()?;
+                    match token.token {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::EOF => {
+                            return self.expected("')' after procedure parameters", token);
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            let mut offset = 0;
+            let selected = loop {
+                self.check_cancelled()?;
+                self.check_source_error()?;
+                let token = self.peek_nth_token(offset);
+                self.check_source_error()?;
+                match token.token {
+                    Token::Word(ref word) if word.keyword == Keyword::LANGUAGE => offset += 2,
+                    Token::Word(ref word)
+                        if matches!(
+                            word.keyword,
+                            Keyword::SECURITY | Keyword::EXTERNAL | Keyword::SET
+                        ) =>
+                    {
+                        break true;
+                    }
+                    Token::Word(ref word) if word.keyword == Keyword::AS => {
+                        break !matches!(self.peek_nth_token(offset + 1).token, Token::Word(_));
+                    }
+                    Token::Word(ref word) if word.keyword == Keyword::BEGIN => {
+                        break matches!(self.peek_nth_token(offset + 1).token,
+                            Token::Word(ref next) if next.keyword == Keyword::ATOMIC);
+                    }
+                    Token::EOF | Token::SemiColon => break parenthesized,
+                    _ => offset += 1,
+                }
+            };
+            self.restore_token_index(checkpoint);
+            selected
+        } else {
+            dialect_of!(self is PostgreSqlDialect)
+        };
+        if postgres_body {
             return self
                 .parse_postgres_create_procedure(or_alter, or_replace)
                 .map(Statement::CreateProcedure);

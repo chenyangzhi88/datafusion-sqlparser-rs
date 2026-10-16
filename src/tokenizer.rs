@@ -4839,8 +4839,11 @@ impl<'a> Tokenizer<'a> {
                     chars.next(); // consume, to check the next char
                     match chars.peek() {
                         Some('\'') => {
-                            let s =
-                                self.tokenize_escaped_single_quoted_string(starting_loc, chars)?;
+                            let s = if self.dialect.supports_postgres_string_constants() {
+                                self.tokenize_postgres_escaped_string(starting_loc, chars)?
+                            } else {
+                                self.tokenize_escaped_single_quoted_string(starting_loc, chars)?
+                            };
                             Ok(Some(Token::EscapedStringLiteral(s)))
                         }
                         _ => {
@@ -4852,6 +4855,7 @@ impl<'a> Tokenizer<'a> {
                 }
                 // Unicode string literals like U&'first \000A second' are supported in some dialects, including PostgreSQL
                 x @ 'u' | x @ 'U' if self.dialect.supports_unicode_string_literal() => {
+                    let starting_loc = chars.location();
                     chars.next(); // consume, to check the next char
                     if chars.peek() == Some(&'&') {
                         // we cannot advance the iterator here, as we need to consume the '&' later if the 'u' was an identifier
@@ -4859,7 +4863,11 @@ impl<'a> Tokenizer<'a> {
                         chars_clone.next(); // consume the '&' in the clone
                         if chars_clone.peek() == Some(&'\'') {
                             chars.next(); // consume the '&' in the original iterator
-                            let s = unescape_unicode_single_quoted_string(chars)?;
+                            let s = if self.dialect.supports_postgres_string_constants() {
+                                self.tokenize_postgres_unicode_string(starting_loc, chars)?
+                            } else {
+                                unescape_unicode_single_quoted_string(chars)?
+                            };
                             return Ok(Some(Token::UnicodeStringLiteral(s)));
                         }
                     }
@@ -4890,6 +4898,12 @@ impl<'a> Tokenizer<'a> {
                 }
                 // single quoted string
                 '\'' => {
+                    if self.dialect.supports_postgres_string_constants() {
+                        return self
+                            .tokenize_postgres_ordinary_string(chars)
+                            .map(Token::SingleQuotedString)
+                            .map(Some);
+                    }
                     if self.dialect.supports_triple_quoted_string() {
                         return self
                             .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
@@ -5698,7 +5712,18 @@ impl<'a> Tokenizer<'a> {
                 ch if self.dialect.is_identifier_start(ch) => {
                     self.tokenize_identifier_or_keyword([ch], chars)
                 }
-                '$' => Ok(Some(self.tokenize_dollar_preceded_value(chars)?)),
+                '$' => {
+                    let token = self.tokenize_dollar_preceded_value(chars)?;
+                    if self.dialect.supports_postgres_string_constants()
+                        && matches!(&token, Token::DollarQuotedString(value) if value.value.contains('\0'))
+                    {
+                        return self.tokenizer_error(
+                            chars.location(),
+                            "invalid byte sequence for encoding \"UTF8\": 0x00",
+                        );
+                    }
+                    Ok(Some(token))
+                }
 
                 // whitespace check (including unicode chars) should be last as it covers some of the chars above
                 ch if ch.is_whitespace() => {
@@ -5858,8 +5883,10 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_dollar_preceded_value(&self, chars: &mut State) -> Result<Token, TokenizerError> {
         let mut s = String::new();
         let mut value = String::new();
+        let postgres_strings = self.dialect.supports_postgres_string_constants();
 
         chars.next();
+        let numeric_start = chars.peek().is_some_and(|ch| ch.is_ascii_digit());
 
         // If the dialect does not support dollar-quoted strings, then `$$` is rather a placeholder.
         if matches!(chars.peek(), Some('$')) && !self.dialect.supports_dollar_placeholder() {
@@ -5896,10 +5923,14 @@ impl<'a> Tokenizer<'a> {
             };
         } else {
             value.push_str(&peeking_take_while(chars, |ch| {
-                ch.is_alphanumeric()
-                    || ch == '_'
-                    // Allow $ as a placeholder character if the dialect supports it
-                    || matches!(ch, '$' if self.dialect.supports_dollar_placeholder())
+                if postgres_strings {
+                    ch.is_ascii_alphanumeric() || !ch.is_ascii() || ch == '_'
+                } else {
+                    ch.is_alphanumeric()
+                        || ch == '_'
+                        // Allow $ as a placeholder character if the dialect supports it
+                        || matches!(ch, '$' if self.dialect.supports_dollar_placeholder())
+                }
             }));
 
             // If the dialect supports a dollar sign as a money prefix (e.g. SQL Server),
@@ -5917,6 +5948,11 @@ impl<'a> Tokenizer<'a> {
 
             // If the dialect does not support dollar-quoted strings, don't look for the end delimiter.
             if matches!(chars.peek(), Some('$')) && !self.dialect.supports_dollar_placeholder() {
+                // scan.l dolq_start excludes ASCII digits. A PARAM spelling
+                // must never become a quoted LOAD filename.
+                if postgres_strings && numeric_start {
+                    return Ok(Token::Placeholder(format!("{}{}", '$', value)));
+                }
                 chars.next();
 
                 let mut temp = String::new();
@@ -6016,6 +6052,398 @@ impl<'a> Tokenizer<'a> {
                 format!("Expected close delimiter '{quote_end}' before EOF."),
             )
         }
+    }
+
+    /// Look ahead without consuming a failed continuation or UESCAPE suffix.
+    /// scan.l quotecontinue includes line comments, but not block comments.
+    fn postgres_literal_whitespace(
+        &self,
+        chars: &mut State,
+        block_comments: bool,
+    ) -> Result<(usize, bool), TokenizerError> {
+        let mut look = chars.peekable.clone();
+        let mut count = 0;
+        let mut newline = false;
+        let mut next_check = 1024;
+        loop {
+            if count >= next_check {
+                next_check = count + 1024;
+                if chars.cancellation.as_ref().is_some_and(|check| check()) {
+                    chars.cancelled = true;
+                    return self.tokenizer_error(chars.location(), QUERY_CANCELLED_MESSAGE);
+                }
+            }
+            match look.peek().copied() {
+                Some(ch @ (' ' | '\t' | '\n' | '\r' | '\x0c')) => {
+                    look.next();
+                    count += 1;
+                    newline |= matches!(ch, '\n' | '\r');
+                }
+                Some('-') if look.clone().nth(1) == Some('-') => {
+                    for _ in 0..2 {
+                        look.next();
+                        count += 1;
+                    }
+                    while look.peek().is_some_and(|ch| !matches!(ch, '\n' | '\r')) {
+                        look.next();
+                        count += 1;
+                        if count >= next_check {
+                            next_check = count + 1024;
+                            if chars.cancellation.as_ref().is_some_and(|check| check()) {
+                                chars.cancelled = true;
+                                return self
+                                    .tokenizer_error(chars.location(), QUERY_CANCELLED_MESSAGE);
+                            }
+                        }
+                    }
+                }
+                Some('/') if block_comments && look.clone().nth(1) == Some('*') => {
+                    look.next();
+                    look.next();
+                    count += 2;
+                    let mut depth = 1;
+                    while depth != 0 {
+                        let Some(ch) = look.next() else {
+                            return self.tokenizer_error(
+                                chars.location(),
+                                "Unterminated multiline comment",
+                            );
+                        };
+                        count += 1;
+                        newline |= matches!(ch, '\n' | '\r');
+                        if ch == '/' && look.peek() == Some(&'*') {
+                            look.next();
+                            count += 1;
+                            depth += 1;
+                        } else if ch == '*' && look.peek() == Some(&'/') {
+                            look.next();
+                            count += 1;
+                            depth -= 1;
+                        }
+                        if count >= next_check {
+                            next_check = count + 1024;
+                            if chars.cancellation.as_ref().is_some_and(|check| check()) {
+                                chars.cancelled = true;
+                                return self
+                                    .tokenizer_error(chars.location(), QUERY_CANCELLED_MESSAGE);
+                            }
+                        }
+                    }
+                }
+                _ => return Ok((count, newline)),
+            }
+        }
+    }
+
+    fn postgres_quote_continuation(&self, chars: &mut State) -> Result<bool, TokenizerError> {
+        let (count, newline) = self.postgres_literal_whitespace(chars, false)?;
+        if newline && chars.peekable.clone().nth(count) == Some('\'') {
+            for _ in 0..count {
+                chars.next();
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn tokenize_postgres_ordinary_string(
+        &self,
+        chars: &mut State,
+    ) -> Result<String, TokenizerError> {
+        let starting_loc = chars.location();
+        let mut value = self.tokenize_single_quoted_string(chars, '\'', false)?;
+        while self.postgres_quote_continuation(chars)? {
+            value.push_str(&self.tokenize_single_quoted_string(chars, '\'', false)?);
+        }
+        if value.contains('\0') {
+            return self.tokenizer_error(
+                starting_loc,
+                "invalid byte sequence for encoding \"UTF8\": 0x00",
+            );
+        }
+        Ok(value)
+    }
+
+    fn tokenize_postgres_escaped_string(
+        &self,
+        starting_loc: Location,
+        chars: &mut State,
+    ) -> Result<String, TokenizerError> {
+        let mut bytes = Vec::new();
+        loop {
+            let part = Unescape::new(chars)
+                .unescape_bytes_with_diagnostic(true)
+                .map_err(|mut error| {
+                    if error.message == "Unterminated encoded string literal" {
+                        error.location = starting_loc;
+                    }
+                    error
+                })?;
+            bytes.extend(part);
+            if !self.postgres_quote_continuation(chars)? {
+                break;
+            }
+        }
+        // Validate one complete Sconst; encoded bytes may cross a quote
+        // continuation, whereas a Unicode surrogate must pair in its fragment.
+        let nul = bytes.iter().position(|byte| *byte == 0);
+        match String::from_utf8(bytes) {
+            Err(error) if nul.is_none_or(|nul| error.utf8_error().valid_up_to() <= nul) => {
+                let start = error.utf8_error().valid_up_to();
+                let bytes = error.as_bytes();
+                let width = match bytes[start] {
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf7 => 4,
+                    _ => 1,
+                };
+                let bad = bytes[start..(start + width).min(bytes.len())]
+                    .iter()
+                    .map(|byte| format!("0x{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.tokenizer_error(
+                    starting_loc,
+                    format!("invalid byte sequence for encoding \"UTF8\": {bad}"),
+                )
+            }
+            _ if nul.is_some() => self.tokenizer_error(
+                starting_loc,
+                "invalid byte sequence for encoding \"UTF8\": 0x00",
+            ),
+            Ok(value) => Ok(value),
+            Err(_) => unreachable!("invalid UTF8 before NUL was handled"),
+        }
+    }
+
+    fn tokenize_postgres_unicode_string(
+        &self,
+        starting_loc: Location,
+        chars: &mut State,
+    ) -> Result<String, TokenizerError> {
+        let mut raw = String::new();
+        // Sparse anchors retain source coordinates across doubled quotes and
+        // physical continuations; normal decoding does not rescan the source.
+        let mut anchors = Vec::new();
+        let mut ending_loc: Location;
+        loop {
+            chars.next(); // opening quote
+            anchors.push((raw.len(), chars.location()));
+            loop {
+                let location = chars.location();
+                match chars.next() {
+                    Some('\'') if chars.peek() == Some(&'\'') => {
+                        chars.next();
+                        raw.push('\'');
+                        anchors.push((raw.len(), chars.location()));
+                    }
+                    Some('\'') => {
+                        ending_loc = location;
+                        break;
+                    }
+                    Some(ch) => raw.push(ch),
+                    None => {
+                        return self.tokenizer_error(
+                            starting_loc,
+                            "Unterminated unicode encoded string literal",
+                        )
+                    }
+                }
+            }
+            if !self.postgres_quote_continuation(chars)? {
+                break;
+            }
+        }
+
+        let mut escape = '\\';
+        let (count, _) = self.postgres_literal_whitespace(chars, true)?;
+        let mut look = chars.peekable.clone();
+        for _ in 0..count {
+            look.next();
+        }
+        let uescape = "UESCAPE"
+            .chars()
+            .all(|ch| look.next().is_some_and(|got| got.eq_ignore_ascii_case(&ch)))
+            && !look
+                .peek()
+                .is_some_and(|ch| self.dialect.is_identifier_part(*ch));
+        if uescape {
+            for _ in 0..count + 7 {
+                chars.next();
+            }
+            let (count, _) = self.postgres_literal_whitespace(chars, true)?;
+            for _ in 0..count {
+                chars.next();
+            }
+            // parser.c asks core_yylex for SCONST: ordinary, E and dollar
+            // strings qualify; U& is USCONST and must not recurse here.
+            let suffix_loc = chars.location();
+            let value = match chars.peek().copied() {
+                Some('\'') => self.tokenize_postgres_ordinary_string(chars)?,
+                Some('E' | 'e') if chars.peekable.clone().nth(1) == Some('\'') => {
+                    chars.next();
+                    self.tokenize_postgres_escaped_string(suffix_loc, chars)?
+                }
+                Some('$') => match self.tokenize_dollar_preceded_value(chars)? {
+                    Token::DollarQuotedString(value) => {
+                        if value.value.contains('\0') {
+                            return self.tokenizer_error(
+                                suffix_loc,
+                                "invalid byte sequence for encoding \"UTF8\": 0x00",
+                            );
+                        }
+                        value.value
+                    }
+                    _ => {
+                        return self.tokenizer_error(
+                            suffix_loc,
+                            "UESCAPE must be followed by a simple string literal",
+                        )
+                    }
+                },
+                _ => {
+                    return self.tokenizer_error(
+                        suffix_loc,
+                        "UESCAPE must be followed by a simple string literal",
+                    )
+                }
+            };
+            if value.len() != 1
+                || value.as_bytes()[0] == 0
+                || value.as_bytes()[0].is_ascii_hexdigit()
+                || matches!(
+                    value.as_bytes()[0],
+                    b'+' | b'\'' | b'"' | b' ' | b'\t' | b'\n' | b'\r' | 12
+                )
+            {
+                return self.tokenizer_error(suffix_loc, "invalid Unicode escape character");
+            }
+            escape = value.as_bytes()[0] as char;
+        }
+        self.decode_postgres_unicode_string(&raw, escape, starting_loc, &anchors, ending_loc)
+    }
+
+    fn decode_postgres_unicode_string(
+        &self,
+        raw: &str,
+        escape: char,
+        starting_loc: Location,
+        anchors: &[(usize, Location)],
+        ending_loc: Location,
+    ) -> Result<String, TokenizerError> {
+        let mut chars = raw.char_indices().peekable();
+        let mut value = String::new();
+        let mut high: Option<u32> = None;
+        let mut work = 0_usize;
+        while let Some((offset, ch)) = chars.next() {
+            work += 1;
+            if work.is_multiple_of(1024) && self.cancellation.as_ref().is_some_and(|check| check())
+            {
+                return self.tokenizer_error(starting_loc, QUERY_CANCELLED_MESSAGE);
+            }
+            if ch != escape {
+                if high.is_some() {
+                    return self.tokenizer_error(
+                        Self::postgres_unicode_location(raw, offset, anchors),
+                        "invalid Unicode surrogate pair",
+                    );
+                }
+                if ch == '\0' {
+                    return self.tokenizer_error(
+                        Self::postgres_unicode_location(raw, offset, anchors),
+                        "invalid byte sequence for encoding \"UTF8\": 0x00",
+                    );
+                }
+                value.push(ch);
+                continue;
+            }
+            if chars.peek().is_some_and(|(_, ch)| *ch == escape) {
+                chars.next();
+                if high.is_some() {
+                    return self.tokenizer_error(
+                        Self::postgres_unicode_location(raw, offset, anchors),
+                        "invalid Unicode surrogate pair",
+                    );
+                }
+                value.push(escape);
+                continue;
+            }
+            let width = if chars.peek().is_some_and(|(_, ch)| *ch == '+') {
+                chars.next();
+                6
+            } else {
+                4
+            };
+            let mut code = 0_u32;
+            for _ in 0..width {
+                let Some(digit) = chars
+                    .next()
+                    .and_then(|(_, ch)| ch.to_digit(16).filter(|_| ch.is_ascii_hexdigit()))
+                else {
+                    return self.tokenizer_error(
+                        Self::postgres_unicode_location(raw, offset, anchors),
+                        "invalid Unicode escape",
+                    );
+                };
+                code = (code << 4) | digit;
+            }
+            if code == 0 || code > 0x10ffff {
+                return self.tokenizer_error(
+                    Self::postgres_unicode_location(raw, offset, anchors),
+                    "invalid Unicode escape value",
+                );
+            }
+            if let Some(first) = high.take() {
+                if !(0xdc00..=0xdfff).contains(&code) {
+                    return self.tokenizer_error(
+                        Self::postgres_unicode_location(raw, offset, anchors),
+                        "invalid Unicode surrogate pair",
+                    );
+                }
+                code = 0x10000_u32 + ((first - 0xd800) << 10) + (code - 0xdc00);
+            } else if (0xdc00..=0xdfff).contains(&code) {
+                return self.tokenizer_error(
+                    Self::postgres_unicode_location(raw, offset, anchors),
+                    "invalid Unicode surrogate pair",
+                );
+            }
+            if (0xd800..=0xdbff).contains(&code) {
+                high = Some(code);
+            } else if let Some(ch) = char::from_u32(code) {
+                value.push(ch);
+            } else {
+                return self.tokenizer_error(
+                    Self::postgres_unicode_location(raw, offset, anchors),
+                    "invalid Unicode escape value",
+                );
+            }
+        }
+        if high.is_some() {
+            return self.tokenizer_error(ending_loc, "invalid Unicode surrogate pair");
+        }
+        Ok(value)
+    }
+
+    fn postgres_unicode_location(
+        raw: &str,
+        offset: usize,
+        anchors: &[(usize, Location)],
+    ) -> Location {
+        let &(start, mut location) = anchors
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= offset)
+            .expect("Unicode body has a source anchor");
+        for ch in raw[start..offset].chars() {
+            if ch == '\n' {
+                location.line += 1;
+                location.column = 1;
+            } else {
+                location.column += 1;
+            }
+        }
+        location
     }
 
     /// Read a single quoted string, starting with the opening quote.
@@ -6496,35 +6924,58 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
         String::from_utf8(bytes).ok()
     }
 
-    fn unescape_bytes(mut self) -> Option<Vec<u8>> {
+    fn unescape_bytes(self) -> Option<Vec<u8>> {
+        self.unescape_bytes_with_diagnostic(false).ok()
+    }
+
+    fn diagnostic(location: Location, message: &str) -> TokenizerError {
+        TokenizerError {
+            message: message.into(),
+            location,
+            source_kind: MySqlSourceErrorKind::Message,
+        }
+    }
+
+    fn unescape_bytes_with_diagnostic(mut self, postgres: bool) -> Result<Vec<u8>, TokenizerError> {
+        let starting_loc = self.chars.location();
         let mut unescaped = Vec::new();
         self.chars.next();
-        while let Some(c) = self.chars.next() {
+        loop {
+            let location = self.chars.location();
+            let Some(c) = self.chars.next() else {
+                return Err(Self::diagnostic(
+                    starting_loc,
+                    "Unterminated encoded string literal",
+                ));
+            };
             if c == '\'' {
                 if self.chars.peek() == Some(&'\'') {
                     self.chars.next();
                     unescaped.push(b'\'');
                     continue;
                 }
-                return Some(unescaped);
+                return Ok(unescaped);
             }
             let c = if c != '\\' {
                 c
             } else {
-                match self.chars.next()? {
+                match self.chars.next().ok_or_else(|| {
+                    Self::diagnostic(starting_loc, "Unterminated encoded string literal")
+                })? {
                     'b' => '\u{0008}',
                     'f' => '\u{000C}',
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
-                    'u' => self.unescape_unicode::<4>()?,
-                    'U' => self.unescape_unicode::<8>()?,
+                    'u' => self.unescape_unicode::<4>(location, postgres)?,
+                    'U' => self.unescape_unicode::<8>(location, postgres)?,
                     c if c == 'x' || c.is_digit(8) => {
                         let byte = if c == 'x' {
-                            self.unescape_hex()?
+                            self.unescape_hex()
                         } else {
-                            self.unescape_octal(c)?
-                        };
+                            self.unescape_octal(c)
+                        }
+                        .ok_or_else(|| Self::diagnostic(location, "invalid byte escape"))?;
                         unescaped.push(byte);
                         continue;
                     }
@@ -6533,7 +6984,6 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
             };
             unescaped.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
         }
-        None
     }
 
     #[inline]
@@ -6588,32 +7038,53 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     }
 
     // Both PG Unicode escape widths use the same surrogate-pair rule.
-    fn unescape_unicode<const NUM: usize>(&mut self) -> Option<char> {
-        let mut digits = String::new();
+    fn unescape_unicode_codepoint<const NUM: usize>(
+        &mut self,
+        location: Location,
+    ) -> Result<u32, TokenizerError> {
+        let mut code = 0_u32;
         for _ in 0..NUM {
-            digits.push(self.chars.next()?);
+            let digit = self
+                .chars
+                .next()
+                .and_then(|ch| ch.to_digit(16).filter(|_| ch.is_ascii_hexdigit()))
+                .ok_or_else(|| Self::diagnostic(location, "invalid Unicode escape"))?;
+            code = (code << 4) | digit;
         }
-        let high = u32::from_str_radix(&digits, 16).ok()?;
+        Ok(code)
+    }
+
+    // Preserve the existing Option decoder contract; the PG tokenizer alone
+    // requests distinct syntax diagnostics instead of collapsing to None.
+    fn unescape_unicode<const NUM: usize>(
+        &mut self,
+        location: Location,
+        postgres: bool,
+    ) -> Result<char, TokenizerError> {
+        let high = self.unescape_unicode_codepoint::<NUM>(location)?;
+        if high > 0x10ffff || (postgres && high == 0) {
+            return Err(Self::diagnostic(location, "invalid Unicode escape value"));
+        }
         if (0xD800..=0xDBFF).contains(&high) {
-            if self.chars.next()? != '\\' {
-                return None;
+            let low_loc = self.chars.location();
+            if self.chars.next() != Some('\\') {
+                return Err(Self::diagnostic(low_loc, "invalid Unicode surrogate pair"));
             }
-            let width = match self.chars.next()? {
-                'u' => 4,
-                'U' => 8,
-                _ => return None,
+            let low = match self.chars.next() {
+                Some('u') => self.unescape_unicode_codepoint::<4>(low_loc)?,
+                Some('U') => self.unescape_unicode_codepoint::<8>(low_loc)?,
+                _ => return Err(Self::diagnostic(low_loc, "invalid Unicode surrogate pair")),
             };
-            digits.clear();
-            for _ in 0..width {
-                digits.push(self.chars.next()?);
-            }
-            let low = u32::from_str_radix(&digits, 16).ok()?;
             if !(0xDC00..=0xDFFF).contains(&low) {
-                return None;
+                return Err(Self::diagnostic(low_loc, "invalid Unicode surrogate pair"));
             }
             char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
+                .ok_or_else(|| Self::diagnostic(low_loc, "invalid Unicode surrogate pair"))
+        } else if (0xDC00..=0xDFFF).contains(&high) {
+            Err(Self::diagnostic(location, "invalid Unicode surrogate pair"))
         } else {
             char::from_u32(high)
+                .ok_or_else(|| Self::diagnostic(location, "invalid Unicode escape value"))
         }
     }
 }

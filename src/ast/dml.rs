@@ -394,6 +394,9 @@ impl Display for Delete {
                 f.write_str(" FROM")?;
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
+                    if f.alternate() {
+                        f.write_str("  ")?;
+                    }
                     fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
                 } else {
                     indented_list(f, from)?;
@@ -402,6 +405,9 @@ impl Display for Delete {
             FromTable::WithoutKeyword(from) => {
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
+                    if f.alternate() {
+                        f.write_str("  ")?;
+                    }
                     fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
                 } else {
                     indented_list(f, from)?;

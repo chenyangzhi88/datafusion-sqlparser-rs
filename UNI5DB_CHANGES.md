@@ -38,7 +38,25 @@ unusable intermediate states as independent fixes. This is not a claim that
 all contracts have passed the latest upstream external test suite. Individual
 upstream contributions still need focused extraction and review.
 
-## Manifest integration
+## Current shared dependency (2026-10-13)
+
+The parent PostgreSQL and MySQL packages and the independent DataFusion
+workspace now share this physical `sqlparser 0.62.0` checkout. The parent
+`[patch.crates-io]` uses `third_party/sqlparser`; DataFusion's
+`[workspace.dependencies].sqlparser` uses `path = "../sqlparser"`,
+`version = "0.62.0"`, `default-features = false` and `std,visitor`.
+`sqlparser_derive 0.5.0` remains the published registry dependency.
+
+Final isolated DataFusion testing must copy and pin this same parser sibling,
+including its original lockfile. The current relationship supersedes the
+initial import's separate DataFusion 0.61 dependency; the historical migration
+inputs and validation results below remain unchanged. This dependency
+integration is not complete PostgreSQL, MySQL or application certification.
+
+## Initial migration manifest integration
+
+This section and the following migration-validation section record the initial
+source-preservation import described by the provenance inputs above.
 
 The complete upstream manifest replaces Cargo's normalized package manifest.
 It retains the product snapshot's `serde/rc` and dev `serde_json` requirements.

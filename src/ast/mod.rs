@@ -1019,9 +1019,6 @@ impl fmt::Display for JsonOutputClause {
 pub enum JsonArraySource {
     /// An ordered list of value expressions.
     Values(Vec<JsonInput>),
-    /// The aggregate input used by native JSON_ARRAY query analysis and its
-    /// durable JSON_ARRAYAGG representation.
-    Aggregate(Box<JsonInput>),
     /// The compiler's aggregate over a JSON_ARRAY query input. Its completed
     /// derived query must supply exactly one column before output type binding.
     QueryAggregate(Box<JsonInput>),
@@ -1071,6 +1068,38 @@ pub struct JsonObjectExpr {
     pub unique_keys: Option<bool>,
     /// Optional output type and format.
     pub returning: Option<JsonOutputClause>,
+}
+
+/// The actual value arguments of a standard SQL/JSON aggregate.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum JsonAggregateSource {
+    /// One array element per input row.
+    Array(Box<JsonInput>),
+    /// One object key/value pair per input row.
+    Object(Box<JsonKeyValue>),
+}
+
+/// PostgreSQL's standard SQL/JSON aggregate syntax.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonAggregateExpr {
+    /// The actual array element or object pair.
+    pub source: JsonAggregateSource,
+    /// Array aggregate ordering, inside the constructor parentheses.
+    pub order_by: Vec<OrderByExpr>,
+    /// Explicit SQL NULL handling.
+    pub null_clause: Option<JsonNullClause>,
+    /// Object key uniqueness, if specified.
+    pub unique_keys: Option<bool>,
+    /// Declared output type and format.
+    pub returning: Option<JsonOutputClause>,
+    /// The rows supplied to the selected transition.
+    pub filter: Option<Box<Expr>>,
+    /// The selected window, if this is a window aggregate.
+    pub over: Option<WindowType>,
 }
 
 /// The item category tested by `IS JSON`.
@@ -1214,6 +1243,8 @@ pub enum Expr {
     JsonArray(JsonArrayExpr),
     /// PostgreSQL standard SQL/JSON object construction.
     JsonObject(JsonObjectExpr),
+    /// Standard SQL/JSON array or object aggregate.
+    JsonAggregate(JsonAggregateExpr),
     /// PostgreSQL's typed and optionally unique `IS JSON` predicate.
     IsJson(JsonIsPredicate),
     /// `IS FALSE` operator
@@ -2546,19 +2577,14 @@ impl fmt::Display for Expr {
             }
             Expr::JsonArray(array) => {
                 f.write_str(
-                    if matches!(
-                        array.source,
-                        JsonArraySource::Aggregate(_) | JsonArraySource::QueryAggregate(_)
-                    ) {
+                    if matches!(array.source, JsonArraySource::QueryAggregate(_)) {
                         "JSON_ARRAYAGG("
                     } else {
                         "JSON_ARRAY("
                     },
                 )?;
                 match &array.source {
-                    JsonArraySource::Aggregate(input) | JsonArraySource::QueryAggregate(input) => {
-                        input.fmt(f)?
-                    }
+                    JsonArraySource::QueryAggregate(input) => input.fmt(f)?,
                     JsonArraySource::Values(values) => {
                         display_comma_separated(values).fmt(f)?;
                     }
@@ -2599,6 +2625,42 @@ impl fmt::Display for Expr {
                     write!(f, " {returning}")?;
                 }
                 f.write_str(")")
+            }
+            Expr::JsonAggregate(aggregate) => {
+                match &aggregate.source {
+                    JsonAggregateSource::Array(input) => write!(f, "JSON_ARRAYAGG({input}")?,
+                    JsonAggregateSource::Object(pair) => {
+                        write!(f, "JSON_OBJECTAGG({} VALUE {}", pair.key, pair.value)?;
+                    }
+                }
+                if !aggregate.order_by.is_empty() {
+                    write!(
+                        f,
+                        " ORDER BY {}",
+                        display_comma_separated(&aggregate.order_by)
+                    )?;
+                }
+                if let Some(null_clause) = &aggregate.null_clause {
+                    write!(f, " {null_clause}")?;
+                }
+                if let Some(unique) = aggregate.unique_keys {
+                    write!(
+                        f,
+                        " {} UNIQUE KEYS",
+                        if unique { "WITH" } else { "WITHOUT" }
+                    )?;
+                }
+                if let Some(returning) = &aggregate.returning {
+                    write!(f, " {returning}")?;
+                }
+                f.write_str(")")?;
+                if let Some(filter) = &aggregate.filter {
+                    write!(f, " FILTER (WHERE {filter})")?;
+                }
+                if let Some(over) = &aggregate.over {
+                    write!(f, " OVER {over}")?;
+                }
+                Ok(())
             }
             Expr::IsJson(predicate) => {
                 write!(
@@ -4298,7 +4360,8 @@ pub enum Statement {
     /// LOAD
     /// ```
     Load {
-        /// Only for DuckDB
+        /// Extension identifier for DuckDB/Generic, or decoded PostgreSQL
+        /// filename with single quote style. Filename case is significant.
         extension_name: Ident,
     },
     // TODO: Support ROW FORMAT
@@ -13352,12 +13415,11 @@ pub struct ResetStatement {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct OptimizerHint {
-    /// An optional prefix between the comment marker and `+`.
+    /// Prefix carried by the hint representation.
     ///
-    /// Standard optimizer hints like `/*+ ... */` have an empty prefix,
-    /// while system-specific hints like `/*abc+ ... */` have `prefix = "abc"`.
-    /// The prefix is any sequence of ASCII alphanumeric characters
-    /// immediately before the `+` marker.
+    /// Parsed optimizer hints have an empty prefix: `+` must immediately
+    /// follow the comment delimiter. An internal `+` in an ordinary comment
+    /// does not introduce a hint.
     pub prefix: String,
     /// the raw text of the optimizer hint without its markers
     pub text: String,

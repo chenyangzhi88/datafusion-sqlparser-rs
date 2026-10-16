@@ -18,7 +18,7 @@ use alloc::{boxed::Box, format, vec, vec::Vec};
 use crate::{
     ast::{
         Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr, MergeInsertKind,
-        MergeUpdateExpr, ObjectName, OutputClause, SetExpr,
+        MergeUpdateExpr, ObjectName, OutputClause, SelectInto, SelectIntoTarget, SetExpr,
     },
     dialect::{BigQueryDialect, GenericDialect, MySqlDialect, PostgreSqlDialect},
     keywords::Keyword,
@@ -250,7 +250,14 @@ impl Parser<'_> {
         let select_items = self.parse_projection()?;
         let into_table = if start_keyword == Keyword::OUTPUT && self.peek_keyword(Keyword::INTO) {
             self.expect_keyword_is(Keyword::INTO)?;
-            Some(self.parse_select_into()?)
+            Some(SelectInto {
+                temporary: false,
+                unlogged: false,
+                table: false,
+                // OUTPUT writes rows into one table/table variable. It does
+                // not share SELECT INTO's scalar-variable or file grammar.
+                target: SelectIntoTarget::Table(self.parse_object_name(false)?),
+            })
         } else {
             None
         };

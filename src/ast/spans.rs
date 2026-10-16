@@ -1762,8 +1762,7 @@ impl Spanned for Expr {
                 span
             }
             Expr::JsonArray(array) => match &array.source {
-                super::JsonArraySource::Aggregate(input)
-                | super::JsonArraySource::QueryAggregate(input) => input.expr.span(),
+                super::JsonArraySource::QueryAggregate(input) => input.expr.span(),
                 super::JsonArraySource::Values(values) => {
                     union_spans(values.iter().map(|value| value.expr.span()))
                 }
@@ -1775,6 +1774,24 @@ impl Spanned for Expr {
                     .iter()
                     .flat_map(|entry| [entry.key.span(), entry.value.expr.span()]),
             ),
+            Expr::JsonAggregate(aggregate) => {
+                let input = match &aggregate.source {
+                    super::JsonAggregateSource::Array(input) => input.expr.span(),
+                    super::JsonAggregateSource::Object(pair) => {
+                        pair.key.span().union(&pair.value.expr.span())
+                    }
+                };
+                input
+                    .union(&union_spans(
+                        aggregate.order_by.iter().map(|order| order.expr.span()),
+                    ))
+                    .union(
+                        &aggregate
+                            .filter
+                            .as_ref()
+                            .map_or(Span::empty(), |filter| filter.span()),
+                    )
+            }
             Expr::IsJson(predicate) => predicate.expr.span(),
             Expr::AnyOp {
                 left,

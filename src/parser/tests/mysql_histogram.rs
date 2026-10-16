@@ -58,24 +58,54 @@ fn analyze_modifiers_and_table_synonym_share_the_typed_histogram_action() {
         "ANALYZE TABLE t LOCAL",
         "ANALYZE NO_WRITE_TO_BINLOG t",
         "CHECK LOCAL TABLE t",
-        "OPTIMIZE LOCAL TABLE t",
-        "REPAIR NO_WRITE_TO_BINLOG TABLE t",
-        "CHECK TABLES t",
-        "OPTIMIZE TABLES t",
-        "REPAIR TABLES t",
+        "CHECK NO_WRITE_TO_BINLOG TABLE t",
+        "OPTIMIZE LOCAL NO_WRITE_TO_BINLOG TABLE t",
+        "REPAIR LOCAL LOCAL TABLE t",
     ] {
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
     }
-    for command in ["CHECK", "OPTIMIZE", "REPAIR"] {
-        let sql = format!("{command} TABLE t");
-        assert!(matches!(
-            Parser::parse_sql(&MySqlDialect {}, &sql).unwrap()[0],
-            Statement::MySqlTableMaintenance {
-                location: None,
-                histogram: None,
-                ..
+    // mysql-8.4.0/sql/sql_yacc.yy: all three use table_or_tables;
+    // OPTIMIZE and REPAIR also use opt_no_write_to_binlog, including LOCAL.
+    for (command, expected_operation) in [
+        ("CHECK", MySqlTableMaintenanceOperation::Check),
+        ("OPTIMIZE", MySqlTableMaintenanceOperation::Optimize),
+        ("REPAIR", MySqlTableMaintenanceOperation::Repair),
+    ] {
+        for (modifier, expected_location) in [
+            ("", None),
+            ("LOCAL ", Some(FlushLocation::Local)),
+            ("NO_WRITE_TO_BINLOG ", Some(FlushLocation::NoWriteToBinlog)),
+        ] {
+            if expected_operation == MySqlTableMaintenanceOperation::Check
+                && expected_location.is_some()
+            {
+                continue;
             }
-        ));
+            for table in ["TABLE", "TABLES"] {
+                let sql = format!("{command} {modifier}{table} db.t,db.u");
+                let parsed = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap().remove(0);
+                let Statement::MySqlTableMaintenance {
+                    operation,
+                    location,
+                    tables,
+                    options,
+                    histogram,
+                } = &parsed
+                else {
+                    panic!("{sql}: {parsed:?}")
+                };
+                assert_eq!(*operation, expected_operation, "{sql}");
+                assert_eq!(*location, expected_location, "{sql}");
+                assert_eq!(tables.len(), 2, "{sql}");
+                assert!(options.is_empty(), "{sql}");
+                assert!(histogram.is_none(), "{sql}");
+                assert_eq!(
+                    Parser::parse_sql(&MySqlDialect {}, &parsed.to_string()).unwrap()[0],
+                    parsed,
+                    "{sql}"
+                );
+            }
+        }
     }
 }
 

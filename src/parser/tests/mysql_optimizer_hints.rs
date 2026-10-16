@@ -6,7 +6,7 @@ use crate::parser::Parser;
 fn optimizer_hint_carrier_does_not_turn_other_comments_into_native_hints() {
     for (sql, expected) in [
         ("SELECT /*+ SET_VAR(sql_buffer_result=ON) */ 1", 1),
-        ("SELECT /*abc+ SET_VAR(sql_buffer_result=ON) */ 1", 1),
+        ("SELECT /*abc+ SET_VAR(sql_buffer_result=ON) */ 1", 0),
         ("SELECT /*ordinary SET_VAR(sql_buffer_result=ON) */ 1", 0),
     ] {
         let statement = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);

@@ -1196,6 +1196,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// PostgreSQL Sconst scanning, including newline continuation and UESCAPE.
+    /// LOAD accepts only a decoded filename string under this grammar.
+    fn supports_postgres_string_constants(&self) -> bool {
+        false
+    }
+
     /// Returns true if this dialect expects the `TOP` option
     /// before the `ALL`/`DISTINCT` options in a `SELECT` statement.
     fn supports_top_before_distinct(&self) -> bool {
@@ -1404,13 +1410,23 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if the dialect supports `SET NAMES <charset_name> [COLLATE <collation_name>]`.
+    /// Returns true if the dialect supports `SET NAMES`.
     ///
     /// - [MySQL](https://dev.mysql.com/doc/refman/8.4/en/set-names.html)
-    /// - [PostgreSQL](https://www.postgresql.org/docs/17/sql-set.html)
-    ///
-    /// Note: Postgres doesn't support the `COLLATE` clause, but we permissively parse it anyway.
+    /// - [PostgreSQL](https://www.postgresql.org/docs/16/sql-set.html)
     fn supports_set_names(&self) -> bool {
+        false
+    }
+
+    /// Returns true if `SET NAMES` permits a character-set identifier.
+    /// When false, its value production is an optional SQL string literal
+    /// or DEFAULT, as in PostgreSQL's `opt_encoding` grammar.
+    fn supports_set_names_identifier(&self) -> bool {
+        true
+    }
+
+    /// Returns true if `SET NAMES` permits a `COLLATE` clause.
+    fn supports_set_names_collation(&self) -> bool {
         false
     }
 

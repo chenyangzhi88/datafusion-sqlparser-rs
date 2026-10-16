@@ -4030,3 +4030,221 @@ fn canonical_hint_keyword_mapping_keeps_fixed_lexical_identity() {
         "a default adapter has no true hint service; metadata lookup is not authority"
     );
 }
+
+#[test]
+fn tokenize_postgres_sconst_owns_decoded_continuations_and_uescape() {
+    let dialect = PostgreSqlDialect {};
+    for (sql, expected) in [
+        (
+            r#"'a' -- continue
+ 'b'"#,
+            Token::SingleQuotedString("ab".into()),
+        ),
+        ("'a'\r\n\t\x0c'b'", Token::SingleQuotedString("ab".into())),
+        (
+            r#"E'\xC3'
+'\xA9'"#,
+            Token::EscapedStringLiteral("é".into()),
+        ),
+        (
+            r#"E'\1'
+'23'"#,
+            Token::EscapedStringLiteral("\u{0001}23".into()),
+        ),
+        (
+            r"U&'\D83D\+00DE00'",
+            Token::UnicodeStringLiteral("😀".into()),
+        ),
+        (
+            r#"U&'!D83D'
+'!DE00' UESCAPE '!'"#,
+            Token::UnicodeStringLiteral("😀".into()),
+        ),
+        (
+            r#"U&'!00'
+'61' UESCAPE '!'"#,
+            Token::UnicodeStringLiteral("a".into()),
+        ),
+        (
+            r"U&'\raw!0061!!' UESCAPE '!'",
+            Token::UnicodeStringLiteral(r"\rawa!".into()),
+        ),
+        (
+            r"U&'!0061' UESCAPE E'\041'",
+            Token::UnicodeStringLiteral("a".into()),
+        ),
+        (
+            r"U&'!0061' UESCAPE $$!$$",
+            Token::UnicodeStringLiteral("a".into()),
+        ),
+        (
+            r#"U&'!0061' UESCAPE ''
+'!'"#,
+            Token::UnicodeStringLiteral("a".into()),
+        ),
+        (
+            r"U&'!0061' /* nested /* comment */ */ UESCAPE /* Sconst */ '!'",
+            Token::UnicodeStringLiteral("a".into()),
+        ),
+    ] {
+        assert_eq!(
+            Tokenizer::new(&dialect, sql).tokenize().unwrap(),
+            vec![expected],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn tokenize_postgres_sconst_does_not_join_noncontinuations() {
+    let dialect = PostgreSqlDialect {};
+    for sql in [
+        "'a' 'b'",
+        "'a'\nE'b'",
+        "$$a$$\n'b'",
+        "'a' /*\n*/ 'b'",
+        "'a'\n/* block */ 'b'",
+        "U&'a' /*\n*/ 'b'",
+    ] {
+        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| !matches!(token, Token::Whitespace(_)))
+                .count(),
+            2,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn tokenize_postgres_unicode_rejects_non_sconst_suffix_and_invalid_values() {
+    let dialect = PostgreSqlDialect {};
+    for sql in [
+        r"U&'!0061' UESCAPE U&'!'",
+        r"U&'!0061' UESCAPE identifier",
+        r"U&'!0061' UESCAPE ''",
+        r"U&'!0061' UESCAPE '!!'",
+        r"U&'!0061' UESCAPE 'A'",
+        r"U&'!0061' UESCAPE '+'",
+        r"U&'!0061' UESCAPE ''''",
+        "U&'!0061' UESCAPE '\"'",
+        r"U&'!0061' UESCAPE ' '",
+        r"U&'!0061' UESCAPE E'\n'",
+        r"U&'!0061' UESCAPE E'\000'",
+        r"U&'!0061' UESCAPE '¡'",
+        r"U&'\0000'",
+        r"U&'\+110000'",
+        r"U&'\D800'",
+        r"U&'\DC00'",
+        r"U&'\D800x\DC00'",
+        r"U&'\D800\\\DC00'",
+        r"U&'\D800\0041'",
+        r"U&'\GGGG'",
+        r"U&'\+12345'",
+        r"E'\uD83D'
+'\uDE00'",
+        r"E'\x00'",
+        r"E'\xFF'",
+    ] {
+        assert!(Tokenizer::new(&dialect, sql).tokenize().is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn tokenize_postgres_sconst_preserves_other_dialect_scanners() {
+    let pg = PostgreSqlDialect {};
+    assert_eq!(
+        Tokenizer::new(&pg, "$😀$MiXeD$😀$").tokenize().unwrap(),
+        vec![Token::DollarQuotedString(DollarQuotedString {
+            value: "MiXeD".into(),
+            tag: Some("😀".into())
+        })],
+    );
+    assert_eq!(
+        Tokenizer::new(&pg, "$1").tokenize().unwrap(),
+        vec![Token::Placeholder("$1".into())],
+    );
+    for dialect in [&GenericDialect {} as &dyn Dialect, &DuckDbDialect {}] {
+        assert_eq!(
+            Tokenizer::new(dialect, "'a'\n'b'").tokenize().unwrap(),
+            vec![
+                Token::SingleQuotedString("a".into()),
+                Token::Whitespace(Whitespace::Newline),
+                Token::SingleQuotedString("b".into())
+            ],
+        );
+    }
+    let tokens = Tokenizer::new(&GenericDialect {}, r"U&'!0061' UESCAPE '!'")
+        .tokenize()
+        .unwrap();
+    assert_eq!(tokens[0], Token::UnicodeStringLiteral("!0061".into()));
+}
+
+#[test]
+fn tokenize_postgres_literal_lookahead_obeys_cancellation() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = calls.clone();
+    let sql = format!("U&'a'{}\n'b'", " ".repeat(8192));
+    let error = Tokenizer::new(&PostgreSqlDialect {}, &sql)
+        .with_cancellation(Arc::new(move || probe.fetch_add(1, Ordering::Relaxed) >= 2))
+        .tokenize()
+        .unwrap_err();
+    assert_eq!(error.message, QUERY_CANCELLED_MESSAGE);
+    assert!(calls.load(Ordering::Relaxed) <= 4);
+}
+
+#[test]
+fn tokenize_postgres_sconst_errors_keep_category_and_actual_location() {
+    let dialect = PostgreSqlDialect {};
+    for (sql, message, line, column) in [
+        ("LOAD E'closed", "Unterminated encoded string literal", 1, 6),
+        (
+            r"LOAD E'\000'",
+            "invalid byte sequence for encoding \"UTF8\": 0x00",
+            1,
+            6,
+        ),
+        (
+            r"LOAD E'\xff'",
+            "invalid byte sequence for encoding \"UTF8\": 0xff",
+            1,
+            6,
+        ),
+        (r"LOAD E'\u0000'", "invalid Unicode escape value", 1, 8),
+        (r"LOAD E'\U00110000'", "invalid Unicode escape value", 1, 8),
+        (r"LOAD E'\u{0001}'", "invalid Unicode escape", 1, 8),
+        (r"LOAD E'\uD800'", "invalid Unicode surrogate pair", 1, 14),
+        (r"LOAD U&'\0000'", "invalid Unicode escape value", 1, 9),
+        (r"LOAD U&'\+110000'", "invalid Unicode escape value", 1, 9),
+        (r"LOAD U&'\D800'", "invalid Unicode surrogate pair", 1, 14),
+        (r"LOAD U&'\DC00'", "invalid Unicode surrogate pair", 1, 9),
+        (r"LOAD U&'\GGGG'", "invalid Unicode escape", 1, 9),
+        (
+            "LOAD U&'!0061' UESCAPE '¡'",
+            "invalid Unicode escape character",
+            1,
+            24,
+        ),
+        (
+            r"LOAD U&'!0061' UESCAPE U&'!'",
+            "UESCAPE must be followed by a simple string literal",
+            1,
+            24,
+        ),
+        (
+            "LOAD U&'ok'\n'\\0000'",
+            "invalid Unicode escape value",
+            2,
+            2,
+        ),
+        (r"LOAD U&'a''\0000'", "invalid Unicode escape value", 1, 12),
+    ] {
+        let error = Tokenizer::new(&dialect, sql).tokenize().unwrap_err();
+        assert_eq!(error.message, message, "{sql}");
+        assert_eq!(error.location, Location::new(line, column), "{sql}");
+        assert_eq!(error.source_kind, MySqlSourceErrorKind::Message);
+    }
+}

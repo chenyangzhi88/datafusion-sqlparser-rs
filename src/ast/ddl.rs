@@ -2400,12 +2400,16 @@ impl fmt::Display for CreateProcedure {
         if self.or_replace {
             write!(f, "OR REPLACE ")?;
         }
-        write!(
-            f,
-            "PROCEDURE {}({})",
-            self.name,
-            display_comma_separated(&self.args)
-        )?;
+        write!(f, "PROCEDURE {}", self.name)?;
+        if matches!(self.body.as_ref(), Some(CreateProcedureBody::Statements(_))) {
+            // Statement-bodied procedures have optional parameters; their
+            // canonical argument list is separated from the routine name.
+            if !self.args.is_empty() {
+                write!(f, " ({})", display_comma_separated(&self.args))?;
+            }
+        } else {
+            write!(f, "({})", display_comma_separated(&self.args))?;
+        }
         if let Some(language) = &self.language {
             write!(f, " LANGUAGE {language}")?;
         }
@@ -4466,6 +4470,7 @@ impl fmt::Display for CreateTable {
         }
 
         match &self.table_options {
+            CreateTableOptions::Plain(options) if options.is_empty() => (),
             options @ CreateTableOptions::With(_)
             | options @ CreateTableOptions::Plain(_)
             | options @ CreateTableOptions::TableProperties(_) => write!(f, " {options}")?,

@@ -835,16 +835,37 @@ fn parse_prefix_key_part() {
     let expected = vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(
         number("10"),
     )))];
-    for sql in [
-        "CREATE INDEX idx_index ON t(textcol(10))",
-        "ALTER TABLE tab ADD INDEX idx_index (textcol(10))",
-        "ALTER TABLE tab ADD PRIMARY KEY (textcol(10))",
-        "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
-        "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
-        "ALTER TABLE tab ADD FULLTEXT INDEX (textcol(10))",
-        "CREATE TABLE t (textcol TEXT, INDEX idx_index (textcol(10)))",
+    for (sql, canonical) in [
+        (
+            "CREATE INDEX idx_index ON t(textcol(10))",
+            "CREATE INDEX idx_index ON t (textcol(10))",
+        ),
+        (
+            "ALTER TABLE tab ADD INDEX idx_index (textcol(10))",
+            "ALTER TABLE tab ADD INDEX idx_index (textcol(10))",
+        ),
+        (
+            "ALTER TABLE tab ADD PRIMARY KEY (textcol(10))",
+            "ALTER TABLE tab ADD PRIMARY KEY (textcol(10))",
+        ),
+        (
+            "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
+            "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
+        ),
+        (
+            "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
+            "ALTER TABLE tab ADD UNIQUE KEY (textcol(10))",
+        ),
+        (
+            "ALTER TABLE tab ADD FULLTEXT INDEX (textcol(10))",
+            "ALTER TABLE tab ADD FULLTEXT INDEX (textcol(10))",
+        ),
+        (
+            "CREATE TABLE t (textcol TEXT, INDEX idx_index (textcol(10)))",
+            "CREATE TABLE t (textcol TEXT, INDEX idx_index (textcol(10)))",
+        ),
     ] {
-        match index_column(mysql_and_generic().verified_stmt(sql)) {
+        match index_column(mysql_and_generic().one_statement_parses_to(sql, canonical)) {
             Expr::Function(Function {
                 name,
                 args: FunctionArguments::List(FunctionArgumentList { args, .. }),
@@ -861,10 +882,10 @@ fn parse_prefix_key_part() {
 #[test]
 fn test_functional_key_part() {
     assert_eq!(
-        index_column(
-            mysql_and_generic()
-                .verified_stmt("CREATE INDEX idx_index ON t((col COLLATE utf8mb4_bin) DESC)")
-        ),
+        index_column(mysql_and_generic().one_statement_parses_to(
+            "CREATE INDEX idx_index ON t((col COLLATE utf8mb4_bin) DESC)",
+            "CREATE INDEX idx_index ON t ((col COLLATE utf8mb4_bin) DESC)"
+        )),
         Expr::Nested(Box::new(Expr::Collate {
             expr: Box::new(Expr::Identifier("col".into())),
             collation: ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
@@ -970,25 +991,23 @@ fn parse_create_table_comment() {
     let without_equal = "CREATE TABLE foo (bar INT) COMMENT 'baz'";
     let with_equal = "CREATE TABLE foo (bar INT) COMMENT = 'baz'";
 
-    for sql in [without_equal, with_equal] {
+    for (sql, expected_comment) in [
+        (without_equal, CommentDef::WithoutEq("baz".to_string())),
+        (with_equal, CommentDef::WithEq("baz".to_string())),
+    ] {
         match mysql().verified_stmt(sql) {
             Statement::CreateTable(CreateTable {
                 name,
+                comment,
                 table_options,
                 ..
             }) => {
                 assert_eq!(name.to_string(), "foo");
-
-                let plain_options = match table_options {
-                    CreateTableOptions::Plain(options) => options,
+                assert_eq!(comment, Some(expected_comment));
+                match table_options {
+                    CreateTableOptions::Plain(options) => assert!(options.is_empty()),
                     _ => unreachable!(),
-                };
-                let comment = match plain_options.first().unwrap() {
-                    SqlOption::Comment(CommentDef::WithEq(c))
-                    | SqlOption::Comment(CommentDef::WithoutEq(c)) => c,
-                    _ => unreachable!(),
-                };
-                assert_eq!(comment, "baz");
+                }
             }
             _ => unreachable!(),
         }
@@ -1033,6 +1052,7 @@ fn parse_create_table_multiple_options_order_independent() {
             Statement::CreateTable(CreateTable {
                 name,
                 table_options,
+                comment,
                 ..
             }) => {
                 assert_eq!(name.to_string(), "mytable");
@@ -1055,8 +1075,10 @@ fn parse_create_table_multiple_options_order_independent() {
                     value: Expr::Value(test_utils::number("8").with_empty_span())
                 }));
 
-                assert!(plain_options
-                    .contains(&SqlOption::Comment(CommentDef::WithEq("abc".to_owned()))));
+                assert_eq!(comment, Some(CommentDef::WithEq("abc".to_owned())));
+                assert!(!plain_options
+                    .iter()
+                    .any(|option| matches!(option, SqlOption::Comment(_))));
 
                 assert!(plain_options.contains(&SqlOption::KeyValue {
                     key: Ident::new("ROW_FORMAT"),
@@ -1070,8 +1092,7 @@ fn parse_create_table_multiple_options_order_independent() {
 
 #[test]
 fn parse_create_table_with_all_table_options() {
-    let sql =
-        "CREATE TABLE foo (bar INT NOT NULL AUTO_INCREMENT) ENGINE = InnoDB AUTO_INCREMENT = 123 DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci INSERT_METHOD = FIRST KEY_BLOCK_SIZE = 8 ROW_FORMAT = DYNAMIC DATA DIRECTORY = '/var/lib/mysql/data' INDEX DIRECTORY = '/var/lib/mysql/index' PACK_KEYS = 1 STATS_AUTO_RECALC = 1 STATS_PERSISTENT = 0 STATS_SAMPLE_PAGES = 128 DELAY_KEY_WRITE = 1 COMPRESSION = 'ZLIB' ENCRYPTION = 'Y' MAX_ROWS = 10000 MIN_ROWS = 10 AUTOEXTEND_SIZE = 64 AVG_ROW_LENGTH = 128 CHECKSUM = 1 CONNECTION = 'mysql://localhost' ENGINE_ATTRIBUTE = 'primary' PASSWORD = 'secure_password' SECONDARY_ENGINE_ATTRIBUTE = 'secondary_attr' START TRANSACTION TABLESPACE my_tablespace STORAGE DISK UNION = (table1, table2, table3)";
+    let sql = "CREATE TABLE foo (bar INT NOT NULL AUTO_INCREMENT) ENGINE = InnoDB AUTO_INCREMENT = 123 DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci INSERT_METHOD = FIRST KEY_BLOCK_SIZE = 8 ROW_FORMAT = DYNAMIC DATA DIRECTORY = '/var/lib/mysql/data' INDEX DIRECTORY = '/var/lib/mysql/index' PACK_KEYS = 1 STATS_AUTO_RECALC = 1 STATS_PERSISTENT = 0 STATS_SAMPLE_PAGES = 128 DELAY_KEY_WRITE = 1 COMPRESSION = 'ZLIB' ENCRYPTION = 'Y' MAX_ROWS = 10000 MIN_ROWS = 10 AUTOEXTEND_SIZE = 64 AVG_ROW_LENGTH = 128 CHECKSUM = 1 CONNECTION = 'mysql://localhost' ENGINE_ATTRIBUTE = 'primary' PASSWORD = 'secure_password' SECONDARY_ENGINE_ATTRIBUTE = 'secondary_attr' START TRANSACTION TABLESPACE my_tablespace STORAGE DISK UNION = (table1, table2, table3)";
 
     match mysql().verified_stmt(sql) {
         Statement::CreateTable(CreateTable {
@@ -3188,8 +3209,7 @@ fn parse_alter_table_with_algorithm() {
     assert_eq!(expected_operation, operation);
 
     //  Check order doesn't matter
-    let sql =
-        "ALTER TABLE users DROP COLUMN password_digest, ALGORITHM = COPY, RENAME COLUMN name TO username";
+    let sql = "ALTER TABLE users DROP COLUMN password_digest, ALGORITHM = COPY, RENAME COLUMN name TO username";
     let stmt = mysql_and_generic().verified_stmt(sql);
     match stmt {
         Statement::AlterTable(AlterTable { operations, .. }) => {
@@ -3236,8 +3256,7 @@ fn parse_alter_table_with_lock() {
     let operation = alter_table_op(mysql_and_generic().verified_stmt(sql));
     assert_eq!(expected_operation, operation);
 
-    let sql =
-        "ALTER TABLE users DROP COLUMN password_digest, LOCK = EXCLUSIVE, RENAME COLUMN name TO username";
+    let sql = "ALTER TABLE users DROP COLUMN password_digest, LOCK = EXCLUSIVE, RENAME COLUMN name TO username";
     let stmt = mysql_and_generic().verified_stmt(sql);
     match stmt {
         Statement::AlterTable(AlterTable { operations, .. }) => {
@@ -3953,11 +3972,23 @@ fn parse_logical_xor() {
 
 #[test]
 fn parse_bitstring_literal() {
-    let select = mysql_and_generic().verified_only_select("SELECT B'111'");
+    let select = TestedDialects::new(vec![Box::new(GenericDialect {})])
+        .verified_only_select("SELECT B'111'");
     assert_eq!(
         select.projection,
         vec![SelectItem::UnnamedExpr(Expr::Value(
             (Value::SingleQuotedByteStringLiteral("111".to_string())).with_empty_span()
+        ))]
+    );
+    let stmt = mysql().one_statement_parses_to("SELECT B'111'", "SELECT X'07'");
+    let Statement::Query(query) = stmt else {
+        panic!("expected query")
+    };
+    let select = query.body.as_select().unwrap();
+    assert_eq!(
+        select.projection,
+        vec![SelectItem::UnnamedExpr(Expr::value(
+            Value::HexStringLiteral("07".into())
         ))]
     );
 }
@@ -4369,8 +4400,8 @@ fn test_variable_assignment_using_colon_equal() {
                 select.projection,
                 vec![
                     SelectItem::UnnamedExpr(Expr::BinaryOp {
-                        left: Box::new(Expr::Identifier(Ident {
-                            value: "@price".to_string(),
+                        left: Box::new(Expr::UserVariable(Ident {
+                            value: "price".to_string(),
                             quote_style: None,
                             span: Span::empty(),
                         })),
@@ -4382,8 +4413,8 @@ fn test_variable_assignment_using_colon_equal() {
                         })),
                     }),
                     SelectItem::UnnamedExpr(Expr::BinaryOp {
-                        left: Box::new(Expr::Identifier(Ident {
-                            value: "@tax".to_string(),
+                        left: Box::new(Expr::UserVariable(Ident {
+                            value: "tax".to_string(),
                             quote_style: None,
                             span: Span::empty(),
                         })),
@@ -4436,8 +4467,8 @@ fn test_variable_assignment_using_colon_equal() {
                         })
                     ])),
                     value: Expr::BinaryOp {
-                        left: Box::new(Expr::Identifier(Ident {
-                            value: "@new_price".to_string(),
+                        left: Box::new(Expr::UserVariable(Ident {
+                            value: "new_price".to_string(),
                             quote_style: None,
                             span: Span::empty(),
                         })),
@@ -4754,18 +4785,30 @@ fn test_ddl_with_index_using() {
         format!("CREATE TABLE foo (name VARCHAR(255), age INT, KEY idx_name {columns} {using})"),
         format!("ALTER TABLE foo ADD KEY idx_name {columns} {using}"),
     ] {
-        mysql_and_generic().verified_stmt(&sql);
+        if sql == format!("CREATE INDEX idx_name ON test{columns} {using}") {
+            mysql_and_generic().one_statement_parses_to(
+                &sql,
+                &format!("CREATE INDEX idx_name ON test {columns} {using}"),
+            );
+        } else {
+            mysql_and_generic().verified_stmt(&sql);
+        }
     }
 }
 
 #[test]
 fn test_create_index_options() {
-    mysql_and_generic()
-        .verified_stmt("CREATE INDEX idx_name ON t(c1, c2) USING HASH LOCK = SHARED");
-    mysql_and_generic()
-        .verified_stmt("CREATE INDEX idx_name ON t(c1, c2) USING BTREE ALGORITHM = INPLACE");
-    mysql_and_generic().verified_stmt(
+    mysql_and_generic().one_statement_parses_to(
+        "CREATE INDEX idx_name ON t(c1, c2) USING HASH LOCK = SHARED",
+        "CREATE INDEX idx_name ON t (c1, c2) USING HASH LOCK = SHARED",
+    );
+    mysql_and_generic().one_statement_parses_to(
+        "CREATE INDEX idx_name ON t(c1, c2) USING BTREE ALGORITHM = INPLACE",
+        "CREATE INDEX idx_name ON t (c1, c2) USING BTREE ALGORITHM = INPLACE",
+    );
+    mysql_and_generic().one_statement_parses_to(
         "CREATE INDEX idx_name ON t(c1, c2) USING BTREE LOCK = EXCLUSIVE ALGORITHM = DEFAULT",
+        "CREATE INDEX idx_name ON t (c1, c2) USING BTREE LOCK = EXCLUSIVE ALGORITHM = DEFAULT",
     );
 }
 
@@ -4813,35 +4856,40 @@ fn test_optimizer_hints() {
        DELETE /*+ foobar */ FROM table_name",
     );
 
-    // prefixed hints: any alphanumeric prefix before `+` is captured
-    let select = mysql_dialect.verified_only_select("SELECT /*abc+ text */ 1");
-    assert_eq!(select.optimizer_hints.len(), 1);
-    assert_eq!(select.optimizer_hints[0].prefix, "abc");
-    assert_eq!(select.optimizer_hints[0].text, " text ");
+    // An internal `+` does not turn an ordinary comment into a hint.
+    let select =
+        mysql_dialect.verified_only_select_with_canonical("SELECT /*abc+ text */ 1", "SELECT 1");
+    assert!(select.optimizer_hints.is_empty());
 
-    // multiple hints with different prefixes
-    let select = mysql_dialect.verified_only_select("SELECT /*+ A */ /*x2+ B */ 1");
-    assert_eq!(select.optimizer_hints.len(), 2);
+    // Only the comment with `+` immediately after its delimiter is a hint.
+    let select = mysql_dialect
+        .verified_only_select_with_canonical("SELECT /*+ A */ /*x2+ B */ 1", "SELECT /*+ A */ 1");
+    assert_eq!(select.optimizer_hints.len(), 1);
     assert_eq!(select.optimizer_hints[0].prefix, "");
     assert_eq!(select.optimizer_hints[0].text, " A ");
-    assert_eq!(select.optimizer_hints[1].prefix, "x2");
-    assert_eq!(select.optimizer_hints[1].text, " B ");
 
-    // hints mixed with regular comments: regular comments are skipped
+    // Ordinary comments are skipped, including comments with an internal `+`.
     let select = mysql_dialect.verified_only_select_with_canonical(
         "SELECT /*+ A */ /* Regular comment */ /*x2+ B */ 1",
-        "SELECT /*+ A */ /*x2+ B */ 1",
+        "SELECT /*+ A */ 1",
     );
-    assert_eq!(select.optimizer_hints.len(), 2);
+    assert_eq!(select.optimizer_hints.len(), 1);
     assert_eq!(select.optimizer_hints[0].prefix, "");
     assert_eq!(select.optimizer_hints[0].text, " A ");
-    assert_eq!(select.optimizer_hints[1].prefix, "x2");
-    assert_eq!(select.optimizer_hints[1].text, " B ");
 
-    // prefixed hints in INSERT/UPDATE/DELETE
-    mysql_dialect.verified_stmt("INSERT /*abc+ append */ INTO t2 VALUES (2)");
-    mysql_dialect.verified_stmt("UPDATE /*abc+ PARALLEL */ table_name SET column1 = 1");
-    mysql_dialect.verified_stmt("DELETE /*abc+ ENABLE_DML */ FROM table_name");
+    // The same marker rule applies to INSERT/UPDATE/DELETE.
+    mysql_dialect.one_statement_parses_to(
+        "INSERT /*abc+ append */ INTO t2 VALUES (2)",
+        "INSERT INTO t2 VALUES (2)",
+    );
+    mysql_dialect.one_statement_parses_to(
+        "UPDATE /*abc+ PARALLEL */ table_name SET column1 = 1",
+        "UPDATE table_name SET column1 = 1",
+    );
+    mysql_dialect.one_statement_parses_to(
+        "DELETE /*abc+ ENABLE_DML */ FROM table_name",
+        "DELETE FROM table_name",
+    );
 }
 
 #[test]

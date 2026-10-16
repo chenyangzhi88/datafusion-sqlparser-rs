@@ -311,6 +311,10 @@ impl Dialect for MySqlDialect {
         true
     }
 
+    fn supports_set_names_collation(&self) -> bool {
+        true
+    }
+
     fn supports_comma_separated_set_assignments(&self) -> bool {
         true
     }
@@ -507,6 +511,14 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_set_names(&self) -> bool {
         MySqlDialect {}.supports_set_names()
+    }
+
+    fn supports_set_names_identifier(&self) -> bool {
+        MySqlDialect {}.supports_set_names_identifier()
+    }
+
+    fn supports_set_names_collation(&self) -> bool {
+        MySqlDialect {}.supports_set_names_collation()
     }
 
     fn supports_comma_separated_set_assignments(&self) -> bool {

@@ -389,14 +389,12 @@ fn test_optimizer_hints() {
                VALUES (ps.person_id, ps.first_name, ps.last_name, ps.title)",
     );
 
-    // single-line prefixed hint (Oracle supports `--` without trailing whitespace)
+    // An internal `+` is ordinary text, also in a single-line comment.
     let select = oracle_dialect.verified_only_select_with_canonical(
         "SELECT --abc+ text\n 1 FROM dual",
-        "SELECT --abc+ text\n 1 FROM dual",
+        "SELECT 1 FROM dual",
     );
-    assert_eq!(select.optimizer_hints.len(), 1);
-    assert_eq!(select.optimizer_hints[0].prefix, "abc");
-    assert_eq!(select.optimizer_hints[0].text, " text\n");
+    assert!(select.optimizer_hints.is_empty());
 }
 
 #[test]

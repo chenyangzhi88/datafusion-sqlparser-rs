@@ -221,9 +221,9 @@ impl Dialect for PostgreSqlDialect {
         true
     }
 
-    /// see <https://www.postgresql.org/docs/13/functions-math.html>
+    /// PostgreSQL 16 has prefix/infix custom operators, but no postfix operators.
     fn supports_factorial_operator(&self) -> bool {
-        true
+        false
     }
 
     fn supports_bitwise_shift_operators(&self) -> bool {
@@ -237,6 +237,10 @@ impl Dialect for PostgreSqlDialect {
 
     /// See <https://www.postgresql.org/docs/current/sql-load.html>
     fn supports_load_extension(&self) -> bool {
+        true
+    }
+
+    fn supports_postgres_string_constants(&self) -> bool {
         true
     }
 
@@ -297,6 +301,10 @@ impl Dialect for PostgreSqlDialect {
 
     fn supports_set_names(&self) -> bool {
         true
+    }
+
+    fn supports_set_names_identifier(&self) -> bool {
+        false
     }
 
     fn supports_alter_column_type_using(&self) -> bool {
