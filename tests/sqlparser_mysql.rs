@@ -33,6 +33,33 @@ use test_utils::*;
 #[macro_use]
 mod test_utils;
 
+#[test]
+fn mysql_option_dialect_keeps_the_actual_explain_connection_grammar() {
+    for ansi_quotes in [false, true] {
+        for no_backslash_escapes in [false, true] {
+            for pipes_as_concat in [false, true] {
+                let dialect =
+                    MySqlDialect::with_options(ansi_quotes, pipes_as_concat, no_backslash_escapes);
+                for sql in [
+                    "EXPLAIN FOR CONNECTION 1",
+                    "EXPLAIN FORMAT=JSON FOR CONNECTION 0xFFFFFFFF",
+                ] {
+                    let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+                    assert!(
+                        matches!(&statements[0], Statement::ExplainForConnection { .. }),
+                        "{sql}"
+                    );
+                }
+                assert!(sqlparser::parser::Parser::parse_sql(
+                    &dialect,
+                    "EXPLAIN FOR CONNECTION @id"
+                )
+                .is_err());
+            }
+        }
+    }
+}
+
 fn mysql() -> TestedDialects {
     TestedDialects::new(vec![Box::new(MySqlDialect {})])
 }
@@ -570,6 +597,84 @@ fn parse_show_create() {
 }
 
 #[test]
+fn mysql_ctas_duplicate_is_one_create_query_fact_with_real_span_and_roundtrip() {
+    for (modifier, expected) in [
+        ("IGNORE", MySqlCreateTableDuplicate::Ignore),
+        ("REPLACE", MySqlCreateTableDuplicate::Replace),
+    ] {
+        for tail in [
+            "AS SELECT 1 AS id",
+            "SELECT 1 AS id",
+            "AS (SELECT 1 AS id)",
+            "WITH q AS (SELECT 1 AS id) SELECT id FROM q",
+        ] {
+            let sql =
+                format!("CREATE TEMPORARY TABLE ctas_table(id INT PRIMARY KEY) {modifier} {tail}");
+            let statements = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, &sql).unwrap();
+            let Statement::CreateTable(create) = &statements[0] else {
+                panic!("{sql}");
+            };
+            assert_eq!(create.mysql_on_duplicate, Some(expected));
+            assert!(create.query.is_some());
+            assert!(!create.or_replace);
+            assert!(create.temporary);
+            assert_ne!(create.span(), Span::empty());
+            create.validate_source_order().unwrap();
+            let roundtrip = statements[0].to_string();
+            let reparsed =
+                sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, &roundtrip).unwrap();
+            let Statement::CreateTable(reparsed) = &reparsed[0] else {
+                panic!("{roundtrip}");
+            };
+            assert_eq!(reparsed.mysql_on_duplicate, Some(expected));
+            assert_eq!(
+                reparsed.query.as_ref().unwrap().to_string(),
+                create.query.as_ref().unwrap().to_string()
+            );
+            #[cfg(feature = "serde")]
+            assert_eq!(
+                serde_json::from_str::<Statement>(&serde_json::to_string(&statements[0]).unwrap())
+                    .unwrap(),
+                statements[0]
+            );
+            #[cfg(feature = "visitor")]
+            {
+                let mut names = Vec::new();
+                let outcome = sqlparser::ast::visit_relations(&statements[0], |name| {
+                    names.push(name.to_string());
+                    std::ops::ControlFlow::<()>::Continue(())
+                });
+                assert!(matches!(outcome, std::ops::ControlFlow::Continue(())));
+                assert!(names.iter().any(|name| name == "ctas_table"));
+            }
+        }
+    }
+    for sql in [
+        "CREATE TABLE bad IGNORE",
+        "CREATE TABLE bad REPLACE LIKE source",
+        "CREATE TABLE bad IGNORE REPLACE SELECT 1",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(),
+            "{sql}"
+        );
+    }
+    for dialect in [
+        &GenericDialect {} as &dyn sqlparser::dialect::Dialect,
+        &sqlparser::dialect::PostgreSqlDialect {},
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(dialect, "CREATE TABLE bad IGNORE SELECT 1")
+                .is_err()
+        );
+        assert!(
+            sqlparser::parser::Parser::parse_sql(dialect, "CREATE TABLE bad REPLACE SELECT 1")
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn parse_show_collation() {
     assert_eq!(
         mysql_and_generic().verified_stmt("SHOW COLLATION"),
@@ -884,7 +989,7 @@ fn test_functional_key_part() {
     assert_eq!(
         index_column(mysql_and_generic().one_statement_parses_to(
             "CREATE INDEX idx_index ON t((col COLLATE utf8mb4_bin) DESC)",
-            "CREATE INDEX idx_index ON t ((col COLLATE utf8mb4_bin) DESC)"
+            "CREATE INDEX idx_index ON t ((col COLLATE utf8mb4_bin) DESC)",
         )),
         Expr::Nested(Box::new(Expr::Collate {
             expr: Box::new(Expr::Identifier("col".into())),
@@ -1833,9 +1938,16 @@ fn parse_signed_data_types() {
         }
         _ => unreachable!(),
     }
-    all_dialects_except(|d| d.supports_data_type_signed_suffix())
-        .run_parser_method(sql, |p| p.parse_statement())
-        .expect_err("SIGNED suffix should not be allowed");
+    all_dialects_except(|d| d.supports_data_type_signed_suffix()).one_of_identical_results(
+        |dialect| {
+            let error = sqlparser::parser::Parser::parse_sql(dialect, sql)
+                .expect_err("SIGNED suffix should not be allowed");
+            assert!(error.to_string().contains("SIGNED"), "{dialect:?}: {error}");
+            // Each dialect rejects the same workload; its own delimiter
+            // diagnostics need not be byte-identical to another dialect's.
+            true
+        },
+    );
 }
 
 #[test]
@@ -2743,12 +2855,12 @@ fn parse_update_with_joins() {
             selection,
             returning,
             or: None,
+            postgres_target_inheritance: PostgresTargetInheritance::Default,
             order_by: _,
             limit: None,
             optimizer_hints,
             update_token: _,
             output: _,
-            postgres_target_inheritance: PostgresTargetInheritance::Default,
         }) if optimizer_hints.is_empty() => {
             assert_eq!(
                 TableWithJoins {
@@ -2921,10 +3033,10 @@ fn parse_alter_table_add_column() {
             only,
             operations,
             table_type,
+            comment: None,
             location: _,
             on_cluster: _,
             end_token: _,
-            comment: _,
         }) => {
             assert_eq!(name.to_string(), "tab");
             assert!(!if_exists);
@@ -3908,11 +4020,11 @@ fn parse_json_table() {
                     r#type: DataType::Int(None),
                     character_set: None,
                     collation: None,
-                    on_error_before_empty: false,
                     path: Expr::Value(Value::SingleQuotedString("$".to_string()).with_empty_span()),
                     exists: false,
                     on_empty: Some(JsonTableColumnErrorHandling::Default(Expr::Value(Value::SingleQuotedString("0".to_string()).with_empty_span()))),
                     on_error: Some(JsonTableColumnErrorHandling::Null),
+                    on_error_before_empty: false,
                 }),
             ],
             alias: table_alias(true, "t"),
@@ -3972,6 +4084,14 @@ fn parse_logical_xor() {
 
 #[test]
 fn parse_bitstring_literal() {
+    let select = mysql().verified_only_select_with_canonical("SELECT B'111'", "SELECT X'07'");
+    assert_eq!(
+        select.projection,
+        vec![SelectItem::UnnamedExpr(Expr::Value(
+            Value::HexStringLiteral("07".to_string()).with_empty_span()
+        ))]
+    );
+    // Generic byte strings are a distinct dialect value, not MySQL BIT bytes.
     let select = TestedDialects::new(vec![Box::new(GenericDialect {})])
         .verified_only_select("SELECT B'111'");
     assert_eq!(
@@ -4246,7 +4366,8 @@ fn parse_looks_like_single_line_comment() {
 #[test]
 fn parse_create_trigger() {
     let sql_create_trigger = r#"CREATE TRIGGER emp_stamp BEFORE INSERT ON emp FOR EACH ROW EXECUTE FUNCTION emp_stamp()"#;
-    // EXECUTE FUNCTION is the PostgreSQL/Generic trigger syntax, not a MySQL action.
+    // EXECUTE FUNCTION is the generic/PostgreSQL invocation representation,
+    // not a MySQL saved PSM body. Keep its complete original AST assertion.
     let create_stmt =
         TestedDialects::new(vec![Box::new(GenericDialect {})]).verified_stmt(sql_create_trigger);
     assert_eq!(
@@ -4292,13 +4413,19 @@ fn parse_create_trigger() {
 
 #[test]
 fn parse_create_trigger_compound_statement() {
-    for (sql, body) in [
+    for (sql, name, table, period, body) in [
         (
             "CREATE TRIGGER mytrigger BEFORE INSERT ON mytable FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
+            "mytrigger",
+            "mytable",
+            TriggerPeriod::Before,
             "BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
         ),
         (
             "CREATE TRIGGER tr AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO t2 VALUES (NEW.id); END",
+            "tr",
+            "t1",
+            TriggerPeriod::After,
             "BEGIN INSERT INTO t2 VALUES (NEW.id); END",
         ),
     ] {
@@ -4307,6 +4434,24 @@ fn parse_create_trigger_compound_statement() {
         else {
             unreachable!("Expected CREATE TRIGGER statement");
         };
+        let mut statements = mysql().parse_sql_statements(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let Statement::CreateTrigger(trigger) = statements.remove(0) else {
+            panic!("native CREATE TRIGGER header");
+        };
+        assert_eq!(trigger.name.to_string(), name);
+        assert_eq!(trigger.table_name.to_string(), table);
+        assert_eq!(trigger.period, Some(period));
+        assert_eq!(trigger.events, vec![TriggerEvent::Insert]);
+        assert_eq!(
+            trigger.trigger_object,
+            Some(TriggerObjectKind::ForEach(TriggerObject::Row))
+        );
+        assert_eq!(trigger.mysql_body, Some(MySqlProgramBody::default()));
+        assert!(trigger.exec_body.is_none() && trigger.statements.is_none());
+        // The filled-string parser is deliberately header-only. Actual saved
+        // bytes must be consumed by the original product's PSM callback, not
+        // copied into a second portable statement list or a rendered SQL body.
         assert!(expected_header.statements.is_some());
         expected_header.statements = None;
         assert_mysql_trigger_source(sql, body, expected_header);
@@ -4785,14 +4930,8 @@ fn test_ddl_with_index_using() {
         format!("CREATE TABLE foo (name VARCHAR(255), age INT, KEY idx_name {columns} {using})"),
         format!("ALTER TABLE foo ADD KEY idx_name {columns} {using}"),
     ] {
-        if sql == format!("CREATE INDEX idx_name ON test{columns} {using}") {
-            mysql_and_generic().one_statement_parses_to(
-                &sql,
-                &format!("CREATE INDEX idx_name ON test {columns} {using}"),
-            );
-        } else {
-            mysql_and_generic().verified_stmt(&sql);
-        }
+        let canonical = sql.replace("ON test(", "ON test (");
+        mysql_and_generic().one_statement_parses_to(&sql, &canonical);
     }
 }
 
@@ -4991,6 +5130,543 @@ fn parse_adjacent_string_literal_concatenation() {
     mysql().one_statement_parses_to(sql, r"SELECT 'MySql'");
 }
 
+#[test]
+fn mysql_check_alter_has_typed_identity_and_native_enforcement_syntax() {
+    use sqlparser::dialect::Dialect;
+    assert!(MySqlDialect {}.supports_check_constraint_enforcement());
+    assert!(!GenericDialect {}.supports_check_constraint_enforcement());
+    for (sql, expected) in [
+        (
+            "ALTER TABLE t DROP CHECK ck",
+            AlterTableOperation::DropCheck {
+                name: Ident::new("ck"),
+            },
+        ),
+        (
+            "ALTER TABLE t ALTER CHECK ck ENFORCED",
+            AlterTableOperation::AlterCheck {
+                name: Ident::new("ck"),
+                enforced: true,
+            },
+        ),
+        (
+            "ALTER TABLE t ALTER CHECK ck NOT ENFORCED",
+            AlterTableOperation::AlterCheck {
+                name: Ident::new("ck"),
+                enforced: false,
+            },
+        ),
+        (
+            "ALTER TABLE t ALTER CONSTRAINT ck NOT ENFORCED",
+            AlterTableOperation::AlterConstraintEnforcement {
+                name: Ident::new("ck"),
+                enforced: false,
+            },
+        ),
+    ] {
+        let Statement::AlterTable(alter) = mysql().verified_stmt(sql) else {
+            panic!("ALTER TABLE")
+        };
+        assert_eq!(alter.operations, vec![expected]);
+    }
+    mysql().verified_stmt("ALTER TABLE `表` DROP CHECK `检查`, ALTER CHECK `另一` NOT ENFORCED");
+    let mode = MySqlDialect::with_options(true, true, true);
+    assert!(mode.supports_check_constraint_enforcement());
+    let statements = sqlparser::parser::Parser::parse_sql(
+        &mode,
+        "ALTER TABLE \"表\" ALTER CHECK \"检查\" NOT ENFORCED",
+    )
+    .unwrap();
+    assert!(
+        matches!(&statements[0], Statement::AlterTable(alter) if matches!(&alter.operations[0], AlterTableOperation::AlterCheck { name, enforced: false } if name.value == "检查"))
+    );
+    for sql in [
+        "ALTER TABLE t DROP CHECK IF EXISTS ck",
+        "ALTER TABLE t DROP CHECK ck CASCADE",
+        "ALTER TABLE t DROP CONSTRAINT IF EXISTS ck",
+        "ALTER TABLE t DROP CONSTRAINT ck RESTRICT",
+        "ALTER TABLE t ALTER CHECK ck",
+        "ALTER TABLE t ALTER CONSTRAINT ck DEFERRABLE",
+        "ALTER TABLE t ALTER CHECK ck NOT",
+    ] {
+        assert!(mysql().parse_sql_statements(sql).is_err(), "{sql}");
+    }
+    // The default/shared dialect keeps its pre-existing generic clause.
+    let statements = test_utils::TestedDialects::new(vec![Box::new(GenericDialect {})])
+        .parse_sql_statements("ALTER TABLE t DROP CONSTRAINT IF EXISTS ck CASCADE")
+        .unwrap();
+    assert!(
+        matches!(&statements[0], Statement::AlterTable(alter) if matches!(alter.operations[0], AlterTableOperation::DropConstraint { if_exists: true, .. }))
+    );
+    let pg =
+        test_utils::TestedDialects::new(vec![Box::new(sqlparser::dialect::PostgreSqlDialect {})]);
+    for sql in [
+        "ALTER TABLE t DROP CHECK ck",
+        "ALTER TABLE t ALTER CHECK ck ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT ck NOT ENFORCED",
+    ] {
+        assert!(
+            pg.parse_sql_statements(sql).is_err(),
+            "MySQL CHECK grammar must not change PostgreSQL: {sql}"
+        );
+    }
+}
+
+#[test]
+fn mysql_explain_for_connection_is_a_literal_target() {
+    use sqlparser::ast::Spanned;
+    for sql in [
+        "EXPLAIN FOR CONNECTION 0",
+        "DESC FOR CONNECTION 0",
+        "DESCRIBE FORMAT=JSON FOR CONNECTION 7",
+        "EXPLAIN FOR CONNECTION 18446744073709551615",
+        "EXPLAIN FORMAT=TRADITIONAL FOR CONNECTION 7",
+        "EXPLAIN FORMAT=JSON FOR CONNECTION 7",
+        "EXPLAIN FORMAT=TREE FOR CONNECTION 7",
+        // Native parses this form; the MySQL executor rejects ANALYZE with 1235.
+        "EXPLAIN ANALYZE FOR CONNECTION 7",
+    ] {
+        let statement = mysql().verified_stmt(sql);
+        assert!(matches!(statement, Statement::ExplainForConnection { .. }));
+        assert_eq!(statement.span(), Span::empty());
+    }
+    for sql in [
+        "EXPLAIN FOR CONNECTION -1",
+        "EXPLAIN FOR CONNECTION +1",
+        "EXPLAIN FOR CONNECTION 1.0",
+        "EXPLAIN FOR CONNECTION 18446744073709551616",
+        "EXPLAIN FOR CONNECTION ?",
+        "EXPLAIN FOR CONNECTION @id",
+        "EXPLAIN FOR CONNECTION 1 + 1",
+        "EXPLAIN EXPLAIN FOR CONNECTION 1",
+        "EXPLAIN VERBOSE FOR CONNECTION 1",
+        "EXPLAIN FOR CONNECTION X'01'",
+        "EXPLAIN FOR CONNECTION b'1'",
+    ] {
+        assert!(mysql().parse_sql_statements(sql).is_err(), "{sql}");
+    }
+    mysql().one_statement_parses_to(
+        "EXPLAIN FOR CONNECTION 0xFFFFFFFF",
+        "EXPLAIN FOR CONNECTION 4294967295",
+    );
+    assert!(TestedDialects::new(vec![Box::new(GenericDialect {})])
+        .parse_sql_statements("EXPLAIN FOR CONNECTION 1")
+        .is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn mysql_explain_for_connection_serde_preserves_target() {
+    let statement = mysql().verified_stmt("EXPLAIN FORMAT=JSON FOR CONNECTION 19");
+    let encoded = serde_json::to_string(&statement).unwrap();
+    let decoded: Statement = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(statement, decoded);
+}
+
+#[cfg(feature = "visitor")]
+#[test]
+fn mysql_explain_for_connection_has_no_executable_child() {
+    let statement = mysql().verified_stmt("EXPLAIN FOR CONNECTION 19");
+    let mut expressions = 0;
+    let mut relations = 0;
+    let _ = sqlparser::ast::visit_expressions(&statement, |_| {
+        expressions += 1;
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    let _ = sqlparser::ast::visit_relations(&statement, |_| {
+        relations += 1;
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    assert_eq!((expressions, relations), (0, 0));
+}
+
+#[test]
+fn explain_connection_hex_identifier_uses_native_signed_saturation_before_thread_cast() {
+    for (source, expected) in [
+        ("0x7FFFFFFFFFFFFFFF", i64::MAX as u64),
+        ("0x8000000000000000", i64::MAX as u64),
+        ("0xFFFFFFFFFFFFFFFFFFFFFFFF", i64::MAX as u64),
+        ("0x000000000000000000000001", 1),
+    ] {
+        let statement = mysql().one_statement_parses_to(
+            &format!("EXPLAIN FOR CONNECTION {source}"),
+            &format!("EXPLAIN FOR CONNECTION {expected}"),
+        );
+        let Statement::ExplainForConnection { connection_id, .. } = statement else {
+            panic!("expected native connection EXPLAIN");
+        };
+        assert_eq!(connection_id, expected);
+    }
+}
+
+#[test]
+fn portable_table_comments_keep_decoded_shapes_real_spans_and_existing_dialect_behavior() {
+    for (sql, expected) in [
+        (
+            "CREATE TABLE comment_shape (v INT) COMMENT 'plain'",
+            CommentDef::WithoutEq("plain".into()),
+        ),
+        (
+            "CREATE TABLE comment_shape (v INT) COMMENT = 'equal'",
+            CommentDef::WithEq("equal".into()),
+        ),
+    ] {
+        let statement = mysql().verified_stmt(sql);
+        let Statement::CreateTable(create) = statement else {
+            panic!("CREATE table");
+        };
+        assert_eq!(create.comment, Some(expected));
+    }
+    let mut statements = sqlparser::parser::Parser::parse_sql(
+        &MySqlDialect {},
+        "ALTER TABLE comment_shape COMMENT = 'span'",
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 1);
+    let statement = statements.remove(0);
+    let Statement::AlterTable(alter) = &statement else {
+        panic!("ALTER table");
+    };
+    let comment = alter.comment.as_ref().unwrap();
+    assert_eq!(
+        comment.value.value,
+        Value::SingleQuotedString("span".into())
+    );
+    assert_ne!(comment.value.span, Span::empty());
+    assert_eq!(comment.value.span, comment.value_token.0.span);
+    assert_eq!(
+        comment.span(),
+        comment
+            .comment_token
+            .0
+            .span
+            .union(&comment.value_token.0.span)
+    );
+    #[cfg(feature = "serde")]
+    {
+        let encoded = serde_json::to_string(&statement).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Statement>(&encoded).unwrap(),
+            statement
+        );
+    }
+    #[cfg(feature = "visitor")]
+    {
+        struct Comments(usize);
+        impl Visitor for Comments {
+            type Break = ();
+            fn pre_visit_value(
+                &mut self,
+                value: &ValueWithSpan,
+            ) -> std::ops::ControlFlow<Self::Break> {
+                if value.value == Value::SingleQuotedString("span".into()) {
+                    self.0 += 1;
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        let mut values = Comments(0);
+        let _ = Visit::visit(&statement, &mut values);
+        assert_eq!(values.0, 1);
+    }
+    let Statement::AlterTable(alter) = TestedDialects::new(vec![Box::new(GenericDialect {})])
+        .verified_stmt("ALTER TABLE comment_shape COMMENT = 'span'")
+    else {
+        panic!("portable ALTER");
+    };
+    assert_eq!(
+        alter.comment.unwrap().value.value,
+        Value::SingleQuotedString("span".into())
+    );
+}
+
+#[test]
+fn mysql_alter_partition_tail_is_one_final_noncomma_action_and_renders_after_comment() {
+    for sql in [
+        "ALTER TABLE t ADD COLUMN v INT PARTITION BY HASH(id) PARTITIONS 3",
+        "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4, COMMENT='tail' PARTITION BY KEY(id) PARTITIONS 2",
+        "ALTER TABLE t DROP COLUMN v, ADD COLUMN replacement INT REMOVE PARTITIONING",
+        "ALTER TABLE t ALGORITHM=COPY, LOCK=EXCLUSIVE REMOVE PARTITIONING",
+        "ALTER TABLE t COMMENT='tail' REMOVE PARTITIONING",
+        "ALTER TABLE t PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (10), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+    ] {
+        let mut statements = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        assert_eq!(statements.len(), 1, "{sql}");
+        let statement = statements.remove(0);
+        let Statement::AlterTable(alter) = &statement else {
+            panic!("ALTER table");
+        };
+        assert!(
+            matches!(
+                alter.operations.last(),
+                Some(AlterTableOperation::SetOptionsParens {
+                    options: AlterTableSetOperation::MySqlPartition(
+                        MySqlPartitionMaintenance::PartitionBy(_)
+                            | MySqlPartitionMaintenance::RemovePartitioning
+                    )
+                })
+            ),
+            "{sql}"
+        );
+        let rendered = statement.to_string();
+        assert!(!rendered.contains(", PARTITION BY"), "{rendered}");
+        assert!(!rendered.contains(", REMOVE PARTITIONING"), "{rendered}");
+        if let Some(comment) = &alter.comment {
+            assert_ne!(comment.value.span, Span::empty());
+            assert!(
+                rendered.find("COMMENT").unwrap()
+                    < rendered
+                        .find(if sql.contains("REMOVE") {
+                            "REMOVE PARTITIONING"
+                        } else {
+                            "PARTITION BY"
+                        })
+                        .unwrap()
+            );
+        }
+        let reparsed = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, &rendered).unwrap();
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(reparsed[0].to_string(), rendered);
+        #[cfg(feature = "serde")]
+        {
+            let bytes = serde_json::to_vec(&statement).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Statement>(&bytes).unwrap(),
+                statement
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_alter_partition_tail_rejects_commas_duplicates_and_other_maintenance_actions() {
+    for sql in [
+        "ALTER TABLE t ADD COLUMN v INT, PARTITION BY HASH(id) PARTITIONS 2",
+        "ALTER TABLE t ADD COLUMN v INT, REMOVE PARTITIONING",
+        "ALTER TABLE t REMOVE PARTITIONING, ADD COLUMN v INT",
+        "ALTER TABLE t PARTITION BY HASH(id) PARTITIONS 2, COMMENT='after'",
+        "ALTER TABLE t REMOVE PARTITIONING REMOVE PARTITIONING",
+        "ALTER TABLE t PARTITION BY HASH(id) PARTITIONS 2 PARTITION BY HASH(id) PARTITIONS 3",
+        "ALTER TABLE t ADD PARTITION PARTITIONS 1 REMOVE PARTITIONING",
+        "ALTER TABLE t ADD COLUMN v INT, TRUNCATE PARTITION ALL",
+        "ALTER TABLE t DROP PARTITION p0, COMMENT='mixed'",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "ALTER TABLE t ALGORITHM=DEFAULT, TRUNCATE PARTITION ALL",
+        "ALTER TABLE t ALGORITHM=COPY, LOCK=EXCLUSIVE, ADD PARTITION PARTITIONS 1",
+    ] {
+        let statements = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let Statement::AlterTable(alter) = &statements[0] else {
+            panic!("ALTER");
+        };
+        assert!(matches!(
+            alter.operations[0],
+            AlterTableOperation::Algorithm { .. }
+        ));
+        assert!(matches!(
+            alter.operations.last(),
+            Some(AlterTableOperation::SetOptionsParens {
+                options: AlterTableSetOperation::MySqlPartition(_)
+            })
+        ));
+    }
+}
+
+#[test]
+fn mysql_partition_tail_capability_is_forwarded_without_enabling_other_dialects() {
+    use sqlparser::dialect::Dialect;
+    assert!(MySqlDialect {}.supports_alter_table_partition_tail());
+    assert!(!GenericDialect {}.supports_alter_table_partition_tail());
+    let sql = "ALTER TABLE t ADD COLUMN v INT REMOVE PARTITIONING";
+    assert!(sqlparser::parser::Parser::parse_sql(&GenericDialect {}, sql).is_err());
+    assert!(
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+            .is_err()
+    );
+    for ansi_quotes in [false, true] {
+        for no_backslash_escapes in [false, true] {
+            let dialect = MySqlDialect::with_options(ansi_quotes, false, no_backslash_escapes);
+            assert!(dialect.supports_alter_table_partition_tail());
+            assert!(sqlparser::parser::Parser::parse_sql(&dialect, sql).is_ok());
+        }
+    }
+}
+#[test]
+fn mysql_native_subquery_hint_directives_keep_query_block_and_strategy_roles_inline() {
+    let subquery = MySqlHintDirective::Subquery {
+        query_block: Some("actual_qb".into()),
+        materialization: false,
+    };
+    let semijoin = MySqlHintDirective::Semijoin {
+        query_block: Some("actual_qb".into()),
+        enabled: false,
+        strategies: (1 << 10) | (1 << 14),
+    };
+    assert_eq!(subquery, subquery.clone());
+    assert_eq!(semijoin, semijoin.clone());
+    assert_ne!(
+        subquery,
+        MySqlHintDirective::Subquery {
+            query_block: Some("other_qb".into()),
+            materialization: false
+        }
+    );
+    assert_ne!(
+        semijoin,
+        MySqlHintDirective::Semijoin {
+            query_block: Some("actual_qb".into()),
+            enabled: false,
+            strategies: 0
+        }
+    );
+    assert_ne!(
+        semijoin,
+        MySqlHintDirective::Semijoin {
+            query_block: Some("actual_qb".into()),
+            enabled: true,
+            strategies: (1 << 10) | (1 << 14)
+        }
+    );
+    #[cfg(feature = "serde")]
+    for directive in [subquery, semijoin] {
+        let encoded = serde_json::to_string(&directive).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MySqlHintDirective>(&encoded).unwrap(),
+            directive
+        );
+    }
+}
+
+#[test]
+fn mysql_engine_attribute_declarations_are_ordered_system_strings_in_all_syntax_slots() {
+    let dialect = MySqlDialect {};
+    for sql in [
+        "CREATE TABLE q9(c INT SECONDARY_ENGINE_ATTRIBUTE='null', PRIMARY KEY(c) SECONDARY_ENGINE_ATTRIBUTE='{}', KEY k(c) ENGINE_ATTRIBUTE='[]') SECONDARY_ENGINE_ATTRIBUTE='true'",
+        "ALTER TABLE q9 ADD c INT SECONDARY_ENGINE_ATTRIBUTE='null'",
+        "ALTER TABLE q9 MODIFY c INT SECONDARY_ENGINE_ATTRIBUTE='[]'",
+        "ALTER TABLE q9 CHANGE c d INT SECONDARY_ENGINE_ATTRIBUTE='false'",
+        "ALTER TABLE q9 ADD PRIMARY KEY(c) SECONDARY_ENGINE_ATTRIBUTE='{}'",
+        "CREATE INDEX k ON q9(c) SECONDARY_ENGINE_ATTRIBUTE='[1]'",
+        "ALTER TABLE q9 SECONDARY_ENGINE_ATTRIBUTE='{}' SECONDARY_ENGINE_ATTRIBUTE=''",
+    ] {
+        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+        let displayed = statements[0].to_string();
+        let restored = sqlparser::parser::Parser::parse_sql(&dialect, &displayed).unwrap();
+        assert_eq!(restored, statements, "{sql}: {displayed}");
+        assert!(displayed.contains("ENGINE_ATTRIBUTE"));
+        #[cfg(feature = "serde")]
+        assert_eq!(
+            serde_json::from_str::<Vec<Statement>>(&serde_json::to_string(&statements).unwrap())
+                .unwrap(),
+            statements
+        );
+    }
+    let statements = sqlparser::parser::Parser::parse_sql(
+        &dialect,
+        "CREATE TABLE q9(c INT) SECONDARY_ENGINE_ATTRIBUTE='{}' SECONDARY_ENGINE_ATTRIBUTE='null'",
+    )
+    .unwrap();
+    let Statement::CreateTable(table) = &statements[0] else {
+        panic!("table")
+    };
+    let CreateTableOptions::Plain(options) = &table.table_options else {
+        panic!("plain options")
+    };
+    assert_eq!(
+        options.len(),
+        2,
+        "every reduction retained before last-wins consumer"
+    );
+}
+
+#[test]
+fn mysql_engine_attribute_grammar_rejects_non_text_and_adjacent_expression_roles() {
+    let dialect = MySqlDialect {};
+    for value in [
+        "NULL",
+        "?",
+        "1",
+        "N'{}'",
+        "X'7b7d'",
+        "_utf8mb4'{}'",
+        "'{}' '{}'",
+        "JSON_OBJECT()",
+    ] {
+        for prefix in [
+            "CREATE TABLE q9(c INT) SECONDARY_ENGINE_ATTRIBUTE=",
+            "CREATE TABLE q9(c INT SECONDARY_ENGINE_ATTRIBUTE=",
+        ] {
+            let sql = format!(
+                "{prefix}{value}{}",
+                if prefix.ends_with("INT SECONDARY_ENGINE_ATTRIBUTE=") {
+                    ")"
+                } else {
+                    ""
+                }
+            );
+            assert!(
+                sqlparser::parser::Parser::parse_sql(&dialect, &sql).is_err(),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn parse_character_array_cast_retains_charset_and_binary_modifier_without_changing_convert() {
+    for sql in [
+        "CAST(foo AS CHAR(4) CHARACTER SET binary ARRAY)",
+        "CAST(foo AS CHAR(4) CHARACTER SET utf8mb4 ARRAY)",
+        "CAST(foo AS CHAR(4) BINARY ARRAY)",
+        "CAST(foo AS CHAR(4) CHARACTER SET binary BINARY ARRAY)",
+    ] {
+        let expression = mysql().verified_expr(sql);
+        let Expr::Convert {
+            array,
+            data_type,
+            expr,
+            styles,
+            ..
+        } = &expression
+        else {
+            panic!("the original character CAST receiver: {sql}");
+        };
+        assert!(*array);
+        assert_eq!(
+            data_type,
+            &Some(DataType::Char(Some(CharacterLength::IntegerLength {
+                length: 4,
+                unit: None
+            })))
+        );
+        assert_eq!(expr.as_ref(), &Expr::Identifier(Ident::new("foo")));
+        assert!(styles.is_empty());
+        assert!(expression.to_string().starts_with("CAST("));
+        assert!(expression.to_string().ends_with(" ARRAY)"));
+    }
+    for sql in [
+        "CONVERT(foo USING binary)",
+        "CONVERT(foo, CHAR(4) CHARACTER SET binary)",
+    ] {
+        assert!(matches!(
+            mysql().verified_expr(sql),
+            Expr::Convert { array: false, .. }
+        ));
+    }
+    for sql in ["CAST(foo AS CHAR(4) ARRAY)", "CAST(foo AS BINARY(4) ARRAY)"] {
+        assert!(matches!(
+            mysql().verified_expr(sql),
+            Expr::Cast { array: true, .. }
+        ));
+    }
+}
+
 // These existing trigger inputs are ASCII. The standalone parser retains the
 // PSM source; the product's PSM compiler owns action semantics and execution.
 fn assert_mysql_trigger_source(sql: &str, action: &str, mut expected_header: CreateTrigger) {
@@ -5079,7 +5755,7 @@ fn assert_mysql_trigger_source(sql: &str, action: &str, mut expected_header: Cre
     assert!(cpp.end <= parsed.cpp.len());
     expected_header.mysql_body = Some(MySqlProgramBody {
         source: Some(source.clone()),
-        cpp: Some(cpp.clone()),
+        cpp: Some(*cpp),
         definer: None,
         if_not_exists: false,
         deterministic: None,

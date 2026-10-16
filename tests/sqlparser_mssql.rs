@@ -122,10 +122,10 @@ fn parse_mssql_delimited_identifiers() {
 
 #[test]
 fn parse_create_procedure() {
-    let sql = "CREATE OR ALTER PROCEDURE test (@foo INT, @bar VARCHAR(256)) AS BEGIN SELECT 1; END";
+    let sql = "CREATE OR ALTER PROCEDURE test(@foo INT, @bar VARCHAR(256)) AS BEGIN SELECT 1; END";
 
     assert_eq!(
-        ms().verified_stmt(sql),
+        ms().one_statement_parses_to(sql, &sql.replace("test(", "test (")),
         Statement::CreateProcedure(CreateProcedure {
             parsed_source: RoutineSourceProvenance::default(),
             mysql_body: None,
@@ -216,24 +216,28 @@ fn parse_create_procedure() {
 
 #[test]
 fn parse_mssql_create_procedure() {
-    let _ = ms_and_generic().verified_stmt("CREATE OR ALTER PROCEDURE foo AS SELECT 1;");
-    let _ = ms_and_generic().verified_stmt("CREATE OR ALTER PROCEDURE foo AS BEGIN SELECT 1; END");
-    let _ = ms_and_generic().verified_stmt("CREATE PROCEDURE foo AS BEGIN SELECT 1; END");
-    let _ = ms().verified_stmt(
+    for sql in [
+        "CREATE OR ALTER PROCEDURE foo AS SELECT 1;",
+        "CREATE OR ALTER PROCEDURE foo AS BEGIN SELECT 1; END",
+        "CREATE PROCEDURE foo AS BEGIN SELECT 1; END",
         "CREATE PROCEDURE foo AS BEGIN SELECT [myColumn] FROM [myschema].[mytable]; END",
-    );
-    let _ = ms_and_generic().verified_stmt(
         "CREATE PROCEDURE foo (@CustomerName NVARCHAR(50)) AS BEGIN SELECT * FROM DEV; END",
-    );
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; END");
-    // Test a statement with END in it
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN SELECT [foo], CASE WHEN [foo] IS NULL THEN 'empty' ELSE 'notempty' END AS [foo]; END");
-    // Multiple statements
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; SELECT [foo] FROM BAR WHERE [FOO] > 10; END");
-
-    // parameters with default values
-    let sql = r#"CREATE PROCEDURE foo (IN @a INTEGER = 1, OUT @b TEXT = '2', INOUT @c DATETIME = NULL, @d BOOL = 0) AS BEGIN SELECT 1; END"#;
-    let _ = ms().verified_stmt(sql);
+        "CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; END",
+        "CREATE PROCEDURE [foo] AS BEGIN SELECT [foo], CASE WHEN [foo] IS NULL THEN 'empty' ELSE 'notempty' END AS [foo]; END",
+        "CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; SELECT [foo] FROM BAR WHERE [FOO] > 10; END",
+        "CREATE PROCEDURE foo (IN @a INTEGER = 1, OUT @b TEXT = '2', INOUT @c DATETIME = NULL, @d BOOL = 0) AS BEGIN SELECT 1; END",
+    ] {
+        let statement = ms().verified_stmt(sql);
+        let generic = TestedDialects::new(vec![Box::new(GenericDialect {})]);
+        if sql.contains('[') {
+            // Generic may read brackets as arrays, never as SQL Server's
+            // quoted table/column identity in this same statement.
+            assert_ne!(generic.parse_sql_statements(sql).ok(), Some(vec![statement.clone()]), "{sql}");
+        } else {
+            assert_eq!(generic.verified_stmt(sql), statement, "{sql}");
+        }
+        assert!(matches!(statement, Statement::CreateProcedure(_)));
+    }
 }
 
 #[test]
@@ -1330,6 +1334,7 @@ fn parse_convert() {
         data_type,
         charset,
         binary_attribute,
+        array,
         target_before_value,
         styles,
     } = ms().verified_expr(sql)
@@ -1337,10 +1342,11 @@ fn parse_convert() {
         unreachable!()
     };
     assert!(!is_try);
+    assert!(!binary_attribute);
+    assert!(!array);
     assert_eq!(Expr::value(number("1")), *expr);
     assert_eq!(Some(DataType::Int(None)), data_type);
     assert!(charset.is_none());
-    assert!(!binary_attribute);
     assert!(target_before_value);
     assert_eq!(
         vec![
@@ -2007,6 +2013,7 @@ mysql_literal_source: None, origin: FunctionOrigin::Source, from_first_last: Non
                 hive_formats: None,
                 file_format: None,
                 location: None,
+                mysql_on_duplicate: None,
                 query: None,
                 without_rowid: false,
                 like: None,
@@ -2190,6 +2197,7 @@ fn parse_create_table_with_identity_column() {
                 hive_formats: None,
                 file_format: None,
                 location: None,
+                mysql_on_duplicate: None,
                 query: None,
                 without_rowid: false,
                 like: None,

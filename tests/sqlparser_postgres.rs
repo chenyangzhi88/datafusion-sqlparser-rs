@@ -3953,7 +3953,7 @@ fn parse_json_object() {
         ),
     ] {
         let canonical = if entries.is_empty() {
-            "JSON_OBJECT( RETURNING JSONB)"
+            "JSON_OBJECT(RETURNING JSONB)"
         } else {
             sql
         };
@@ -6589,6 +6589,9 @@ fn parse_create_simple_before_insert_trigger() {
         characteristics: None,
     });
 
+    assert!(pg()
+        .parse_sql_statements(sql.trim_end_matches("()"))
+        .is_err());
     assert_eq!(pg().verified_stmt(sql), expected);
 }
 
@@ -6635,6 +6638,9 @@ fn parse_create_after_update_trigger_with_condition() {
         characteristics: None,
     });
 
+    assert!(pg()
+        .parse_sql_statements(sql.trim_end_matches("()"))
+        .is_err());
     assert_eq!(pg().verified_stmt(sql), expected);
 }
 
@@ -6674,6 +6680,9 @@ fn parse_create_instead_of_delete_trigger() {
         characteristics: None,
     });
 
+    assert!(pg()
+        .parse_sql_statements(sql.trim_end_matches("()"))
+        .is_err());
     assert_eq!(pg().verified_stmt(sql), expected);
 }
 
@@ -6726,6 +6735,12 @@ fn parse_create_trigger_with_multiple_events_and_deferrable() {
         }),
     });
 
+    assert!(pg()
+        .parse_sql_statements(sql.trim_end_matches("()"))
+        .is_err());
+    assert!(pg()
+        .parse_sql_statements(&sql.replace(" AFTER ", " BEFORE "))
+        .is_err());
     assert_eq!(pg().verified_stmt(sql), expected);
 }
 
@@ -6736,7 +6751,7 @@ fn parse_create_trigger_with_referencing() {
         pg().parse_sql_statements(original).unwrap_err(),
         ParserError::ParserError("Expected: (, found: EOF".into())
     );
-    let sql = "CREATE TRIGGER check_referencing BEFORE INSERT ON accounts REFERENCING NEW TABLE AS new_accounts OLD TABLE AS old_accounts FOR EACH ROW EXECUTE FUNCTION check_account_referencing()";
+    let sql = "CREATE TRIGGER check_referencing AFTER UPDATE ON accounts REFERENCING NEW TABLE AS new_accounts OLD TABLE AS old_accounts FOR EACH ROW EXECUTE FUNCTION check_account_referencing()";
     let expected = Statement::CreateTrigger(CreateTrigger {
         mysql_body: None,
         or_alter: false,
@@ -6744,9 +6759,9 @@ fn parse_create_trigger_with_referencing() {
         or_replace: false,
         is_constraint: false,
         name: ObjectName::from(vec![Ident::new("check_referencing")]),
-        period: Some(TriggerPeriod::Before),
+        period: Some(TriggerPeriod::After),
         period_before_table: true,
-        events: vec![TriggerEvent::Insert],
+        events: vec![TriggerEvent::Update(vec![])],
         table_name: ObjectName::from(vec![Ident::new("accounts")]),
         referenced_table_name: None,
         referencing: vec![
@@ -6776,6 +6791,9 @@ fn parse_create_trigger_with_referencing() {
         characteristics: None,
     });
 
+    assert!(pg()
+        .parse_sql_statements(sql.trim_end_matches("()"))
+        .is_err());
     assert_eq!(pg().verified_stmt(sql), expected);
 }
 
@@ -6984,6 +7002,7 @@ fn parse_trigger_related_functions() {
             hive_formats: None,
             file_format: None,
             location: None,
+            mysql_on_duplicate: None,
             query: None,
             without_rowid: false,
             like: None,

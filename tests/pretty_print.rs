@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
 fn prettify(sql: &str) -> String {
@@ -263,6 +263,29 @@ DELETE
 "#
         .trim()
     );
+}
+
+#[test]
+fn test_pretty_print_postgres_delete_inheritance() {
+    for (sql, target) in [
+        (
+            "DELETE FROM ONLY accounts AS a WHERE id = 1",
+            "ONLY accounts AS a",
+        ),
+        (
+            "DELETE FROM accounts * AS a WHERE id = 1",
+            "accounts * AS a",
+        ),
+    ] {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        assert_eq!(ast[0].to_string(), sql);
+        let pretty = format!("{:#}", ast[0]);
+        assert_eq!(pretty, format!("DELETE FROM\n  {target}\nWHERE\n  id = 1"));
+        assert_eq!(
+            Parser::parse_sql(&PostgreSqlDialect {}, &pretty).unwrap(),
+            ast
+        );
+    }
 }
 
 #[test]

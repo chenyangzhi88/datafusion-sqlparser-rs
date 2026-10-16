@@ -111,6 +111,8 @@ pub struct CreateTableBuilder {
     pub location: Option<String>,
     /// Optional `AS SELECT` query for the table.
     pub query: Option<Box<Query>>,
+    /// Explicit MySQL CTAS query duplicate-row treatment; None preserves ERROR.
+    pub mysql_on_duplicate: Option<crate::ast::MySqlCreateTableDuplicate>,
     /// Whether `WITHOUT ROWID` is set.
     pub without_rowid: bool,
     /// Optional `LIKE` clause kind.
@@ -224,6 +226,7 @@ impl CreateTableBuilder {
             file_format: None,
             location: None,
             query: None,
+            mysql_on_duplicate: None,
             without_rowid: false,
             like: None,
             clone: None,
@@ -267,6 +270,14 @@ impl CreateTableBuilder {
             sortkey: None,
             backup: None,
         }
+    }
+    /// Set MySQL's duplicate-row treatment for the receiving CREATE query.
+    pub fn mysql_on_duplicate(
+        mut self,
+        duplicate: Option<crate::ast::MySqlCreateTableDuplicate>,
+    ) -> Self {
+        self.mysql_on_duplicate = duplicate;
+        self
     }
     /// Set `OR REPLACE` for the CREATE TABLE statement.
     pub fn or_replace(mut self, or_replace: bool) -> Self {
@@ -659,6 +670,7 @@ impl CreateTableBuilder {
             file_format: self.file_format,
             location: self.location,
             query: self.query,
+            mysql_on_duplicate: self.mysql_on_duplicate,
             without_rowid: self.without_rowid,
             like: self.like,
             clone: self.clone,
@@ -746,6 +758,7 @@ impl From<CreateTable> for CreateTableBuilder {
             file_format: table.file_format,
             location: table.location,
             query: table.query,
+            mysql_on_duplicate: table.mysql_on_duplicate,
             without_rowid: table.without_rowid,
             like: table.like,
             clone: table.clone,

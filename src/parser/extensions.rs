@@ -16,10 +16,10 @@ impl Parser<'_> {
         } else if self.parse_keywords(&[Keyword::SET, Keyword::SCHEMA]) {
             AlterExtensionOperation::SetSchema(self.parse_identifier()?)
         } else {
-            let add = match self.expect_one_of_keywords(&[Keyword::ADD, Keyword::DROP])? {
-                Keyword::ADD => true,
-                _ => false,
-            };
+            let add = matches!(
+                self.expect_one_of_keywords(&[Keyword::ADD, Keyword::DROP])?,
+                Keyword::ADD
+            );
             AlterExtensionOperation::Member {
                 add,
                 object: self.parse_extension_member()?,

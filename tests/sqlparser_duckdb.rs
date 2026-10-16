@@ -773,6 +773,7 @@ fn test_duckdb_union_datatype() {
             hive_formats: None,
             file_format: Default::default(),
             location: Default::default(),
+            mysql_on_duplicate: None,
             query: Default::default(),
             without_rowid: Default::default(),
             like: Default::default(),

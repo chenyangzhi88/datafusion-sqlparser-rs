@@ -4025,65 +4025,58 @@ pub struct SelectIntoFile {
 
 impl fmt::Display for SelectInto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let SelectIntoTarget::MySqlFile(file) = &self.target {
-            return file.fmt(f);
-        }
-        if let SelectIntoTarget::File(file) = &self.target {
-            let path = escape_mysql_file_literal(&file.path);
-            write!(
-                f,
-                "INTO {} '{path}'",
-                if file.dumpfile { "DUMPFILE" } else { "OUTFILE" }
-            )?;
-            if let Some(character_set) = &file.character_set {
-                write!(f, " CHARACTER SET {character_set}")?;
-            }
-            if !file.dumpfile
-                && (file.fields_terminated_by.is_some()
-                    || file.fields_enclosed_by.is_some()
-                    || file.fields_escaped_by.is_some())
-            {
-                f.write_str(" FIELDS")?;
-                if let Some(value) = &file.fields_terminated_by {
-                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.fields_enclosed_by {
-                    if file.fields_optionally_enclosed {
-                        f.write_str(" OPTIONALLY")?;
-                    }
-                    write!(f, " ENCLOSED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.fields_escaped_by {
-                    write!(f, " ESCAPED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-            }
-            if !file.dumpfile
-                && (file.lines_starting_by.is_some() || file.lines_terminated_by.is_some())
-            {
-                f.write_str(" LINES")?;
-                if let Some(value) = &file.lines_starting_by {
-                    write!(f, " STARTING BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.lines_terminated_by {
-                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-            }
-            return Ok(());
-        }
-        let temporary = if self.temporary { " TEMPORARY" } else { "" };
-        let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
-        let table = if self.table { " TABLE" } else { "" };
-
         match &self.target {
+            SelectIntoTarget::MySqlFile(file) => file.fmt(f),
+            SelectIntoTarget::File(file) => {
+                let path = escape_mysql_file_literal(&file.path);
+                write!(
+                    f,
+                    "INTO {} '{path}'",
+                    if file.dumpfile { "DUMPFILE" } else { "OUTFILE" }
+                )?;
+                if let Some(character_set) = &file.character_set {
+                    write!(f, " CHARACTER SET {character_set}")?;
+                }
+                if !file.dumpfile
+                    && (file.fields_terminated_by.is_some()
+                        || file.fields_enclosed_by.is_some()
+                        || file.fields_escaped_by.is_some())
+                {
+                    f.write_str(" FIELDS")?;
+                    if let Some(value) = &file.fields_terminated_by {
+                        write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.fields_enclosed_by {
+                        if file.fields_optionally_enclosed {
+                            f.write_str(" OPTIONALLY")?;
+                        }
+                        write!(f, " ENCLOSED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.fields_escaped_by {
+                        write!(f, " ESCAPED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                }
+                if !file.dumpfile
+                    && (file.lines_starting_by.is_some() || file.lines_terminated_by.is_some())
+                {
+                    f.write_str(" LINES")?;
+                    if let Some(value) = &file.lines_starting_by {
+                        write!(f, " STARTING BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.lines_terminated_by {
+                        write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                }
+                Ok(())
+            }
             SelectIntoTarget::Table(name) => {
+                let temporary = if self.temporary { " TEMPORARY" } else { "" };
+                let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
+                let table = if self.table { " TABLE" } else { "" };
                 write!(f, "INTO{}{}{} {}", temporary, unlogged, table, name)
             }
             SelectIntoTarget::Variables(variables) => {
                 write!(f, "INTO {}", display_comma_separated(variables))
-            }
-            SelectIntoTarget::File(_) => unreachable!("file destination was formatted above"),
-            SelectIntoTarget::MySqlFile(_) => {
-                unreachable!("raw file destination was formatted above")
             }
         }
     }

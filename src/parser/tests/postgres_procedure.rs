@@ -125,10 +125,9 @@ fn generic_and_vendor_procedure_syntax_does_not_regress() {
         "CREATE PROCEDURE p(IN value INT) AS SELECT value; END"
     )
     .is_err());
-    for (statement, dialect) in [(
-        "CREATE PROCEDURE p AS SELECT 1; END",
-        &MsSqlDialect {} as &dyn crate::dialect::Dialect,
-    )] {
+    {
+        let statement = "CREATE PROCEDURE p AS SELECT 1; END";
+        let dialect = &MsSqlDialect {} as &dyn crate::dialect::Dialect;
         let parsed = Parser::parse_sql(dialect, statement)
             .unwrap_or_else(|error| panic!("vendor procedure syntax regressed: {error}"));
         assert_eq!(parsed.len(), 1);

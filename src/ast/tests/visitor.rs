@@ -1,7 +1,106 @@
 // The existing owning visitor unit tests; production APIs remain private.
 use super::super::*;
-use crate::ast::{CreateTable, CreateTableElement, Value};
+use crate::ast::{AlterTableOperation, CreateTable, CreateTableElement, Spanned, Value};
 use core::ops::ControlFlow;
+
+#[cfg(feature = "visitor")]
+#[test]
+fn check_operation_derived_visitors_keep_typed_flags_spans_and_relation_roles() {
+    let sql = "ALTER TABLE t DROP CHECK `检查`, ALTER CHECK enabled ENFORCED, ALTER CONSTRAINT disabled NOT ENFORCED";
+    let mut statements =
+        crate::parser::Parser::parse_sql(&crate::dialect::MySqlDialect {}, sql).unwrap();
+    let mut statement = statements.remove(0);
+    let Statement::AlterTable(alter) = &statement else {
+        panic!("ALTER TABLE")
+    };
+    let original_spans = alter
+        .operations
+        .iter()
+        .map(Spanned::span)
+        .collect::<Vec<_>>();
+
+    #[derive(Default)]
+    struct Observe {
+        statements: usize,
+        relations: Vec<String>,
+        expressions: usize,
+    }
+    impl Visitor for Observe {
+        type Break = ();
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+            self.relations.push(relation.to_string());
+            ControlFlow::Continue(())
+        }
+        fn post_visit_expr(&mut self, _: &Expr) -> ControlFlow<()> {
+            self.expressions += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_statement(&mut self, _: &Statement) -> ControlFlow<()> {
+            self.statements += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    let mut observed = Observe::default();
+    assert_eq!(
+        Visit::visit(&statement, &mut observed),
+        ControlFlow::Continue(())
+    );
+    assert_eq!(observed.statements, 1);
+    assert_eq!(observed.relations, ["t"]);
+    assert_eq!(
+        observed.expressions, 0,
+        "constraint names and flags are not expression or relation children"
+    );
+
+    struct FlipFlags;
+    impl VisitorMut for FlipFlags {
+        type Break = ();
+        fn post_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<()> {
+            let Statement::AlterTable(alter) = statement else {
+                panic!("ALTER TABLE")
+            };
+            for operation in &mut alter.operations {
+                match operation {
+                    AlterTableOperation::DropCheck { .. } => {}
+                    AlterTableOperation::AlterCheck { enforced, .. }
+                    | AlterTableOperation::AlterConstraintEnforcement { enforced, .. } => {
+                        *enforced = !*enforced
+                    }
+                    other => panic!("unexpected operation {other:?}"),
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    assert_eq!(
+        VisitMut::visit(&mut statement, &mut FlipFlags),
+        ControlFlow::Continue(())
+    );
+    let Statement::AlterTable(alter) = &statement else {
+        panic!("ALTER TABLE")
+    };
+    assert!(
+        matches!(&alter.operations[0], AlterTableOperation::DropCheck { name } if name.value == "检查")
+    );
+    assert!(
+        matches!(&alter.operations[1], AlterTableOperation::AlterCheck { name, enforced: false } if name.value == "enabled")
+    );
+    assert!(
+        matches!(&alter.operations[2], AlterTableOperation::AlterConstraintEnforcement { name, enforced: true } if name.value == "disabled")
+    );
+    assert_eq!(
+        alter
+            .operations
+            .iter()
+            .map(Spanned::span)
+            .collect::<Vec<_>>(),
+        original_spans
+    );
+    assert_eq!(
+        statement.to_string(),
+        "ALTER TABLE t DROP CHECK `检查`, ALTER CHECK enabled NOT ENFORCED, ALTER CONSTRAINT disabled ENFORCED"
+    );
+}
 
 #[test]
 fn match_against_original_expression_child_is_visited_once_without_literal_narrowing() {

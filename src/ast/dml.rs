@@ -394,10 +394,11 @@ impl Display for Delete {
                 f.write_str(" FROM")?;
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
-                    if f.alternate() {
-                        f.write_str("  ")?;
-                    }
-                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                    Indent(PostgresDmlTarget(
+                        &from[0],
+                        self.postgres_target_inheritance,
+                    ))
+                    .fmt(f)?;
                 } else {
                     indented_list(f, from)?;
                 }
@@ -405,10 +406,11 @@ impl Display for Delete {
             FromTable::WithoutKeyword(from) => {
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
-                    if f.alternate() {
-                        f.write_str("  ")?;
-                    }
-                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                    Indent(PostgresDmlTarget(
+                        &from[0],
+                        self.postgres_target_inheritance,
+                    ))
+                    .fmt(f)?;
                 } else {
                     indented_list(f, from)?;
                 }
@@ -509,7 +511,7 @@ impl Display for Update {
             or.fmt(f)?;
             f.write_str(" ")?;
         }
-        fmt_postgres_dml_target(f, &self.table, self.postgres_target_inheritance)?;
+        PostgresDmlTarget(&self.table, self.postgres_target_inheritance).fmt(f)?;
         if let Some(UpdateTableFromKind::BeforeSet(from)) = &self.from {
             SpaceOrNewline.fmt(f)?;
             f.write_str("FROM")?;
@@ -553,34 +555,35 @@ impl Display for Update {
     }
 }
 
-fn fmt_postgres_dml_target(
-    f: &mut fmt::Formatter<'_>,
-    table: &TableWithJoins,
-    inheritance: PostgresTargetInheritance,
-) -> fmt::Result {
-    if inheritance == PostgresTargetInheritance::Only {
-        f.write_str("ONLY ")?;
-        return table.fmt(f);
+struct PostgresDmlTarget<'a>(&'a TableWithJoins, PostgresTargetInheritance);
+
+impl Display for PostgresDmlTarget<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(table, inheritance) = *self;
+        if inheritance == PostgresTargetInheritance::Only {
+            f.write_str("ONLY ")?;
+            return table.fmt(f);
+        }
+        if inheritance != PostgresTargetInheritance::Descendants {
+            return table.fmt(f);
+        }
+        let TableFactor::Table { alias, .. } = &table.relation else {
+            return table.fmt(f);
+        };
+        let mut relation = table.relation.clone();
+        if let TableFactor::Table { alias, .. } = &mut relation {
+            *alias = None;
+        }
+        relation.fmt(f)?;
+        f.write_str(" *")?;
+        if let Some(alias) = alias {
+            write!(f, " {alias}")?;
+        }
+        for join in &table.joins {
+            write!(f, " {join}")?;
+        }
+        Ok(())
     }
-    if inheritance != PostgresTargetInheritance::Descendants {
-        return table.fmt(f);
-    }
-    let TableFactor::Table { alias, .. } = &table.relation else {
-        return table.fmt(f);
-    };
-    let mut relation = table.relation.clone();
-    if let TableFactor::Table { alias, .. } = &mut relation {
-        *alias = None;
-    }
-    relation.fmt(f)?;
-    f.write_str(" *")?;
-    if let Some(alias) = alias {
-        write!(f, " {alias}")?;
-    }
-    for join in &table.joins {
-        write!(f, " {join}")?;
-    }
-    Ok(())
 }
 
 /// A `MERGE` statement.

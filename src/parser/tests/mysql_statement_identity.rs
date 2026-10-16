@@ -895,6 +895,80 @@ mod mysql_byte_source {
         Arc,
     };
 
+    #[test]
+    fn saved_trigger_body_is_consumed_once_on_its_original_source_not_a_header_display() {
+        use crate::ast::ConditionalStatements;
+        use crate::keywords::Keyword;
+        for (sql, body, expected_statements) in [
+            (
+                "CREATE TRIGGER mytrigger BEFORE INSERT ON mytable FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
+                "BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
+                2,
+            ),
+            (
+                "CREATE TRIGGER tr AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO t2 VALUES (NEW.id); END",
+                "BEGIN INSERT INTO t2 VALUES (NEW.id); END",
+                1,
+            ),
+        ] {
+            let facts = Facts::new("utf8mb4");
+            {
+                let owner = facts.owner(sql.as_bytes().to_vec());
+                let calls = AtomicUsize::new(0);
+                let (parsed, compiled) = Parser::new(&MySqlDialect {})
+                    .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                    .unwrap()
+                    .parse_next_mysql_source_with_program_body(|parser| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        parser.parse_conditional_statements(&[Keyword::END])
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(parsed.consumed_end, sql.len());
+                let Statement::CreateTrigger(trigger) = &parsed.statement else {
+                    panic!("original CREATE TRIGGER header");
+                };
+                assert!(trigger.exec_body.is_none() && trigger.statements.is_none());
+                let source = trigger
+                    .mysql_body
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(source.bytes().unwrap().trim_ascii(), body.as_bytes());
+                assert!(Arc::ptr_eq(source.owner().unwrap(), &owner));
+                let ConditionalStatements::BeginEnd(block) = compiled.unwrap() else {
+                    panic!("actual body callback consumed the original block");
+                };
+                assert_eq!(block.statements.len(), expected_statements);
+            }
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
+        let sql = "CREATE TRIGGER t BEFORE INSERT ON tab FOR EACH ROW BEGIN SET NEW.a=1; END";
+        let facts = Facts::new("utf8mb4");
+        let owner = facts.owner(sql.as_bytes().to_vec());
+        let without_compiler = Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source();
+        assert!(
+            without_compiler.is_err(),
+            "raw headers cannot silently discard a saved body"
+        );
+        let invalid =
+            "CREATE TRIGGER t BEFORE INSERT ON tab FOR EACH ROW EXECUTE FUNCTION emp_stamp()";
+        let invalid_owner = facts.owner(invalid.as_bytes().to_vec());
+        assert!(Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(invalid_owner.occurrence(0..invalid.len()).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source_with_program_body(|parser| {
+                parser.parse_conditional_statements(&[])
+            })
+            .is_err());
+    }
+
     // Deliberately finite pinned-native fact fixtures. This is NOT a fallback
     // Unicode classifier or production charset authority. Native facade tests
     // independently establish the facts supplied by the real caller adapter.
@@ -903,6 +977,10 @@ mod mysql_byte_source {
         minimum: u8,
         limit: usize,
         system_text_limit: usize,
+        system_text_calls: AtomicUsize,
+        system_role_text_calls: AtomicUsize,
+        alias_text_calls: AtomicUsize,
+        system_text_live: Arc<AtomicUsize>,
         live: Arc<AtomicUsize>,
         units: Arc<AtomicUsize>,
         tail_probes: Arc<AtomicUsize>,
@@ -925,6 +1003,10 @@ mod mysql_byte_source {
                 minimum: 1,
                 limit: usize::MAX,
                 system_text_limit: usize::MAX,
+                system_text_calls: AtomicUsize::new(0),
+                system_role_text_calls: AtomicUsize::new(0),
+                alias_text_calls: AtomicUsize::new(0),
+                system_text_live: Arc::new(AtomicUsize::new(0)),
                 live: Arc::new(AtomicUsize::new(0)),
                 units: Arc::new(AtomicUsize::new(0)),
                 tail_probes: Arc::new(AtomicUsize::new(0)),
@@ -971,9 +1053,9 @@ mod mysql_byte_source {
                 self.tail_probes.fetch_add(1, Ordering::SeqCst);
                 return Err("tail was actually lexed".into());
             }
-            let width = if self.charset == "gbk" && bytes.starts_with(&[0x81, 0x5c]) {
-                2
-            } else if self.charset == "utf8mb4" && bytes.starts_with(&[0xc3, 0xa9]) {
+            let width = if (self.charset == "gbk" && bytes.starts_with(&[0x81, 0x5c]))
+                || (self.charset == "utf8mb4" && bytes.starts_with(&[0xc3, 0xa9]))
+            {
                 2
             } else if self.charset == "utf8mb4" && bytes.starts_with(&[0xf0, 0x9f, 0x98, 0x80]) {
                 4
@@ -1018,6 +1100,10 @@ mod mysql_byte_source {
             &self,
             text: &MySqlText,
         ) -> Result<(String, SqlSourceAdmission), crate::tokenizer::MySqlSourceError> {
+            self.system_text_calls.fetch_add(1, Ordering::SeqCst);
+            if text.role() == crate::ast::MySqlTextRole::System {
+                self.system_role_text_calls.fetch_add(1, Ordering::SeqCst);
+            }
             let bytes = text.bytes()?;
             let capacity = if self.charset == "latin1" {
                 bytes.len().checked_mul(2).ok_or("fixture capacity")?
@@ -1027,7 +1113,52 @@ mod mysql_byte_source {
             if capacity > self.system_text_limit {
                 return Err("system text budget refused before conversion".into());
             }
-            self.system_identifier(text.bytes()?, false)
+            let (value, admission) = self.system_identifier(text.bytes()?, false)?;
+            // Observe this original conversion lease without replacing its
+            // admitted source or issuing any additional parser capability.
+            self.system_text_live.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                value,
+                SqlSourceAdmission::new(Arc::new((
+                    admission,
+                    Lease(self.system_text_live.clone()),
+                ))),
+            ))
+        }
+        fn system_text_value(
+            &self,
+            text: &MySqlText,
+        ) -> Result<(Vec<u8>, SqlSourceAdmission), crate::tokenizer::MySqlSourceError> {
+            // The same finite test adapter and its original once-conversion
+            // counters; production conversion is independently native-backed.
+            let (value, admission) = self.system_text(text)?;
+            Ok((value.into_bytes(), admission))
+        }
+        fn projection_alias_text(
+            &self,
+            text: &MySqlText,
+        ) -> Result<
+            (Vec<u8>, SqlSourceAdmission),
+            (
+                crate::tokenizer::MySqlSourceError,
+                Option<SqlSourceAdmission>,
+            ),
+        > {
+            self.alias_text_calls.fetch_add(1, Ordering::SeqCst);
+            let result = (|| {
+                if text.role() != crate::ast::MySqlTextRole::Alias {
+                    return Err("fixture alias lost its actual reduction".into());
+                }
+                let bytes = text.bytes()?;
+                // Pinned fixture: the native system charset does not perform
+                // a second validation/conversion, including malformed bytes.
+                if self.charset == "utf8mb3" {
+                    return Ok((bytes.to_vec(), self.admit(bytes.len())?));
+                }
+                let (value, admission) = self.system_identifier(bytes, false)?;
+                Ok((value.into_bytes(), admission))
+            })();
+            result.map_err(|error| (error, None))
         }
         fn admit(
             &self,
@@ -1921,7 +2052,9 @@ mod mysql_byte_source {
 
     #[test]
     fn raw_projection_keeps_first_literal_alias_and_original_cpp_boundaries() {
-        let facts = Facts::new("utf8mb4");
+        // Invalid system bytes are legal only on the genuine same-system
+        // branch; cross-charset validation has its own native Source tests.
+        let facts = Facts::new("utf8mb3");
         let sql = b"SELECT 'a'/* raw */'b' AS '\xff\0name', - 1 + 2";
         let result = parsed(sql, &facts, false, false);
         let SelectItem::MySqlProjection {
@@ -1937,6 +2070,7 @@ mod mysql_byte_source {
         assert_eq!(text(expr).bytes().unwrap(), b"ab");
         assert_eq!(text(expr).source().bytes().unwrap(), b"'a'");
         assert_eq!(alias.bytes().unwrap(), b"\xff\0name");
+        assert_eq!(alias.alias_system_bytes().unwrap(), b"\xff\0name");
         assert_eq!(source_occurrence.bytes().unwrap(), b"'a'/* raw */'b'");
         let mut bytes = Vec::new();
         for piece in cpp_piece_range.pieces(&result.cpp).unwrap() {
@@ -1963,6 +2097,39 @@ mod mysql_byte_source {
             panic!("alias")
         };
         assert_eq!(alias.bytes().unwrap().len(), 257); // Name_string is a later actual producer.
+    }
+
+    #[test]
+    fn projection_alias_reuses_ident_system_value_but_converts_quoted_text_once() {
+        for (sql, ansi, expected_calls) in [
+            (b"SELECT 1 AS '\xe9'".as_slice(), false, 1),
+            (b"SELECT 1 AS `\xe9`".as_slice(), false, 0),
+            (b"SELECT 1 AS \"\xe9\"".as_slice(), true, 0),
+            (b"SELECT 1 \xe9".as_slice(), false, 0),
+        ] {
+            let facts = Facts::new("latin1");
+            let statement = parsed(sql, &facts, ansi, false);
+            let SelectItem::MySqlProjection {
+                alias: Some(alias), ..
+            } = &projection(&statement)[0]
+            else {
+                panic!("actual projection alias")
+            };
+            assert_eq!(alias.alias_system_bytes().unwrap(), "é".as_bytes());
+            assert_eq!(alias.charset(), "utf8mb3");
+            assert_eq!(
+                facts.alias_text_calls.load(Ordering::SeqCst),
+                expected_calls
+            );
+            assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(cpp(&statement), sql);
+            let retained = alias.clone();
+            drop(statement);
+            assert!(facts.live.load(Ordering::SeqCst) > 0);
+            assert_eq!(retained.alias_system_bytes().unwrap(), "é".as_bytes());
+            drop(retained);
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -2268,7 +2435,10 @@ mod mysql_byte_source {
             .parse_next_mysql_source()
             .unwrap()
             .is_none());
-        assert!(parsed.source_occurrence.slice(9..1).is_err());
+        assert!(parsed
+            .source_occurrence
+            .slice(core::ops::Range { start: 9, end: 1 })
+            .is_err());
         for sql in [
             b"--".as_slice(),
             b"#comment".as_slice(),
@@ -2705,7 +2875,7 @@ mod mysql_byte_source {
     }
 
     #[test]
-    fn raw_outfile_and_comments_do_not_call_string_conversion_or_lose_roles() {
+    fn raw_outfile_and_column_comments_keep_roles_while_table_comment_consumes_system_text_once() {
         use crate::ast::{CommentDef, MySqlTextRole};
         let facts = Facts::new("latin1");
         let result = parsed(b"SELECT 1 INTO OUTFILE 'p\xe9' CHARACTER SET 'latin1' FIELDS TERMINATED BY '\xe9' LINES TERMINATED BY '\\n'", &facts, false, false);
@@ -2726,6 +2896,20 @@ mod mysql_byte_source {
         assert_eq!(file.fields.len(), 1);
         assert_eq!(file.lines.len(), 1);
         assert!(!file.dumpfile);
+        assert!(matches!(&file.character_set, Some(Expr::Value(value))
+            if matches!(&value.value, Value::MySqlText(text)
+                if text.role() == MySqlTextRole::System && text.bytes().unwrap() == b"latin1")));
+        assert!(
+            matches!(&file.fields[0], crate::ast::MySqlLoadFieldOption::TerminatedBy(value)
+            if matches!(&value.value, Value::MySqlText(text)
+                if text.role() == MySqlTextRole::Literal && text.bytes().unwrap() == b"\xe9"))
+        );
+        assert!(
+            matches!(&file.lines[0], crate::ast::MySqlLoadLineOption::TerminatedBy(value)
+            if matches!(&value.value, Value::MySqlText(text)
+                if text.role() == MySqlTextRole::Literal && text.bytes().unwrap() == b"\n"))
+        );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 0);
         let dump = parsed(b"SELECT 1 INTO DUMPFILE 'p\xe9'", &facts, false, false);
         let Statement::Query(query) = &dump.statement else {
             panic!("dump")
@@ -2736,23 +2920,29 @@ mod mysql_byte_source {
         assert!(
             matches!(&select.into.as_ref().unwrap().target, SelectIntoTarget::MySqlFile(file) if file.dumpfile && file.fields.is_empty() && file.character_set.is_none())
         );
-        let table = parsed(
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 0);
+        let parsed_table = parsed(
             b"CREATE TABLE t(a INT COMMENT 'column\xe9') COMMENT='table\xe9'",
             &facts,
             false,
             false,
         );
-        let Statement::CreateTable(table) = &table.statement else {
+        let Statement::CreateTable(table) = &parsed_table.statement else {
             panic!("table")
         };
         let ColumnOption::MySqlComment(comment) = &table.columns[0].options[0].option else {
             panic!("column comment")
         };
         assert_eq!(comment.role(), MySqlTextRole::System);
-        assert_eq!(comment.bytes().unwrap(), b"column\xe9");
+        assert_eq!(comment.system_bytes().unwrap(), "columné".as_bytes());
         assert!(
-            matches!(&table.comment, Some(CommentDef::MySql { text, .. }) if text.bytes().unwrap() == b"table\xe9" && text.role() == MySqlTextRole::System)
+            matches!(&table.comment, Some(CommentDef::MySql { has_eq: true, text }) if text.bytes().unwrap() == "tableé".as_bytes())
         );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 2);
+        drop((parsed_table, dump, result));
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "visitor")]
@@ -2796,6 +2986,7 @@ mod mysql_byte_source {
         assert!(table.statement.visit(&mut seen).is_continue());
         assert_eq!(seen.text, 4);
         assert_eq!(seen.types, ["enum"]);
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
         let Statement::CreateTable(create) = &table.statement else {
             panic!("table")
         };
@@ -2816,6 +3007,13 @@ mod mysql_byte_source {
             }
         }
         assert!(VisitMut::visit(&mut table.statement, &mut Change).is_continue());
+        let Statement::CreateTable(create) = &table.statement else {
+            panic!("same table after raw-role mutation")
+        };
+        assert!(
+            matches!(&create.comment, Some(crate::ast::CommentDef::MySql { has_eq: false, text }) if text.bytes().unwrap() == b"table")
+        );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
         let load = parsed(
             b"LOAD DATA INFILE 'p' INTO TABLE t (@'a,b') SET a=(@side:=7)",
             &facts,
@@ -2835,6 +3033,8 @@ mod mysql_byte_source {
         let mut seen = Seen::default();
         assert!(normal.visit(&mut seen).is_continue());
         assert_eq!((seen.text, seen.expr), (0, 3));
+        drop((table, array, load, query));
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "visitor")]
@@ -2846,18 +3046,19 @@ mod mysql_byte_source {
         };
         use std::ops::ControlFlow;
         let facts = Facts::new("latin1");
-        let mut parsed = parsed(
-            b"CREATE TABLE t(e ENUM('ab','c') COMMENT 'column\xe9') COMMENT='old\xe9' ENGINE=InnoDB COMMENT 'table\xe9'",
-            &facts, false, false,
-        );
+        let sql = b"CREATE TABLE t(e ENUM('ab','c') COMMENT 'column\xe9') COMMENT='old\xe9' ENGINE=InnoDB COMMENT 'table\xe9'";
+        let mut parsed = parsed(sql, &facts, false, false);
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cpp(&parsed), sql);
+        assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 3);
         let Statement::CreateTable(table) = &parsed.statement else {
             panic!("table")
         };
         assert_eq!(table.elements, [CreateTableElement::Column(0)]);
         assert!(table.validate_source_order().is_ok());
         assert!(
-            matches!(&table.comment, Some(CommentDef::MySql { has_eq: false, text })
-            if text.bytes().unwrap() == b"table\xe9" && text.role() == MySqlTextRole::System)
+            matches!(&table.comment, Some(CommentDef::MySql { has_eq: false, text }) if text.bytes().unwrap() == "tableé".as_bytes())
         );
         let CreateTableOptions::Plain(options) = &table.table_options else {
             panic!("options")
@@ -2885,8 +3086,8 @@ mod mysql_byte_source {
             [
                 b"ab".to_vec(),
                 b"c".to_vec(),
-                b"column\xe9".to_vec(),
-                b"table\xe9".to_vec()
+                "columné".as_bytes().to_vec(),
+                "tableé".as_bytes().to_vec()
             ]
         );
         struct Change(usize);
@@ -2911,7 +3112,11 @@ mod mysql_byte_source {
             .iter()
             .all(|value| value.role() == MySqlTextRole::Validated));
         assert!(
-            matches!(&table.comment, Some(CommentDef::MySql { text, .. }) if text.role() == MySqlTextRole::Validated)
+            matches!(&table.columns[0].options[0].option, ColumnOption::MySqlComment(value)
+            if value.role() == MySqlTextRole::Validated)
+        );
+        assert!(
+            matches!(&table.comment, Some(CommentDef::MySql { has_eq: false, text }) if text.bytes().unwrap() == "tableé".as_bytes())
         );
         let mut after = Seen(Vec::new());
         assert!(Visit::visit(&parsed.statement, &mut after).is_continue());
@@ -2919,11 +3124,16 @@ mod mysql_byte_source {
             after.0, seen.0,
             "mutation changed canonical roles, not bytes or a mirror"
         );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 3);
+        drop(parsed);
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(all(feature = "serde", feature = "visitor"))]
     #[test]
-    fn raw_create_table_ordinals_detach_and_reattach_only_the_four_real_text_values() {
+    fn raw_create_table_ordinals_detach_three_text_values_without_resigning_decoded_table_comment()
+    {
         use crate::ast::{
             CommentDef, CreateTable, CreateTableElement, Visit, VisitMut, Visitor, VisitorMut,
         };
@@ -2936,8 +3146,13 @@ mod mysql_byte_source {
         };
         let encoded = serde_json::to_value(table).unwrap();
         assert_eq!(encoded["elements"], serde_json::json!([{"Column": 0}]));
+        assert!(
+            matches!(&table.comment, Some(CommentDef::MySql { has_eq: true, text }) if text.bytes().unwrap() == "tableé".as_bytes())
+        );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
         let mut detached: CreateTable = serde_json::from_value(encoded.clone()).unwrap();
         assert!(detached.validate_source_order().is_ok());
+        assert_eq!(detached.comment, table.comment);
         struct Detached(usize);
         impl Visitor for Detached {
             type Break = ();
@@ -2979,13 +3194,173 @@ mod mysql_byte_source {
         assert_eq!(attach.count, 4);
         assert_eq!(detached.elements, [CreateTableElement::Column(0)]);
         assert!(
-            matches!(&detached.comment, Some(CommentDef::MySql { text, .. }) if text.bytes().unwrap() == b"table\xe9")
+            matches!(&detached.comment, Some(CommentDef::MySql { has_eq: true, text })
+            if text.bytes().unwrap() == "tableé".as_bytes() && text.system_bytes().is_err()),
+            "reattachment restores admitted transport bytes, never the native System issuer"
         );
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
         let mut bad = encoded;
         bad["elements"][0]["Column"] = serde_json::json!(1);
         let bad: CreateTable = serde_json::from_value(bad).unwrap();
         assert!(bad.validate_source_order().is_err());
         assert!(core::fmt::write(&mut String::new(), format_args!("{bad}")).is_err());
+        drop((detached, bad, parsed, owner));
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn table_comment_system_conversion_is_once_and_its_admission_moves_with_the_original_bundle() {
+        use crate::ast::CommentDef;
+        for (sql, has_eq, expected, no_escape) in [
+            (
+                b"CREATE TABLE t(a INT) COMMENT='table\xe9'".as_slice(),
+                true,
+                "tableé",
+                false,
+            ),
+            (
+                b"CREATE TABLE t(a INT) COMMENT 'table\xe9'".as_slice(),
+                false,
+                "tableé",
+                false,
+            ),
+            (
+                b"ALTER TABLE t COMMENT='table\xe9'".as_slice(),
+                true,
+                "tableé",
+                false,
+            ),
+            (
+                b"ALTER TABLE t COMMENT 'table\xe9'".as_slice(),
+                false,
+                "tableé",
+                false,
+            ),
+            (
+                br"CREATE TABLE t(a INT) COMMENT='a\nb'".as_slice(),
+                true,
+                "a\nb",
+                false,
+            ),
+            (
+                br"CREATE TABLE t(a INT) COMMENT='a\nb'".as_slice(),
+                true,
+                r"a\nb",
+                true,
+            ),
+            (
+                b"CREATE TABLE t(a INT) COMMENT=''".as_slice(),
+                true,
+                "",
+                false,
+            ),
+        ] {
+            let facts = Facts::new("latin1");
+            let result = parsed(sql, &facts, false, no_escape);
+            match &result.statement {
+                Statement::CreateTable(table) => {
+                    assert!(
+                        match &table.comment {
+                            Some(CommentDef::MySql {
+                                has_eq: actual,
+                                text,
+                            }) =>
+                                *actual == has_eq
+                                    && text.system_bytes().unwrap() == expected.as_bytes(),
+                            _ => false,
+                        },
+                        "{sql:?}"
+                    );
+                    assert!(table.validate_source_order().is_ok());
+                }
+                Statement::AlterTable(table) => {
+                    let comment = table.comment.as_ref().expect("original ALTER COMMENT");
+                    assert!(
+                        matches!(&comment.value.value, Value::MySqlText(value) if value.system_bytes().unwrap() == expected.as_bytes())
+                    );
+                    assert_eq!(comment.value.span, comment.value_token.0.span);
+                    assert!(
+                        comment.value.span.start.column > comment.comment_token.0.span.start.column
+                    );
+                    assert!(table.operations.is_empty());
+                }
+                statement => panic!("actual comment grammar: {statement:?}"),
+            }
+            assert_eq!(result.source_occurrence.bytes().unwrap(), sql);
+            assert_eq!(cpp(&result), sql);
+            assert_eq!(result.consumed_end, sql.len());
+            assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 1);
+            let (statement, source, cpp, admissions, container, secrets) =
+                result.into_owned_parts();
+            drop((statement, source, cpp, secrets));
+            assert_eq!(
+                facts.system_text_live.load(Ordering::SeqCst),
+                1,
+                "the same original admission, not the decoded AST, owns conversion capacity"
+            );
+            drop((admissions, container));
+            assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn table_comment_budget_grammar_failure_and_scanner_cancel_release_original_admissions() {
+        for sql in [
+            b"CREATE TABLE t(a INT) COMMENT='table\xe9'".as_slice(),
+            b"CREATE TABLE t(a INT) COMMENT 'table\xe9'".as_slice(),
+            b"ALTER TABLE t COMMENT='table\xe9'".as_slice(),
+        ] {
+            let mut facts = Facts::new("latin1");
+            facts.system_text_limit = 1;
+            let owner = facts.owner(sql.to_vec());
+            let error = Parser::new(&MySqlDialect {})
+                .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                .unwrap()
+                .parse_next_mysql_source()
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("system text budget refused before conversion"));
+            assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
+            drop(owner);
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
+        let facts = Facts::new("latin1");
+        let sql = b"CREATE TABLE t(a INT) COMMENT='table\xe9' COMMENT=+";
+        let owner = facts.owner(sql.to_vec());
+        let error = Parser::new(&MySqlDialect {})
+            .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source()
+            .unwrap_err();
+        assert!(!matches!(error, ParserError::Cancelled));
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+
+        let facts = Facts::new("latin1");
+        let mut sql = b"CREATE TABLE t(a INT) COMMENT='".to_vec();
+        sql.extend(core::iter::repeat_n(b'a', 4096));
+        sql.push(b'\'');
+        let owner = facts.owner(sql);
+        let units = facts.units.clone();
+        let error = Parser::new(&MySqlDialect {})
+            .with_cancellation(Arc::new(move || units.load(Ordering::SeqCst) >= 1024))
+            .try_with_mysql_source(owner.occurrence(0..owner.bytes().len()).unwrap(), &facts)
+            .unwrap()
+            .parse_next_mysql_source()
+            .unwrap_err();
+        assert!(matches!(error, ParserError::Cancelled));
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3095,6 +3470,253 @@ mod mysql_byte_source {
         let mut overlap = encoded;
         overlap["segments"][1]["source"]["start"] = serde_json::json!(7);
         assert!(serde_json::from_value::<MySqlText>(overlap).is_err());
+    }
+
+    #[cfg(all(feature = "visitor", feature = "serde"))]
+    #[test]
+    fn final_partition_tail_keeps_original_raw_occurrences_spans_and_one_system_comment_conversion()
+    {
+        use crate::ast::{
+            AlterTableOperation, AlterTableSetOperation, MySqlPartitionMaintenance, MySqlTextRole,
+            Spanned, Visit, VisitMut, Visitor, VisitorMut,
+        };
+        use std::ops::ControlFlow;
+        let facts = Facts::new("latin1");
+        let sql = b"ALTER TABLE t ADD e ENUM('a','b') COMMENT 'column',ADD CHECK(e<>'x'),CONVERT TO CHARACTER SET utf8mb4,COMMENT='table\xe9' PARTITION BY LIST COLUMNS(e)(PARTITION p0 VALUES IN('a'),PARTITION p1 VALUES IN('b'))";
+        let parsed = parsed(sql, &facts, false, false);
+        assert_eq!(cpp(&parsed), sql);
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 2);
+        assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 2);
+        let Statement::AlterTable(alter) = &parsed.statement else {
+            panic!("actual ALTER");
+        };
+        assert!(matches!(
+            alter.operations.last(),
+            Some(AlterTableOperation::SetOptionsParens {
+                options: AlterTableSetOperation::MySqlPartition(
+                    MySqlPartitionMaintenance::PartitionBy(_)
+                )
+            })
+        ));
+        assert_ne!(alter.span(), crate::tokenizer::Span::empty());
+        let comment = alter.comment.as_ref().unwrap();
+        assert!(matches!(&comment.value.value, Value::MySqlText(value)
+            if value.system_bytes().unwrap() == "tableé".as_bytes()));
+        let value_span = crate::tokenizer::Span::new(
+            crate::tokenizer::Location::new(1, 111),
+            crate::tokenizer::Location::new(1, 119),
+        );
+        assert_eq!(comment.value.span, value_span);
+        assert_eq!(comment.value_token.0.span, value_span);
+        assert_eq!(
+            comment.span(),
+            crate::tokenizer::Span::new(
+                crate::tokenizer::Location::new(1, 103),
+                crate::tokenizer::Location::new(1, 119),
+            )
+        );
+        assert!(matches!(&comment.value_token.0.token,
+            crate::tokenizer::Token::MySqlText(text)
+                if text.role() == MySqlTextRole::Literal
+                    && text.source().range() == (110..118)
+                    && text.bytes().unwrap() == b"table\xe9"));
+        // The value is decoded once by the System consumer. Its AttachedToken
+        // separately retains the original lexical Literal, not a second
+        // semantic table comment or a second conversion.
+        let expected = [
+            (
+                MySqlTextRole::System,
+                110..118,
+                "tableé".as_bytes(),
+                b"'table\xe9'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                25..28,
+                b"a".as_slice(),
+                b"'a'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                29..32,
+                b"b".as_slice(),
+                b"'b'".as_slice(),
+            ),
+            (
+                MySqlTextRole::System,
+                42..50,
+                b"column".as_slice(),
+                b"'column'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                64..67,
+                b"x".as_slice(),
+                b"'x'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                110..118,
+                b"table\xe9".as_slice(),
+                b"'table\xe9'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                171..174,
+                b"a".as_slice(),
+                b"'a'".as_slice(),
+            ),
+            (
+                MySqlTextRole::Literal,
+                199..202,
+                b"b".as_slice(),
+                b"'b'".as_slice(),
+            ),
+        ];
+        let mut attached_expected = expected
+            .iter()
+            .map(|(role, range, bytes, source)| {
+                (
+                    *role,
+                    range.clone(),
+                    Some(bytes.to_vec()),
+                    Some(source.to_vec()),
+                )
+            })
+            .collect::<Vec<_>>();
+        attached_expected.sort_by_key(|(_, range, _, _)| range.start);
+        let mut detached_expected = expected
+            .iter()
+            .map(|(role, range, _, _)| (*role, range.clone(), None, None))
+            .collect::<Vec<_>>();
+        detached_expected.sort_by_key(|(_, range, _, _)| range.start);
+        type ObservedText = (
+            MySqlTextRole,
+            core::ops::Range<usize>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
+        struct Seen {
+            values: Vec<ObservedText>,
+            detached: bool,
+        }
+        impl Visitor for Seen {
+            type Break = ();
+            fn pre_visit_mysql_text(&mut self, value: &MySqlText) -> ControlFlow<()> {
+                assert_eq!(value.bytes().is_err(), self.detached);
+                assert_eq!(value.source().bytes().is_err(), self.detached);
+                assert_eq!(value.source().owner().is_none(), self.detached);
+                assert_eq!(
+                    value.charset(),
+                    if value.role() == MySqlTextRole::System {
+                        "utf8mb3"
+                    } else {
+                        "latin1"
+                    }
+                );
+                assert_eq!(value.quote(), '\'');
+                assert_eq!(value.segments().len(), 1);
+                self.values.push((
+                    value.role(),
+                    value.source().range(),
+                    value.bytes().ok().map(<[u8]>::to_vec),
+                    value.source().bytes().ok().map(<[u8]>::to_vec),
+                ));
+                ControlFlow::Continue(())
+            }
+        }
+        let mut seen = Seen {
+            values: Vec::new(),
+            detached: false,
+        };
+        assert!(parsed.statement.visit(&mut seen).is_continue());
+        seen.values.sort_by_key(|(_, range, _, _)| range.start);
+        assert_eq!(
+            seen.values, attached_expected,
+            "each TYPELIB member, column comment, CHECK literal, table COMMENT source token and partition bound occurs once"
+        );
+        assert!(
+            seen.values
+                .windows(2)
+                .all(|pair| pair[0].1.end <= pair[1].1.start
+                    || pair[0].1 == pair[1].1 && pair[0].1 == (110..118)),
+            "only the original AttachedToken and its same System semantic loan share a range"
+        );
+        let cloned = parsed.statement.clone();
+        let mut cloned_seen = Seen {
+            values: Vec::new(),
+            detached: false,
+        };
+        assert!(cloned.visit(&mut cloned_seen).is_continue());
+        cloned_seen
+            .values
+            .sort_by_key(|(_, range, _, _)| range.start);
+        assert_eq!(cloned_seen.values, attached_expected);
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
+        let mut detached: Statement =
+            serde_json::from_value(serde_json::to_value(&parsed.statement).unwrap()).unwrap();
+        let mut transported = Seen {
+            values: Vec::new(),
+            detached: true,
+        };
+        assert!(detached.visit(&mut transported).is_continue());
+        transported
+            .values
+            .sort_by_key(|(_, range, _, _)| range.start);
+        assert_eq!(transported.values, detached_expected);
+        let detached_comment = match &detached {
+            Statement::AlterTable(alter) => alter.comment.as_ref().unwrap(),
+            _ => panic!("transport lost ALTER"),
+        };
+        assert_eq!(detached_comment.value.value, comment.value.value);
+        assert_eq!(detached_comment.value.span, value_span);
+        assert_eq!(detached_comment.value_token.0.span, value_span);
+        let owner = facts.owner(sql.to_vec());
+        struct Attach<'a> {
+            facts: &'a Facts,
+            owner: &'a Arc<SqlSourceOwner>,
+            count: usize,
+        }
+        impl VisitorMut for Attach<'_> {
+            type Break = crate::tokenizer::MySqlSourceError;
+            fn pre_visit_mysql_text(&mut self, value: &mut MySqlText) -> ControlFlow<Self::Break> {
+                let result = self.facts.admit(1024).and_then(|admission| {
+                    value.reattach(self.owner, admission).map_err(Into::into)
+                });
+                match result {
+                    Ok(()) => {
+                        self.count += 1;
+                        ControlFlow::Continue(())
+                    }
+                    Err(error) => ControlFlow::Break(error),
+                }
+            }
+        }
+        let mut attach = Attach {
+            facts: &facts,
+            owner: &owner,
+            count: 0,
+        };
+        assert!(VisitMut::visit(&mut detached, &mut attach).is_continue());
+        assert_eq!(attach.count, 8);
+        let mut reattached = Seen {
+            values: Vec::new(),
+            detached: false,
+        };
+        assert!(detached.visit(&mut reattached).is_continue());
+        reattached
+            .values
+            .sort_by_key(|(_, range, _, _)| range.start);
+        assert_eq!(reattached.values, attached_expected);
+        assert_eq!(detached, parsed.statement);
+        assert_eq!(facts.system_text_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(facts.system_role_text_calls.load(Ordering::SeqCst), 2);
+        drop((detached, owner, cloned));
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 2);
+        drop(parsed);
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -3208,18 +3830,38 @@ fn mysql_check_table_options_are_structured_and_round_trip_in_order() {
 }
 
 #[test]
-fn mysql_drop_check_uses_the_existing_drop_constraint_operation() {
-    let Statement::AlterTable(alter) = parse_one("ALTER TABLE t DROP CHECK t_chk_1") else {
-        panic!("expected ALTER TABLE");
-    };
-    assert!(matches!(
-        alter.operations.as_slice(),
-        [AlterTableOperation::DropConstraint {
-            if_exists: false,
-            name,
-            ..
-        }] if name.value == "t_chk_1"
-    ));
+fn mysql_drop_check_preserves_its_kind_scoped_operation_and_source_identity() {
+    for (sql, expected_name, quote) in [
+        ("ALTER TABLE t DROP CHECK t_chk_1", "t_chk_1", None),
+        ("ALTER TABLE t DROP CHECK `检查`", "检查", Some('`')),
+        ("ALTER TABLE t DROP CONSTRAINT t_chk_1", "t_chk_1", None),
+        ("ALTER TABLE t DROP CONSTRAINT `检查`", "检查", Some('`')),
+    ] {
+        let statement = parse_one(sql);
+        let Statement::AlterTable(alter) = &statement else {
+            panic!("expected ALTER TABLE");
+        };
+        let name = match alter.operations.as_slice() {
+            [AlterTableOperation::DropCheck { name }] if sql.contains("DROP CHECK") => name,
+            [AlterTableOperation::DropConstraint {
+                if_exists: false,
+                name,
+                ..
+            }] if sql.contains("DROP CONSTRAINT") => name,
+            operations => panic!("lost the original CHECK/CONSTRAINT kind: {operations:?}"),
+        };
+        assert_eq!(name.value, expected_name);
+        assert_eq!(name.quote_style, quote);
+        assert_eq!(statement.to_string(), sql);
+        assert_eq!(parse_one(&statement.to_string()), statement);
+    }
+    for sql in [
+        "ALTER TABLE t DROP CHECK",
+        "ALTER TABLE t DROP CHECK IF EXISTS t_chk_1",
+        "ALTER TABLE t DROP CHECK t_chk_1 CASCADE",
+    ] {
+        assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
+    }
 }
 
 #[test]
@@ -4328,5 +4970,131 @@ fn mysql_maintenance_native_options_have_one_ordered_ast_and_roundtrip() {
         "CHECK TABLE t FOR",
     ] {
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn array_character_cast_clones_and_serializes_the_original_convert_bit_and_visits_its_operand() {
+    let sql = "CREATE INDEX i ON t ((CAST(j AS CHAR(4) CHARACTER SET binary ARRAY)))";
+    let statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+    let cloned = statements.clone();
+    assert_eq!(statements, cloned);
+    assert_eq!(statements[0].to_string(), sql);
+    #[cfg(feature = "serde")]
+    {
+        let encoded = serde_json::to_vec(&statements).unwrap();
+        let decoded: Vec<Statement> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, statements);
+    }
+    #[cfg(feature = "visitor")]
+    {
+        let mut cast = 0;
+        let mut operand = 0;
+        let _: std::ops::ControlFlow<()> =
+            crate::ast::visit_expressions(&statements, |expression| {
+                if matches!(expression, Expr::Convert { array: true, .. }) {
+                    cast += 1;
+                }
+                if matches!(expression, Expr::Identifier(name) if name.value == "j") {
+                    operand += 1;
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+        assert_eq!((cast, operand), (1, 1));
+    }
+    assert!(Parser::parse_sql(
+        &MySqlDialect {},
+        "SELECT CAST(j AS CHAR(4) CHARACTER SET binary ARRAY FORMAT 'x')"
+    )
+    .is_err());
+}
+
+#[test]
+fn temporal_array_cast_preserves_fsp_and_rejects_timezone_only_in_the_mysql_array_context() {
+    for target in [
+        "DATE",
+        "TIME",
+        "TIME(0)",
+        "TIME(6)",
+        "DATETIME",
+        "DATETIME(0)",
+        "DATETIME(6)",
+    ] {
+        let sql = format!("CREATE INDEX i ON t ((CAST(j AS {target} ARRAY)))");
+        let parsed = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap();
+        assert_eq!(parsed[0].to_string(), sql);
+        assert_eq!(
+            Parser::parse_sql(&MySqlDialect {}, &parsed[0].to_string()).unwrap(),
+            parsed
+        );
+        #[cfg(feature = "serde")]
+        assert_eq!(
+            serde_json::from_slice::<Vec<Statement>>(&serde_json::to_vec(&parsed).unwrap())
+                .unwrap(),
+            parsed
+        );
+    }
+    for target in [
+        "TIME WITH TIME ZONE",
+        "TIME(6) WITH TIME ZONE",
+        "TIME WITHOUT TIME ZONE",
+        "TIME(6) WITHOUT TIME ZONE",
+        "TIMETZ",
+        "TIMETZ(6)",
+    ] {
+        let sql = format!("CREATE INDEX bad ON t ((CAST((@once:=@once+1) AS {target} ARRAY)))");
+        let error = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap_err();
+        assert!(
+            matches!(&error, crate::parser::ParserError::ParserError(_)),
+            "original syntax error, not a semantic cast/Field error: {error}"
+        );
+        assert!(
+            error.to_string().contains("time zone qualifier"),
+            "{sql}: {error}"
+        );
+        let ordinary = format!("SELECT CAST(j AS {target})");
+        assert!(
+            Parser::parse_sql(&MySqlDialect {}, &ordinary).is_ok(),
+            "old ordinary syntax is untouched: {ordinary}"
+        );
+        let generic = format!("SELECT CAST(j AS {target} ARRAY)");
+        assert!(
+            Parser::parse_sql(&crate::dialect::GenericDialect {}, &generic).is_ok(),
+            "other dialect is untouched: {generic}"
+        );
+    }
+}
+
+#[test]
+fn array_time_zone_capability_is_delegated_by_every_mysql_option_combination() {
+    use crate::dialect::{Dialect, GenericDialect};
+    assert!(GenericDialect {}.supports_time_zone_in_array_cast());
+    assert!(!MySqlDialect {}.supports_time_zone_in_array_cast());
+    for mask in 0..8 {
+        let configured = MySqlDialect::with_options(mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+        assert!(!configured.supports_time_zone_in_array_cast());
+        for target in [
+            "TIME WITH TIME ZONE",
+            "TIME(6) WITHOUT TIME ZONE",
+            "TIMETZ(6)",
+        ] {
+            let sql = format!("SELECT CAST(j AS {target} ARRAY)");
+            let native = Parser::parse_sql(&MySqlDialect {}, &sql);
+            assert!(native.is_err());
+            assert_eq!(
+                Parser::parse_sql(&configured, &sql),
+                native,
+                "options={mask}: {sql}"
+            );
+            assert!(Parser::parse_sql(&configured, &format!("SELECT CAST(j AS {target})")).is_ok());
+            assert!(Parser::parse_sql(&GenericDialect {}, &sql).is_ok());
+        }
+        for target in ["DATE", "TIME", "TIME(6)", "DATETIME(6)"] {
+            let sql = format!("SELECT CAST(j AS {target} ARRAY)");
+            assert_eq!(
+                Parser::parse_sql(&configured, &sql).unwrap(),
+                Parser::parse_sql(&MySqlDialect {}, &sql).unwrap()
+            );
+        }
     }
 }

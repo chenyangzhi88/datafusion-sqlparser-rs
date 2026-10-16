@@ -61,6 +61,7 @@ fn analyze_modifiers_and_table_synonym_share_the_typed_histogram_action() {
         "CHECK NO_WRITE_TO_BINLOG TABLE t",
         "OPTIMIZE LOCAL NO_WRITE_TO_BINLOG TABLE t",
         "REPAIR LOCAL LOCAL TABLE t",
+        "REPAIR NO_WRITE_TO_BINLOG LOCAL TABLE t",
     ] {
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
     }

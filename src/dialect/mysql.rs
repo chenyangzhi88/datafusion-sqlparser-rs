@@ -134,6 +134,22 @@ fn parse_mysql_prefix(
 }
 
 impl Dialect for MySqlDialect {
+    fn supports_time_zone_in_array_cast(&self) -> bool {
+        false
+    }
+
+    fn supports_explain_for_connection(&self) -> bool {
+        true
+    }
+
+    fn supports_check_constraint_enforcement(&self) -> bool {
+        true
+    }
+
+    fn supports_alter_table_partition_tail(&self) -> bool {
+        true
+    }
+
     fn is_identifier_start(&self, ch: char) -> bool {
         // See https://dev.mysql.com/doc/refman/8.0/en/identifiers.html.
         // Identifiers which begin with a digit are recognized while tokenizing numbers,
@@ -259,6 +275,10 @@ impl Dialect for MySqlDialect {
         true
     }
 
+    fn supports_create_table_query_duplicate(&self) -> bool {
+        true
+    }
+
     /// See: <https://dev.mysql.com/doc/refman/8.4/en/insert.html>
     fn supports_insert_set(&self) -> bool {
         true
@@ -363,6 +383,22 @@ impl Dialect for MySqlDialect {
 }
 
 impl Dialect for MySqlDialectWithOptions {
+    fn supports_time_zone_in_array_cast(&self) -> bool {
+        MySqlDialect {}.supports_time_zone_in_array_cast()
+    }
+
+    fn supports_explain_for_connection(&self) -> bool {
+        MySqlDialect {}.supports_explain_for_connection()
+    }
+
+    fn supports_check_constraint_enforcement(&self) -> bool {
+        MySqlDialect {}.supports_check_constraint_enforcement()
+    }
+
+    fn supports_alter_table_partition_tail(&self) -> bool {
+        MySqlDialect {}.supports_alter_table_partition_tail()
+    }
+
     fn dialect(&self) -> TypeId {
         TypeId::of::<MySqlDialect>()
     }
@@ -467,6 +503,10 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_create_table_select(&self) -> bool {
         MySqlDialect {}.supports_create_table_select()
+    }
+
+    fn supports_create_table_query_duplicate(&self) -> bool {
+        MySqlDialect {}.supports_create_table_query_duplicate()
     }
 
     fn supports_insert_set(&self) -> bool {

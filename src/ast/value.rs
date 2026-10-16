@@ -41,6 +41,20 @@ impl SqlSourceAdmission {
         Self { guard }
     }
 
+    #[cfg(feature = "std")]
+    /// Moves the same allocation guard across a parser-neutral boundary.
+    /// This does not allocate, copy the payload or grant SQL authority.
+    pub fn into_shared_guard(self) -> Arc<dyn Send + Sync> {
+        self.guard
+    }
+
+    #[cfg(feature = "std")]
+    /// Wraps an existing shared allocation lifetime without changing its owner.
+    /// The guard conveys no SQL, compiler, credential or charset authority.
+    pub fn from_shared_guard(guard: Arc<dyn Send + Sync>) -> Self {
+        Self { guard }
+    }
+
     #[cfg(not(feature = "std"))]
     /// Creates the no-std admission token; the caller remains responsible for
     /// accounting and retaining any external allocation lease.
@@ -59,7 +73,8 @@ impl fmt::Debug for SqlSourceAdmission {
 /// Adopted Vec capacity, not just its length, must be admitted before this call.
 pub struct SqlSourceOwner {
     bytes: Vec<u8>,
-    admission: SqlSourceAdmission,
+    // Drop the original byte allocation before its retained admission lease.
+    _admission: SqlSourceAdmission,
 }
 
 impl SqlSourceOwner {
@@ -67,7 +82,10 @@ impl SqlSourceOwner {
     /// The caller must admit the Vec's capacity and shared-owner header before
     /// calling; this constructor does not reserve memory or validate SQL.
     pub fn adopt(bytes: Vec<u8>, admission: SqlSourceAdmission) -> Arc<Self> {
-        Arc::new(Self { bytes, admission })
+        Arc::new(Self {
+            bytes,
+            _admission: admission,
+        })
     }
 
     /// Shared physical owner header, excluding the separately admitted Vec capacity.
@@ -393,13 +411,22 @@ fn check_mysql_text_segments(parts: &[MySqlTextSegment], length: usize) -> Resul
 #[derive(Clone, Debug)]
 enum MySqlTextSemantic {
     Admitted(SqlSourceOccurrence),
+    /// Catalog bytes with restored ownership, never a fresh lexer or alias issuance.
+    Reattached(SqlSourceOccurrence),
     /// Same semantic owner after the actual native declaration adapter bound
     /// its connection/binary byte domain. Original occurrence remains in segments.
     Declaration(SqlSourceOccurrence),
+    /// The same admitted semantic owner after the genuine System reduction.
+    System(SqlSourceOccurrence),
+    /// The same owner after actual output-alias acceptance. This logical
+    /// relationship is distinct from general System text and IDENT authority.
+    AliasSystem(SqlSourceOccurrence),
     /// A decoded catalog transport value, not admitted execution source.
     Detached(Vec<u8>),
     /// Durable declaration facts without runtime Source/admission proof.
     DetachedDeclaration(Vec<u8>),
+    /// Durable System bytes without the original adapter issuance proof.
+    DetachedSystem(Vec<u8>),
 }
 
 impl MySqlText {
@@ -407,10 +434,14 @@ impl MySqlText {
     /// Borrowing it does not clone segment strings or grant parser authority.
     pub(crate) fn canonical_identifier_occurrence(&self) -> Option<&SqlSourceOccurrence> {
         match &self.semantic {
-            MySqlTextSemantic::Admitted(source) | MySqlTextSemantic::Declaration(source) => {
-                Some(source)
-            }
-            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_) => None,
+            MySqlTextSemantic::Admitted(source)
+            | MySqlTextSemantic::Declaration(source)
+            | MySqlTextSemantic::System(source) => Some(source),
+            MySqlTextSemantic::AliasSystem(_)
+            | MySqlTextSemantic::Reattached(_)
+            | MySqlTextSemantic::Detached(_)
+            | MySqlTextSemantic::DetachedDeclaration(_)
+            | MySqlTextSemantic::DetachedSystem(_) => None,
         }
     }
 
@@ -479,8 +510,17 @@ impl MySqlText {
         charset: String,
         expected: &Arc<SqlSourceOwner>,
     ) -> Result<(), String> {
-        if self.segments().len() != 1 || self.introducer().is_some() {
-            return Err("declaration requires one unintroduced literal".into());
+        if self.segments().len() != 1
+            || self.introducer().is_some()
+            || matches!(
+                self.semantic,
+                MySqlTextSemantic::System(_)
+                    | MySqlTextSemantic::Reattached(_)
+                    | MySqlTextSemantic::AliasSystem(_)
+                    | MySqlTextSemantic::DetachedSystem(_)
+            )
+        {
+            return Err("declaration requires one unintroduced non-System literal".into());
         }
         let source = self.source().clone();
         if !source
@@ -509,6 +549,105 @@ impl MySqlText {
         self.source().bytes()?;
         semantic.bytes()
     }
+    /// Bind one actual single System reduction with its once-converted,
+    /// pre-admitted semantic owner and the exact original Source identity.
+    pub fn bind_system(
+        &mut self,
+        semantic: SqlSourceOccurrence,
+        expected: &Arc<SqlSourceOwner>,
+    ) -> Result<(), String> {
+        self.bind_system_role(semantic, expected, MySqlTextRole::System)
+    }
+
+    /// The actual projection-alias reduction supplies accepted system bytes.
+    /// with_role, ordinary System text and detached transport cannot substitute
+    /// for this same-original-Source handback.
+    pub fn bind_alias_system(
+        &mut self,
+        semantic: SqlSourceOccurrence,
+        expected: &Arc<SqlSourceOwner>,
+    ) -> Result<(), String> {
+        self.bind_system_role(semantic, expected, MySqlTextRole::Alias)
+    }
+
+    fn bind_system_role(
+        &mut self,
+        semantic: SqlSourceOccurrence,
+        expected: &Arc<SqlSourceOwner>,
+        role: MySqlTextRole,
+    ) -> Result<(), String> {
+        if self.role != role
+            || !matches!(self.semantic, MySqlTextSemantic::Admitted(_))
+            || self.segments().len() != 1
+            || self.introducer().is_some()
+            || self.binary_literal().is_some()
+            || !self
+                .source()
+                .owner()
+                .is_some_and(|owner| Arc::ptr_eq(owner, expected))
+        {
+            return Err("System reduction lost its single original Source".into());
+        }
+        let source = self.source().clone();
+        source.bytes()?;
+        let length = semantic.bytes()?.len();
+        let part = MySqlTextSegment::new(
+            0..length,
+            source,
+            String::from("utf8mb3"),
+            self.quote(),
+            None,
+        )?;
+        self.segments = MySqlTextSegments::Single([part]);
+        self.semantic = if role == MySqlTextRole::Alias {
+            MySqlTextSemantic::AliasSystem(semantic)
+        } else {
+            MySqlTextSemantic::System(semantic)
+        };
+        Ok(())
+    }
+
+    /// Borrow the actually accepted alias, not an identifier/Field capability.
+    /// Serde intentionally restores only detached bytes, never this relation.
+    pub fn alias_system_bytes(&self) -> Result<&[u8], String> {
+        let MySqlTextSemantic::AliasSystem(semantic) = &self.semantic else {
+            return Err("output alias is not adapter-bound".into());
+        };
+        if self.role != MySqlTextRole::Alias
+            || self.segments().len() != 1
+            || self.introducer().is_some()
+            || self.binary_literal().is_some()
+        {
+            return Err("invalid output alias grammar".into());
+        }
+        self.source().bytes()?;
+        semantic.bytes()
+    }
+
+    /// Actual adapter-bound System bytes, not role/serde/shape permission.
+    pub fn system_bytes(&self) -> Result<&[u8], String> {
+        let MySqlTextSemantic::System(semantic) = &self.semantic else {
+            return Err("System text is not adapter-bound".into());
+        };
+        if self.role != MySqlTextRole::System
+            || self.segments().len() != 1
+            || self.introducer().is_some()
+            || self.binary_literal().is_some()
+        {
+            return Err("invalid System text grammar".into());
+        }
+        self.source().bytes()?;
+        semantic.bytes()
+    }
+
+    /// Durable System grammar facts alone do not grant runtime admission.
+    pub fn is_system(&self) -> bool {
+        matches!(
+            self.semantic,
+            MySqlTextSemantic::System(_) | MySqlTextSemantic::DetachedSystem(_)
+        )
+    }
+
     /// Reports durable declaration grammar facts without granting admission.
     pub fn is_declaration(&self) -> bool {
         matches!(
@@ -597,22 +736,28 @@ impl MySqlText {
     /// explicit catalog reattachment and admission before they are accessible.
     pub fn bytes(&self) -> Result<&[u8], String> {
         match &self.semantic {
-            MySqlTextSemantic::Admitted(value) | MySqlTextSemantic::Declaration(value) => {
-                value.bytes()
-            }
-            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_) => {
+            MySqlTextSemantic::Admitted(value)
+            | MySqlTextSemantic::Reattached(value)
+            | MySqlTextSemantic::Declaration(value)
+            | MySqlTextSemantic::AliasSystem(value)
+            | MySqlTextSemantic::System(value) => value.bytes(),
+            MySqlTextSemantic::Detached(_)
+            | MySqlTextSemantic::DetachedDeclaration(_)
+            | MySqlTextSemantic::DetachedSystem(_) => {
                 Err("MySQL text requires catalog admission".into())
             }
         }
     }
     fn semantic_bytes(&self) -> &[u8] {
         match &self.semantic {
-            MySqlTextSemantic::Admitted(value) | MySqlTextSemantic::Declaration(value) => {
-                value.bytes().expect("constructed checked text")
-            }
-            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedDeclaration(bytes) => {
-                bytes
-            }
+            MySqlTextSemantic::Admitted(value)
+            | MySqlTextSemantic::Reattached(value)
+            | MySqlTextSemantic::Declaration(value)
+            | MySqlTextSemantic::AliasSystem(value)
+            | MySqlTextSemantic::System(value) => value.bytes().expect("constructed checked text"),
+            MySqlTextSemantic::Detached(bytes)
+            | MySqlTextSemantic::DetachedDeclaration(bytes)
+            | MySqlTextSemantic::DetachedSystem(bytes) => bytes,
         }
     }
     /// Borrows the first literal's original occurrence. For adjacent literals,
@@ -649,12 +794,16 @@ impl MySqlText {
     /// not source or compiler authority; overflow is explicit.
     pub fn semantic_allocation_bytes(&self) -> Option<usize> {
         let semantic = match &self.semantic {
-            MySqlTextSemantic::Admitted(_) | MySqlTextSemantic::Declaration(_) => 0,
-            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedDeclaration(bytes) => {
-                bytes
-                    .capacity()
-                    .checked_add(SqlSourceOwner::owner_allocation_bytes())?
-            }
+            MySqlTextSemantic::Admitted(_)
+            | MySqlTextSemantic::Reattached(_)
+            | MySqlTextSemantic::Declaration(_)
+            | MySqlTextSemantic::AliasSystem(_)
+            | MySqlTextSemantic::System(_) => 0,
+            MySqlTextSemantic::Detached(bytes)
+            | MySqlTextSemantic::DetachedDeclaration(bytes)
+            | MySqlTextSemantic::DetachedSystem(bytes) => bytes
+                .capacity()
+                .checked_add(SqlSourceOwner::owner_allocation_bytes())?,
         };
         let segment = match &self.segments {
             MySqlTextSegments::Single(_) => 0,
@@ -698,26 +847,25 @@ impl MySqlText {
                 parts_owner.admission = Some(semantic_admission.clone());
             }
         }
-        if matches!(
-            &self.semantic,
-            MySqlTextSemantic::Detached(_) | MySqlTextSemantic::DetachedDeclaration(_)
-        ) {
-            let old =
-                core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
-            let (bytes, declaration) = match old {
-                MySqlTextSemantic::Detached(bytes) => (bytes, false),
-                MySqlTextSemantic::DetachedDeclaration(bytes) => (bytes, true),
-                _ => unreachable!(),
-            };
-            let length = bytes.len();
-            let semantic = SqlSourceOwner::adopt(bytes, semantic_admission);
-            let occurrence = semantic.occurrence(0..length)?;
-            self.semantic = if declaration {
-                MySqlTextSemantic::Declaration(occurrence)
-            } else {
-                MySqlTextSemantic::Admitted(occurrence)
-            };
-        }
+        let old = core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
+        let (bytes, declaration) = match old {
+            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedSystem(bytes) => {
+                (bytes, false)
+            }
+            MySqlTextSemantic::DetachedDeclaration(bytes) => (bytes, true),
+            attached => {
+                self.semantic = attached;
+                return Ok(());
+            }
+        };
+        let length = bytes.len();
+        let semantic = SqlSourceOwner::adopt(bytes, semantic_admission);
+        let occurrence = semantic.occurrence(0..length)?;
+        self.semantic = if declaration {
+            MySqlTextSemantic::Declaration(occurrence)
+        } else {
+            MySqlTextSemantic::Reattached(occurrence)
+        };
         Ok(())
     }
 }
@@ -782,11 +930,12 @@ impl fmt::Display for MySqlText {
 impl Serialize for MySqlText {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("MySqlText", 4)?;
+        let mut state = serializer.serialize_struct("MySqlText", 5)?;
         state.serialize_field("bytes", self.semantic_bytes())?;
         state.serialize_field("segments", self.segments())?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("declaration", &self.is_declaration())?;
+        state.serialize_field("system", &self.is_system())?;
         state.end()
     }
 }
@@ -800,12 +949,21 @@ impl<'de> Deserialize<'de> for MySqlText {
             segments: Vec<MySqlTextSegment>,
             role: MySqlTextRole,
             declaration: bool,
+            #[serde(default)]
+            system: bool,
         }
         let value = Transport::deserialize(deserializer)?;
+        if value.system && value.declaration {
+            return Err(serde::de::Error::custom(
+                "conflicting System/declaration transport states",
+            ));
+        }
         check_mysql_text_segments(&value.segments, value.bytes.len())
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
-            semantic: if value.declaration {
+            semantic: if value.system {
+                MySqlTextSemantic::DetachedSystem(value.bytes)
+            } else if value.declaration {
                 MySqlTextSemantic::DetachedDeclaration(value.bytes)
             } else {
                 MySqlTextSemantic::Detached(value.bytes)

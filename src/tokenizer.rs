@@ -844,6 +844,12 @@ pub enum MySqlSourceErrorKind {
     Cancelled,
     /// The original armed deadline expired.
     DeadlineExceeded,
+    /// Actual json_attribute syntax failure, before DDL contextualization.
+    InvalidJsonAttribute,
+    /// Actual native depth failure; the first status is3157, not3980.
+    JsonAttributeDepth,
+    /// Actual cross-charset TEXT_STRING_validated conversion failure3854.
+    CharacterConversionFailed,
 }
 
 /// The one error value carried from native source services to the parser.
@@ -1329,6 +1335,9 @@ pub enum MySqlHintTokenKind {
     Error,
 }
 
+type MySqlHintEmitter<'a> =
+    dyn FnMut(MySqlHintTokenKind, &[u8]) -> Result<(), MySqlSourceError> + 'a;
+
 /// The original Source owner's borrowed native conversion/admission services.
 /// Defaults supply no Hint issuer and never infer one from retained text.
 pub trait MySqlSourceAdapter {
@@ -1338,7 +1347,7 @@ pub trait MySqlSourceAdapter {
     fn consume_optimizer_hint(
         &self,
         _source: &SqlSourceOccurrence,
-        _emit: &mut dyn FnMut(MySqlHintTokenKind, &[u8]) -> Result<(), MySqlSourceError>,
+        _emit: &mut MySqlHintEmitter<'_>,
     ) -> Result<Option<crate::ast::OptimizerHintStyle>, MySqlSourceError> {
         Ok(None)
     }
@@ -1400,6 +1409,37 @@ pub trait MySqlSourceAdapter {
         &self,
         text: &MySqlText,
     ) -> Result<(String, SqlSourceAdmission), MySqlSourceError>;
+    /// Borrow the genuine single TEXT_STRING_sys conversion as bytes. A
+    /// native grammar receiver retains this same admission until its late
+    /// validation; a foreign adapter must not invent System issuance.
+    fn system_text_value(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), MySqlSourceError> {
+        Err("System value requires the actual native Source service".into())
+    }
+    /// One actual quoted output-alias TEXT_STRING_validated reduction, with
+    /// its original admission on success or a native fatal condition.
+    fn projection_alias_text(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (MySqlSourceError, Option<SqlSourceAdmission>)> {
+        Err((
+            "output alias requires the actual validated Source service".into(),
+            None,
+        ))
+    }
+    /// The genuine single TEXT_STRING_sys JSON reduction. The original
+    /// System carrier retains every byte; a foreign adapter has no issuer.
+    fn json_attribute(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (MySqlSourceError, Option<SqlSourceAdmission>)> {
+        Err((
+            "JSON attribute requires the actual native Source service".into(),
+            None,
+        ))
+    }
     /// Native TEXT_STRING_literal conversion into the captured connection
     /// character domain. Unlike TEXT_STRING_sys, its result is raw bytes and
     /// need not be representable as UTF-8. The actual adapter admits before
@@ -1461,6 +1501,10 @@ struct MySqlByteState<'a> {
 enum MySqlCursorFailure {
     Source(MySqlSourceError),
     Tokenizer(TokenizerError),
+    Admitted {
+        error: TokenizerError,
+        _admission: SqlSourceAdmission,
+    },
 }
 
 impl MySqlCursorFailure {
@@ -1468,6 +1512,7 @@ impl MySqlCursorFailure {
         match self {
             Self::Source(error) => &error.message,
             Self::Tokenizer(error) => &error.message,
+            Self::Admitted { error, .. } => &error.message,
         }
     }
 }
@@ -1518,6 +1563,14 @@ impl MySqlByteState<'_> {
         let mut first = self.error.borrow_mut();
         let selected = match first.as_ref() {
             Some(MySqlCursorFailure::Tokenizer(original)) => return original.clone(),
+            Some(MySqlCursorFailure::Admitted { .. }) => {
+                // The admitted fatal JSON branch has a distinct inline loan
+                // handback below. Ordinary cursor recovery cannot discard it.
+                return TokenizerError::source(
+                    "terminal Source condition requires its admitted handback".into(),
+                    error.location,
+                );
+            }
             Some(MySqlCursorFailure::Source(original)) => {
                 TokenizerError::source(original.clone(), error.location)
             }
@@ -1529,6 +1582,12 @@ impl MySqlByteState<'_> {
     fn first_error(&self, location: Location) -> Option<TokenizerError> {
         let selected = match self.error.borrow().as_ref() {
             Some(MySqlCursorFailure::Tokenizer(original)) => return Some(original.clone()),
+            Some(MySqlCursorFailure::Admitted { .. }) => {
+                return Some(TokenizerError::source(
+                    "terminal Source condition requires its admitted handback".into(),
+                    location,
+                ));
+            }
             Some(MySqlCursorFailure::Source(original)) => {
                 TokenizerError::source(original.clone(), location)
             }
@@ -1899,7 +1958,7 @@ impl MySqlDigestCollector {
                 self.tokens.truncate(self.tokens.len() - 4);
                 token = row;
                 if self.previous(1) == 44
-                    && matches!(self.previous(2), 1102 | 1103 | 1104 | 1105)
+                    && matches!(self.previous(2), 1102..=1105)
                     && matches!(
                         (row, self.previous(2)),
                         (1102, 1102 | 1103) | (1104, 1104 | 1105)
@@ -2067,9 +2126,7 @@ impl MySqlDigestCollector {
         source: &SqlSourceOccurrence,
         identifier: Option<&MySqlText>,
         adapter: &dyn MySqlSourceAdapter,
-        empty_hint_comment: bool,
-        comment_barrier: bool,
-        hint_consumed: bool,
+        (empty_hint_comment, comment_barrier, hint_consumed): (bool, bool, bool),
     ) {
         if self.full || self.unavailable.is_some() {
             return;
@@ -3658,6 +3715,98 @@ impl<'a> MySqlTokenCursor<'a> {
         Ok(value)
     }
 
+    pub(crate) fn system_text_value(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), TokenizerError> {
+        let location = self.state.location();
+        let raw = self.state.raw.as_mut().expect("raw cursor");
+        if let Some(error) = raw.first_error(location) {
+            return Err(error);
+        }
+        let (value, admission) = raw
+            .adapter
+            .system_text_value(text)
+            .map_err(|error| raw.record_error(TokenizerError::source(error, location)))?;
+        raw.retain_admission(admission.clone())
+            .map_err(|message| raw.token_error(message, location))?;
+        Ok((value, admission))
+    }
+
+    pub(crate) fn json_attribute(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        self.admitted_system_text(text, true)
+    }
+
+    pub(crate) fn projection_alias_text(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        self.admitted_system_text(text, false)
+    }
+
+    fn admitted_system_text(
+        &mut self,
+        text: &MySqlText,
+        json_attribute: bool,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        let location = self.state.location();
+        let raw = self.state.raw.as_mut().expect("raw cursor");
+        if let Some(MySqlCursorFailure::Admitted {
+            error: original, ..
+        }) = raw.error.borrow().as_ref()
+        {
+            let admission = raw
+                .adapter
+                .admit(original.message.len())
+                .map_err(|error| (TokenizerError::source(error, location), None))?;
+            return Err((original.clone(), Some(admission)));
+        }
+        if let Some(error) = raw.first_error(location) {
+            return Err((error, None));
+        }
+        let result = if json_attribute {
+            raw.adapter.json_attribute(text)
+        } else {
+            raw.adapter.projection_alias_text(text)
+        };
+        let (value, admission) = match result {
+            Ok(value) => value,
+            Err((error, Some(admission))) => {
+                let error = TokenizerError::source(error, location);
+                // The original first-error slot owns its own actual String
+                // copy. Admit before Clone; do not share the returning copy's
+                // grant as if it paid two allocations.
+                let copy = match raw.adapter.admit(error.message.len()) {
+                    Ok(copy) => copy,
+                    Err(refusal) => {
+                        *raw.error.borrow_mut() = Some(MySqlCursorFailure::Admitted {
+                            error,
+                            _admission: admission,
+                        });
+                        return Err((TokenizerError::source(refusal, location), None));
+                    }
+                };
+                *raw.error.borrow_mut() = Some(MySqlCursorFailure::Admitted {
+                    error: error.clone(),
+                    _admission: copy,
+                });
+                return Err((error, Some(admission)));
+            }
+            Err((error, None)) => {
+                return Err((
+                    raw.record_error(TokenizerError::source(error, location)),
+                    None,
+                ));
+            }
+        };
+        raw.retain_admission(admission.clone())
+            .map_err(|message| (raw.token_error(message, location), None))?;
+        Ok((value, admission))
+    }
+
     /// Borrows the same actual token Source and connection-domain adapter.
     /// Admission remains in the original parser bundle, including conversion
     /// failure/abandonment; no second cursor or converted-text cache is made.
@@ -3854,9 +4003,11 @@ impl<'a> MySqlTokenCursor<'a> {
                     &source,
                     identifier_text.as_ref(),
                     digest_adapter,
-                    empty_hint_comment,
-                    digest_comment_barrier,
-                    optimizer_hint.is_some(),
+                    (
+                        empty_hint_comment,
+                        digest_comment_barrier,
+                        optimizer_hint.is_some(),
+                    ),
                 );
             }
             Ok(Some(MySqlSourceToken {
@@ -4224,14 +4375,13 @@ impl<'a> Tokenizer<'a> {
         ch: impl IntoIterator<Item = char>,
         chars: &mut State,
     ) -> Result<Option<Token>, TokenizerError> {
-        if chars.raw.is_some() {
-            let location = chars.location();
+        let location = chars.location();
+        if let Some(raw) = &mut chars.raw {
             let fail = |message| TokenizerError {
                 message,
                 location,
                 source_kind: MySqlSourceErrorKind::Message,
             };
-            let raw = chars.raw.as_mut().expect("raw State");
             while let Some(unit) = raw.unit_at(raw.offset).map_err(&fail)? {
                 if !unit.identifier {
                     break;

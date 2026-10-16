@@ -4415,13 +4415,15 @@ fn parse_create_table() {
         _ => unreachable!(),
     }
 
-    let res = parse_sql_statements("CREATE TABLE t (a int NOT NULL GARBAGE)");
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>())
+        .parse_sql_statements("CREATE TABLE t (a int NOT NULL GARBAGE)");
     assert!(res
         .unwrap_err()
         .to_string()
         .contains("Expected: \',\' or \')\' after column definition, found: GARBAGE"));
 
-    let res = parse_sql_statements("CREATE TABLE t (a int NOT NULL CONSTRAINT foo)");
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>())
+        .parse_sql_statements("CREATE TABLE t (a int NOT NULL CONSTRAINT foo)");
     assert!(res
         .unwrap_err()
         .to_string()
@@ -4566,7 +4568,7 @@ fn parse_create_table_with_constraint_characteristics() {
         _ => unreachable!(),
     }
 
-    let res = parse_sql_statements("CREATE TABLE t (
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements("CREATE TABLE t (
         a int NOT NULL,
          FOREIGN KEY (a) REFERENCES othertable4(a) ON DELETE CASCADE ON UPDATE SET DEFAULT DEFERRABLE INITIALLY IMMEDIATE NOT DEFERRABLE, \
         )");
@@ -4575,7 +4577,7 @@ fn parse_create_table_with_constraint_characteristics() {
         .to_string()
         .contains("Expected: \',\' or \')\' after column definition, found: NOT"));
 
-    let res = parse_sql_statements("CREATE TABLE t (
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements("CREATE TABLE t (
         a int NOT NULL,
          FOREIGN KEY (a) REFERENCES othertable4(a) ON DELETE CASCADE ON UPDATE SET DEFAULT NOT ENFORCED INITIALLY DEFERRED ENFORCED, \
         )");
@@ -4584,7 +4586,7 @@ fn parse_create_table_with_constraint_characteristics() {
         .to_string()
         .contains("Expected: \',\' or \')\' after column definition, found: ENFORCED"));
 
-    let res = parse_sql_statements("CREATE TABLE t (
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements("CREATE TABLE t (
         a int NOT NULL,
          FOREIGN KEY (lat) REFERENCES othertable4(lat) ON DELETE CASCADE ON UPDATE SET DEFAULT INITIALLY DEFERRED INITIALLY IMMEDIATE, \
         )");
@@ -4681,7 +4683,7 @@ fn parse_create_table_column_constraint_characteristics() {
         }
     }
 
-    let res = parse_sql_statements(
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements(
         "CREATE TABLE t (a int NOT NULL UNIQUE DEFERRABLE INITIALLY BADVALUE)",
     );
     assert!(res
@@ -4689,17 +4691,17 @@ fn parse_create_table_column_constraint_characteristics() {
         .to_string()
         .contains("Expected: one of DEFERRED or IMMEDIATE, found: BADVALUE"));
 
-    let res = parse_sql_statements(
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements(
         "CREATE TABLE t (a int NOT NULL UNIQUE INITIALLY IMMEDIATE DEFERRABLE INITIALLY DEFERRED)",
     );
     res.expect_err("INITIALLY {IMMEDIATE|DEFERRED} setting should only be allowed once");
 
-    let res = parse_sql_statements(
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements(
         "CREATE TABLE t (a int NOT NULL UNIQUE DEFERRABLE INITIALLY DEFERRED NOT DEFERRABLE)",
     );
     res.expect_err("[NOT] DEFERRABLE setting should only be allowed once");
 
-    let res = parse_sql_statements(
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements(
         "CREATE TABLE t (a int NOT NULL UNIQUE DEFERRABLE INITIALLY DEFERRED ENFORCED NOT ENFORCED)",
     );
     res.expect_err("[NOT] ENFORCED setting should only be allowed once");
@@ -4784,7 +4786,7 @@ fn parse_create_table_hive_array() {
 
 #[test]
 fn parse_create_table_with_multiple_on_delete_in_constraint_fails() {
-    parse_sql_statements(
+    all_dialects_except(|d| d.is::<SnowflakeDialect>()).parse_sql_statements(
         "\
         create table X (\
             y_id int, \
@@ -4796,14 +4798,15 @@ fn parse_create_table_with_multiple_on_delete_in_constraint_fails() {
 
 #[test]
 fn parse_create_table_with_multiple_on_delete_fails() {
-    parse_sql_statements(
-        "\
+    all_dialects_except(|d| d.is::<SnowflakeDialect>())
+        .parse_sql_statements(
+            "\
         create table X (\
             y_id int references Y (id) \
             on delete cascade on update cascade on delete no action\
         )",
-    )
-    .expect_err("should have failed");
+        )
+        .expect_err("should have failed");
 }
 
 #[test]
@@ -5759,7 +5762,10 @@ fn parse_alter_table_drop_constraint() {
     check_one("DROP CONSTRAINT IF EXISTS constraint_name RESTRICT");
     check_one("DROP CONSTRAINT IF EXISTS constraint_name CASCADE");
     fn check_one(constraint_text: &str) {
-        match alter_table_op(verified_stmt(&format!("ALTER TABLE tab {constraint_text}"))) {
+        match alter_table_op(
+            all_dialects_except(|d| d.is::<MySqlDialect>())
+                .verified_stmt(&format!("ALTER TABLE tab {constraint_text}")),
+        ) {
             AlterTableOperation::DropConstraint {
                 name: constr_name,
                 if_exists,
@@ -5786,13 +5792,15 @@ fn parse_alter_table_drop_constraint() {
 
 #[test]
 fn parse_bad_constraint() {
-    let res = parse_sql_statements("ALTER TABLE tab ADD");
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>())
+        .parse_sql_statements("ALTER TABLE tab ADD");
     assert_eq!(
         ParserError::ParserError("Expected: identifier, found: EOF".to_string()),
         res.unwrap_err()
     );
 
-    let res = parse_sql_statements("CREATE TABLE tab (foo int,");
+    let res = all_dialects_except(|d| d.is::<SnowflakeDialect>())
+        .parse_sql_statements("CREATE TABLE tab (foo int,");
     assert_eq!(
         ParserError::ParserError(
             "Expected: column name or constraint definition, found: EOF".to_string()
@@ -6687,10 +6695,11 @@ fn parse_literal_timestamp_with_time_zone() {
 
 #[test]
 fn parse_interval_all() {
+    let dialects = all_dialects_except(|d| d.is::<MySqlDialect>());
     // these intervals expressions all work with both variants of INTERVAL
 
     let sql = "SELECT INTERVAL '1-1' YEAR TO MONTH";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::Value(
@@ -6705,7 +6714,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL '01:01.01' MINUTE (5) TO SECOND (5)";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::Value(
@@ -6720,7 +6729,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL '1' SECOND (5, 4)";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::Value(
@@ -6735,7 +6744,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL '10' HOUR";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::Value(
@@ -6750,7 +6759,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL 5 DAY";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::value(number("5"))),
@@ -6763,7 +6772,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL 5 DAYS";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::value(number("5"))),
@@ -6776,7 +6785,7 @@ fn parse_interval_all() {
     );
 
     let sql = "SELECT INTERVAL '10' HOUR (1)";
-    let select = verified_only_select(sql);
+    let select = dialects.verified_only_select(sql);
     assert_eq!(
         &Expr::Interval(Interval {
             value: Box::new(Expr::Value(
@@ -6804,42 +6813,67 @@ fn parse_interval_all() {
         result.unwrap_err(),
     );
 
-    verified_only_select("SELECT INTERVAL '1' YEAR");
-    verified_only_select("SELECT INTERVAL '1' MONTH");
-    verified_only_select("SELECT INTERVAL '1' WEEK");
-    verified_only_select("SELECT INTERVAL '1' DAY");
-    verified_only_select("SELECT INTERVAL '1' HOUR");
-    verified_only_select("SELECT INTERVAL '1' MINUTE");
-    verified_only_select("SELECT INTERVAL '1' SECOND");
-    verified_only_select("SELECT INTERVAL '1' YEARS");
-    verified_only_select("SELECT INTERVAL '1' MONTHS");
-    verified_only_select("SELECT INTERVAL '1' WEEKS");
-    verified_only_select("SELECT INTERVAL '1' DAYS");
-    verified_only_select("SELECT INTERVAL '1' HOURS");
-    verified_only_select("SELECT INTERVAL '1' MINUTES");
-    verified_only_select("SELECT INTERVAL '1' SECONDS");
-    verified_only_select("SELECT INTERVAL '1' YEAR TO MONTH");
-    verified_only_select("SELECT INTERVAL '1' DAY TO HOUR");
-    verified_only_select("SELECT INTERVAL '1' DAY TO MINUTE");
-    verified_only_select("SELECT INTERVAL '1' DAY TO SECOND");
-    verified_only_select("SELECT INTERVAL '1' HOUR TO MINUTE");
-    verified_only_select("SELECT INTERVAL '1' HOUR TO SECOND");
-    verified_only_select("SELECT INTERVAL '1' MINUTE TO SECOND");
-    verified_only_select("SELECT INTERVAL 1 YEAR");
-    verified_only_select("SELECT INTERVAL 1 MONTH");
-    verified_only_select("SELECT INTERVAL 1 WEEK");
-    verified_only_select("SELECT INTERVAL 1 DAY");
-    verified_only_select("SELECT INTERVAL 1 HOUR");
-    verified_only_select("SELECT INTERVAL 1 MINUTE");
-    verified_only_select("SELECT INTERVAL 1 SECOND");
-    verified_only_select("SELECT INTERVAL 1 YEARS");
-    verified_only_select("SELECT INTERVAL 1 MONTHS");
-    verified_only_select("SELECT INTERVAL 1 WEEKS");
-    verified_only_select("SELECT INTERVAL 1 DAYS");
-    verified_only_select("SELECT INTERVAL 1 HOURS");
-    verified_only_select("SELECT INTERVAL 1 MINUTES");
-    verified_only_select("SELECT INTERVAL 1 SECONDS");
-    verified_only_select(
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' YEAR");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' MONTH");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' WEEK");
+    dialects.verified_only_select("SELECT INTERVAL '1' DAY");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' HOUR");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' MINUTE");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' SECOND");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' YEARS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' MONTHS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' WEEKS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' DAYS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' HOURS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' MINUTES");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' SECONDS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' YEAR TO MONTH");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' DAY TO HOUR");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' DAY TO MINUTE");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' DAY TO SECOND");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' HOUR TO MINUTE");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' HOUR TO SECOND");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL '1' MINUTE TO SECOND");
+    dialects.verified_only_select("SELECT INTERVAL 1 YEAR");
+    dialects.verified_only_select("SELECT INTERVAL 1 MONTH");
+    dialects.verified_only_select("SELECT INTERVAL 1 WEEK");
+    dialects.verified_only_select("SELECT INTERVAL 1 DAY");
+    dialects.verified_only_select("SELECT INTERVAL 1 HOUR");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL 1 MINUTE");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL 1 SECOND");
+    dialects.verified_only_select("SELECT INTERVAL 1 YEARS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL 1 MONTHS");
+    dialects.verified_only_select("SELECT INTERVAL 1 WEEKS");
+    dialects.verified_only_select("SELECT INTERVAL 1 DAYS");
+    dialects.verified_only_select("SELECT INTERVAL 1 HOURS");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL 1 MINUTES");
+    all_dialects_except(|d| d.is::<MySqlDialect>())
+        .verified_only_select("SELECT INTERVAL 1 SECONDS");
+    dialects.verified_only_select(
         "SELECT '2 years 15 months 100 weeks 99 hours 123456789 milliseconds'::INTERVAL",
     );
 }
@@ -8666,12 +8700,18 @@ fn parse_trim() {
     );
 
     // dialects without comma-style TRIM syntax should fail
-    let unsupported_dialects = all_dialects_where(|d| !d.supports_comma_separated_trim());
+    let unsupported_dialects =
+        all_dialects_where(|d| !d.supports_comma_separated_trim() && !d.is::<MySqlDialect>());
     assert_eq!(
         ParserError::ParserError("Expected: ), found: ,".to_owned()),
         unsupported_dialects
             .parse_sql_statements("SELECT TRIM('xyz', 'a')")
             .unwrap_err()
+    );
+    let mysql = TestedDialects::new(vec![Box::new(MySqlDialect {})]);
+    assert_eq!(
+        mysql.parse_sql_statements("SELECT TRIM('xyz', 'a')").unwrap_err(),
+        ParserError::ParserError("Expected: ), found: ,".into()),
     );
 }
 
@@ -9984,6 +10024,17 @@ fn parse_rollback() {
             "transaction completion clauses are not valid with ROLLBACK TO SAVEPOINT".into()
         )
     );
+    for sql in [
+        "ROLLBACK AND CHAIN TO SAVEPOINT test1",
+        "ROLLBACK AND CHAIN TO test1",
+    ] {
+        for dialect in all_dialects().dialects {
+            assert!(
+                Parser::parse_sql(&*dialect, sql).is_err(),
+                "{dialect:?}: {sql}"
+            );
+        }
+    }
 
     one_statement_parses_to("ROLLBACK AND NO CHAIN", "ROLLBACK AND NO CHAIN");
     one_statement_parses_to("ROLLBACK WORK AND NO CHAIN", "ROLLBACK AND NO CHAIN");
@@ -13234,8 +13285,8 @@ fn test_parse_inline_comment() {
     match all_dialects_except(|d| d.is::<HiveDialect>()).verified_stmt(sql) {
         Statement::CreateTable(CreateTable {
             columns,
-            table_options,
             comment,
+            table_options,
             ..
         }) => {
             assert_eq!(
@@ -16056,6 +16107,7 @@ fn parse_comments() {
                 comment: Some(comment),
                 if_exists,
             } => {
+                assert_eq!(routine_arguments, routine.then(Vec::new));
                 assert_eq!("comment", comment);
                 assert_eq!("db.t0", object_name.to_string());
                 assert_eq!(*expected_object_type, object_type);
@@ -19732,14 +19784,263 @@ fn parse_array_subscript() {
     dialects.verified_stmt("SELECT arr[1]");
     dialects.verified_stmt("SELECT arr[:]");
     dialects.verified_stmt("SELECT arr[1:2]");
-    dialects.verified_stmt("SELECT arr[1:2:4]");
+    all_dialects_except(|d| {
+        d.is::<MsSqlDialect>()
+            || d.is::<SnowflakeDialect>()
+            || d.is::<SQLiteDialect>()
+            || d.is::<RedshiftSqlDialect>()
+            || d.is::<PostgreSqlDialect>()
+    })
+    .verified_stmt("SELECT arr[1:2:4]");
+    assert!(Parser::parse_sql(&PostgreSqlDialect {}, "SELECT arr[1:2:4]").is_err());
     dialects.verified_stmt("SELECT arr[1:array_length(arr)]");
     dialects.verified_stmt("SELECT arr[array_length(arr) - 1:array_length(arr)]");
-    dialects
-        .verified_stmt("SELECT arr[array_length(arr) - 2:array_length(arr) - 1:array_length(arr)]");
+    all_dialects_except(|d| {
+        d.is::<MsSqlDialect>()
+            || d.is::<SnowflakeDialect>()
+            || d.is::<SQLiteDialect>()
+            || d.is::<RedshiftSqlDialect>()
+            || d.is::<PostgreSqlDialect>()
+    })
+    .verified_stmt("SELECT arr[array_length(arr) - 2:array_length(arr) - 1:array_length(arr)]");
+    assert!(Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT arr[array_length(arr) - 2:array_length(arr) - 1:array_length(arr)]"
+    )
+    .is_err());
 
     dialects.verified_stmt("SELECT arr[1][2]");
     dialects.verified_stmt("SELECT arr[:][:]");
+}
+
+#[test]
+fn native_mysql_expression_and_destination_contracts() {
+    let mysql = TestedDialects::new(vec![Box::new(MySqlDialect {})]);
+    assert_eq!(
+        mysql.verified_stmt("ANALYZE TABLE test_table"),
+        Statement::MySqlTableMaintenance {
+            operation: MySqlTableMaintenanceOperation::Analyze,
+            location: None,
+            tables: vec![ObjectName::from(vec!["test_table".into()])],
+            options: vec![],
+            histogram: None,
+        }
+    );
+    assert!(mysql.parse_sql_statements("ANALYZE test_table").is_err());
+    let select = mysql.verified_only_select_with_canonical("SELECT a || b", "SELECT a OR b");
+    assert_eq!(
+        select.projection,
+        vec![UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier("a".into())),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Identifier("b".into())),
+        })]
+    );
+    let select = mysql.verified_only_select("SELECT * INTO table0 FROM table1");
+    assert_eq!(
+        select.into,
+        Some(SelectInto {
+            temporary: false,
+            unlogged: false,
+            table: false,
+            target: SelectIntoTarget::Variables(vec![ObjectName::from(vec!["table0".into()])]),
+        })
+    );
+    for sql in ["SET NAMES 'UTF8'", "SET NAMES 'utf8'"] {
+        let charset = if sql.contains("UTF8") { "UTF8" } else { "utf8" };
+        assert_eq!(
+            mysql.one_statement_parses_to(sql, &format!("SET NAMES {charset}")),
+            Statement::Set(Set::SetNames {
+                charset_name: charset.into(),
+                collation_name: None
+            })
+        );
+    }
+    for sql in [
+        "SELECT name COLLATE \"de_DE\" FROM customer",
+        "SELECT (name) COLLATE \"de_DE\" FROM customer",
+    ] {
+        let canonical = sql.replace("\"de_DE\"", "de_DE");
+        let select = mysql.verified_only_select_with_canonical(sql, &canonical);
+        let expr = if sql.contains("(name)") {
+            Expr::Nested(Box::new(Expr::Identifier("name".into())))
+        } else {
+            Expr::Identifier("name".into())
+        };
+        assert_eq!(
+            select.projection,
+            vec![UnnamedExpr(Expr::Collate {
+                expr: Box::new(expr),
+                collation: ObjectName::from(vec!["de_DE".into()]),
+            })]
+        );
+    }
+    for sql in [
+        "SELECT ts AT TIME ZONE 'UTC'",
+        "SELECT '2001-01-01'::TIMESTAMP AT TIME ZONE 'UTC'",
+        "ALTER TABLE tab DROP CONSTRAINT IF EXISTS c",
+        "REVOKE ALL ON a, b FROM u",
+        "LOAD my_extension",
+        "LOAD DATA INPATH 'f' INTO TABLE t",
+        "SELECT INTERVAL '1' SECOND TO SECOND",
+    ] {
+        assert!(mysql.parse_sql_statements(sql).is_err(), "{sql}");
+    }
+    // Valid MySQL interval units retain the same typed Interval representation.
+    for (unit, field) in [
+        ("YEAR", DateTimeField::Year),
+        ("MONTH", DateTimeField::Month),
+        ("DAY", DateTimeField::Day),
+        ("HOUR", DateTimeField::Hour),
+        ("MINUTE", DateTimeField::Minute),
+        ("SECOND", DateTimeField::Second),
+    ] {
+        let select = mysql.verified_only_select(&format!("SELECT INTERVAL 1 {unit}"));
+        assert_eq!(
+            select.projection,
+            vec![UnnamedExpr(Expr::Interval(Interval {
+                value: Box::new(Expr::value(number("1"))),
+                leading_field: Some(field),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            }))]
+        );
+    }
+}
+
+#[test]
+fn native_postgres_pattern_and_prefix_contracts() {
+    let pg = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+    for (keyword, operator, function) in [
+        ("LIKE", "~~", "like_escape"),
+        ("ILIKE", "~~*", "like_escape"),
+        ("SIMILAR TO", "~", "similar_to_escape"),
+    ] {
+        for negated in [false, true] {
+            for escape in [Value::SingleQuotedString("^".into()), Value::Null] {
+                let sql = format!(
+                    "SELECT name {}{keyword} '%a' ESCAPE {escape} IS NULL",
+                    if negated { "NOT " } else { "" }
+                );
+                let actual = only(pg.parse_sql_statements(&sql).unwrap());
+                let Statement::Query(query) = actual else {
+                    panic!("query")
+                };
+                let SetExpr::Select(select) = *query.body else {
+                    panic!("select")
+                };
+                let mut escaped = call(
+                    function,
+                    [
+                        Expr::value(Value::SingleQuotedString("%a".into())),
+                        Expr::value(escape),
+                    ],
+                );
+                let Expr::Function(ref mut function_call) = escaped else {
+                    panic!("function")
+                };
+                function_call.name = ObjectName::from(vec!["pg_catalog".into(), function.into()]);
+                assert_eq!(
+                    select.projection,
+                    vec![UnnamedExpr(Expr::IsNull(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Identifier("name".into())),
+                        op: BinaryOperator::Custom(format!(
+                            "{}{operator}",
+                            if negated { "!" } else { "" }
+                        )),
+                        right: Box::new(escaped),
+                    })))]
+                );
+            }
+        }
+    }
+    let expr = pg.expr_parses_to("!a", "! a");
+    assert_eq!(
+        expr,
+        Expr::UnaryOp {
+            op: UnaryOperator::PGCustomUnaryOperator(vec!["!".into()]),
+            expr: Box::new(Expr::Identifier("a".into()))
+        }
+    );
+    pg.one_statement_parses_to(
+        "SELECT 10e-20, 1e3, 1e+3, 0.5e2",
+        &format!(
+            "SELECT {}, {}, {}, {}",
+            number("10e-20"),
+            number("1e3"),
+            number("1e+3"),
+            number("0.5e2")
+        ),
+    );
+    for sql in [
+        "SELECT 1e3a",
+        "SELECT 1e",
+        "SELECT * FROM t GROUP BY ALL",
+        "ALTER VIEW v AS SELECT 1",
+        "ALTER VIEW v (a) AS SELECT 1",
+        "ALTER VIEW v WITH (a = 1) AS SELECT 1",
+        "CREATE USER u1 option1='value1'",
+        "DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.id",
+        "DELETE FROM t1, t2 USING t1 JOIN t2 ON t1.id = t2.id",
+    ] {
+        assert!(pg.parse_sql_statements(sql).is_err(), "{sql}");
+    }
+    let Statement::CreateRole(role) =
+        pg.one_statement_parses_to("CREATE USER u1", "CREATE ROLE u1 LOGIN")
+    else {
+        panic!("role")
+    };
+    assert_eq!(role.names, vec![ObjectName::from(vec!["u1".into()])]);
+    assert_eq!(role.login, Some(true));
+    let select = pg.verified_only_select("SELECT a FROM t GROUP BY ALL a");
+    assert_eq!(
+        select.group_by,
+        GroupByExpr::Expressions(
+            vec![Expr::Identifier("a".into())],
+            vec![GroupByWithModifier::Quantifier(DuplicateTreatment::All)]
+        )
+    );
+}
+
+#[test]
+fn dialect_specific_ddl_boundaries_remain_checked() {
+    // Both grammars reject these inputs; Snowflake has its own DDL diagnostic.
+    for sql in [
+        "CREATE TABLE tab (foo int,",
+        "CREATE TABLE t (a int NOT NULL GARBAGE)",
+        "CREATE TABLE X (y_id int REFERENCES Y (id) ON DELETE CASCADE ON UPDATE CASCADE ON DELETE NO ACTION)",
+        "CREATE TABLE X (y_id int, FOREIGN KEY (y_id) REFERENCES Y (id) ON DELETE CASCADE ON UPDATE CASCADE ON DELETE NO ACTION)",
+        "CREATE TABLE t (a int UNIQUE INITIALLY IMMEDIATE DEFERRABLE INITIALLY DEFERRED)",
+    ] {
+        for dialect in all_dialects().dialects {
+            assert!(Parser::parse_sql(&*dialect, sql).is_err(), "{dialect:?}: {sql}");
+        }
+    }
+    let clickhouse = TestedDialects::new(vec![Box::new(ClickHouseDialect {})]);
+    assert!(clickhouse
+        .parse_sql_statements("ALTER VIEW v (has, cols) AS SELECT 1, 2")
+        .is_err());
+    let Statement::AlterView { columns, .. } =
+        clickhouse.verified_stmt("ALTER VIEW v (has INT, cols TEXT) AS SELECT 1, 2")
+    else {
+        panic!("view")
+    };
+    assert_eq!(
+        columns,
+        vec![
+            ViewColumnDef {
+                name: "has".into(),
+                data_type: Some(DataType::Int(None)),
+                options: None
+            },
+            ViewColumnDef {
+                name: "cols".into(),
+                data_type: Some(DataType::Text),
+                options: None
+            },
+        ]
+    );
 }
 
 #[test]
@@ -20293,4 +20594,163 @@ fn postgres_set_names_uses_native_optional_encoding_and_no_collation() {
     assert!(TestedDialects::new(vec![Box::new(MySqlDialect {})])
         .parse_sql_statements("SET NAMES")
         .is_err());
+}
+
+
+#[test]
+fn parse_create_procedure_with_language_postgres_sql_body() {
+    let sql = r#"CREATE PROCEDURE test_proc() LANGUAGE sql AS 'SELECT 1;'"#;
+    match TestedDialects::new(vec![
+        Box::new(PostgreSqlDialect {}),
+        Box::new(GenericDialect {}),
+    ])
+    .verified_stmt(sql)
+    {
+        Statement::CreateProcedure(CreateProcedure {
+            or_alter,
+            name,
+            args: params,
+            language,
+            ..
+        }) => {
+            assert_eq!(or_alter, false);
+            assert_eq!(name.to_string(), "test_proc");
+            assert_eq!(params, vec![]);
+            assert_eq!(
+                language,
+                Some(Ident {
+                    value: "sql".into(),
+                    quote_style: None,
+                    span: Span {
+                        start: Location::empty(),
+                        end: Location::empty()
+                    }
+                })
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+
+#[test]
+fn parse_create_procedure_with_parameter_modes_postgres_sql_body() {
+    let sql = r#"CREATE PROCEDURE test_proc(IN a INTEGER, OUT b TEXT, INOUT c TIMESTAMP, d BOOL) LANGUAGE sql AS 'SELECT 1;'"#;
+    match TestedDialects::new(vec![
+        Box::new(PostgreSqlDialect {}),
+        Box::new(GenericDialect {}),
+    ])
+    .verified_stmt(sql)
+    {
+        Statement::CreateProcedure(CreateProcedure {
+            or_alter,
+            name,
+            args: params,
+            ..
+        }) => {
+            assert_eq!(or_alter, false);
+            assert_eq!(name.to_string(), "test_proc");
+            let fake_span = Span {
+                start: Location { line: 0, column: 0 },
+                end: Location { line: 0, column: 0 },
+            };
+            assert_eq!(
+                params,
+                vec![
+                    OperateFunctionArg {
+                        name: Some(Ident {
+                            value: "a".into(),
+                            quote_style: None,
+                            span: fake_span,
+                        }),
+                        data_type: DataType::Integer(None),
+                        mode: Some(ArgMode::In),
+                        default_expr: None,
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident {
+                            value: "b".into(),
+                            quote_style: None,
+                            span: fake_span,
+                        }),
+                        data_type: DataType::Text,
+                        mode: Some(ArgMode::Out),
+                        default_expr: None,
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident {
+                            value: "c".into(),
+                            quote_style: None,
+                            span: fake_span,
+                        }),
+                        data_type: DataType::Timestamp(None, TimezoneInfo::None),
+                        mode: Some(ArgMode::InOut),
+                        default_expr: None,
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident {
+                            value: "d".into(),
+                            quote_style: None,
+                            span: fake_span,
+                        }),
+                        data_type: DataType::Bool,
+                        mode: None,
+                        default_expr: None,
+                    },
+                ]
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    // parameters with default values
+    let sql = r#"CREATE PROCEDURE test_proc(IN a INTEGER = 1, OUT b TEXT = '2', INOUT c TIMESTAMP = NULL, d BOOL = 0) LANGUAGE sql AS 'SELECT 1;'"#;
+    match TestedDialects::new(vec![
+        Box::new(PostgreSqlDialect {}),
+        Box::new(GenericDialect {}),
+    ])
+    .verified_stmt(sql)
+    {
+        Statement::CreateProcedure(CreateProcedure {
+            or_alter,
+            name,
+            args: params,
+            ..
+        }) => {
+            assert_eq!(or_alter, false);
+            assert_eq!(name.to_string(), "test_proc");
+            assert_eq!(
+                params,
+                vec![
+                    OperateFunctionArg {
+                        name: Some(Ident::new("a")),
+                        data_type: DataType::Integer(None),
+                        mode: Some(ArgMode::In),
+                        default_expr: Some(Expr::Value((number("1")).with_empty_span())),
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident::new("b")),
+                        data_type: DataType::Text,
+                        mode: Some(ArgMode::Out),
+                        default_expr: Some(Expr::Value(
+                            Value::SingleQuotedString("2".into()).with_empty_span()
+                        )),
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident::new("c")),
+                        data_type: DataType::Timestamp(None, TimezoneInfo::None),
+                        mode: Some(ArgMode::InOut),
+                        default_expr: Some(Expr::Value(Value::Null.with_empty_span())),
+                    },
+                    OperateFunctionArg {
+                        name: Some(Ident::new("d")),
+                        data_type: DataType::Bool,
+                        mode: None,
+                        default_expr: Some(Expr::Value((number("0")).with_empty_span())),
+                    }
+                ],
+            );
+        }
+        _ => unreachable!(),
+    }
 }

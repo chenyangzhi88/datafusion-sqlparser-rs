@@ -74,12 +74,6 @@ pub enum UnaryOperator {
 
 impl fmt::Display for UnaryOperator {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let UnaryOperator::PGCustomUnaryOperator(parts) = self {
-            if parts.len() == 1 {
-                return f.write_str(&parts[0]);
-            }
-            return write!(f, "OPERATOR({})", parts.join("."));
-        }
         f.write_str(match self {
             UnaryOperator::AtDashAt => "@-@",
             UnaryOperator::BangNot => "!",
@@ -92,7 +86,13 @@ impl fmt::Display for UnaryOperator {
             UnaryOperator::PGCubeRoot => "||/",
             UnaryOperator::PGPostfixFactorial => "!",
             UnaryOperator::PGPrefixFactorial => "!!",
-            UnaryOperator::PGCustomUnaryOperator(_) => unreachable!(),
+            UnaryOperator::PGCustomUnaryOperator(parts) => {
+                return if parts.len() == 1 {
+                    f.write_str(&parts[0])
+                } else {
+                    write!(f, "OPERATOR({})", parts.join("."))
+                };
+            }
             UnaryOperator::PGSquareRoot => "|/",
             UnaryOperator::Plus => "+",
             UnaryOperator::QuestionDash => "?-",
