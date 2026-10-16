@@ -423,6 +423,8 @@ fn test_duckdb_struct_literal() {
 
     assert_eq!(
         &Expr::Array(Array {
+            opening_token: AttachedToken::empty(),
+            closing_token: AttachedToken::empty(),
             elem: vec![Expr::Dictionary(vec![DictionaryField {
                 key: Ident::with_quote('\'', "a"),
                 value: Box::new(Expr::Value(
@@ -442,6 +444,8 @@ fn test_duckdb_struct_literal() {
             DictionaryField {
                 key: Ident::with_quote('\'', "b"),
                 value: Box::new(Expr::Array(Array {
+                    opening_token: AttachedToken::empty(),
+                    closing_token: AttachedToken::empty(),
                     elem: vec![Expr::CompoundIdentifier(vec![
                         Ident::from("t"),
                         Ident::from("str_col")
@@ -635,6 +639,10 @@ fn test_duckdb_named_argument_function_with_assignment_operator() {
     let select = duckdb_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::new("FUN")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -680,6 +688,8 @@ fn test_array_index() {
     assert_eq!(
         &Expr::CompoundFieldAccess {
             root: Box::new(Expr::Array(Array {
+                opening_token: AttachedToken::empty(),
+                closing_token: AttachedToken::empty(),
                 elem: vec![
                     Expr::Value((Value::SingleQuotedString("a".to_owned())).with_empty_span()),
                     Expr::Value((Value::SingleQuotedString("b".to_owned())).with_empty_span()),
@@ -701,6 +711,17 @@ fn test_duckdb_union_datatype() {
     let stmt = duckdb_and_generic().verified_stmt(sql);
     assert_eq!(
         Statement::CreateTable(CreateTable {
+            unlogged: false,
+            of_type: None,
+            query_columns: vec![],
+            with_data: None,
+            mysql_partitioning: None,
+            elements: vec![
+                CreateTableElement::Column(0),
+                CreateTableElement::Column(1),
+                CreateTableElement::Column(2)
+            ],
+
             or_replace: Default::default(),
             temporary: Default::default(),
             external: Default::default(),

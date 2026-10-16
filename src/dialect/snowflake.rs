@@ -1802,6 +1802,7 @@ fn parse_multi_table_insert(
     let source = parser.parse_query()?;
 
     Ok(Statement::Insert(Insert {
+        postgres_insert_bindings: None,
         insert_token: insert_token.into(),
         optimizer_hints: vec![],
         or: None,

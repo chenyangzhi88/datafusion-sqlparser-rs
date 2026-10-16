@@ -470,6 +470,7 @@ impl Parser<'_> {
             Keyword::LOGIN,
             Keyword::NOLOGIN,
             Keyword::PASSWORD,
+            Keyword::ENCRYPTED,
             Keyword::REPLICATION,
             Keyword::NOREPLICATION,
             Keyword::SUPERUSER,
@@ -490,7 +491,19 @@ impl Parser<'_> {
             Some(Keyword::NOINHERIT) => RoleOption::Inherit(false),
             Some(Keyword::LOGIN) => RoleOption::Login(true),
             Some(Keyword::NOLOGIN) => RoleOption::Login(false),
-            Some(Keyword::PASSWORD) => {
+            Some(keyword @ (Keyword::PASSWORD | Keyword::ENCRYPTED)) => {
+                if keyword == Keyword::ENCRYPTED {
+                    self.expect_keyword_is(Keyword::PASSWORD)?;
+                    if !matches!(
+                        self.peek_token_ref().token,
+                        Token::SingleQuotedString(_)
+                            | Token::EscapedStringLiteral(_)
+                            | Token::UnicodeStringLiteral(_)
+                            | Token::DollarQuotedString(_)
+                    ) {
+                        return self.expected_ref("password string", self.peek_token_ref());
+                    }
+                }
                 let password = if self.parse_keyword(Keyword::NULL) {
                     Password::NullPassword
                 } else {

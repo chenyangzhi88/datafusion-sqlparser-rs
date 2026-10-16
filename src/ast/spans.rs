@@ -17,9 +17,9 @@
 
 use crate::{
     ast::{
-        AlterSchemaOperation, AlterTable, ColumnOptions, CreateOperator, CreateOperatorClass,
-        CreateOperatorFamily, CreateView, ExportData, Owner, TypedString, ddl::AlterSchema,
-        query::SelectItemQualifiedWildcardKind,
+        ddl::AlterSchema, query::SelectItemQualifiedWildcardKind, AlterSchemaOperation, AlterTable,
+        ColumnOptions, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreateView,
+        ExportData, Owner, TypedString,
     },
     tokenizer::TokenWithSpan,
 };
@@ -28,15 +28,16 @@ use core::iter;
 use crate::tokenizer::Span;
 
 use super::{
-    AccessExpr, AlterColumnOperation, AlterIndexOperation, AlterTableOperation, Analyze, Array,
-    Assignment, AssignmentTarget, AttachedToken, BeginEndStatements, CaseStatement, CloseCursor,
-    ClusteredIndex, ColumnDef, ColumnOption, ColumnOptionDef, ConditionalStatementBlock,
-    ConditionalStatements, ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource,
-    CreateIndex, CreateTable, CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem,
-    ExcludeSelectItem, Expr, ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
-    HavingBound, IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr,
-    Join, JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
+    comments, dcl::SecondaryRoles, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
+    AlterIndexOperation, AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget,
+    AttachedToken, BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef,
+    ColumnOption, ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements,
+    ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource, CreateIndex, CreateTable,
+    CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem, ExcludeSelectItem, Expr,
+    ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, HavingBound,
+    IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr, Join,
+    JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
     MatchRecognizePattern, Measure, Merge, MergeAction, MergeClause, MergeInsertExpr,
     MergeInsertKind, MergeUpdateExpr, MySqlAlterTableComment, NamedParenthesizedList,
     NamedWindowDefinition, ObjectName, ObjectNamePart, Offset, OnConflict, OnConflictAction,
@@ -47,8 +48,7 @@ use super::{
     StartTransactionSnapshot, Statement, Subscript, SymbolDefinition, TableAlias,
     TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
     TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewCheckOption, ViewColumnDef,
-    WhileStatement, WildcardAdditionalOptions, With, WithFill, comments, dcl::SecondaryRoles,
-    value::ValueWithSpan,
+    WhileStatement, WildcardAdditionalOptions, With, WithFill,
 };
 
 /// Given an iterator of spans, return the [Span::union] of all spans.
@@ -104,6 +104,12 @@ pub trait Spanned {
 impl Spanned for TokenWithSpan {
     fn span(&self) -> Span {
         self.span
+    }
+}
+
+impl Spanned for AttachedToken {
+    fn span(&self) -> Span {
+        self.0.span()
     }
 }
 
@@ -202,6 +208,8 @@ impl Spanned for Cte {
             query,
             from,
             materialized: _, // enum
+            search,
+            cycle,
             closing_paren_token,
         } = self;
 
@@ -209,7 +217,21 @@ impl Spanned for Cte {
             core::iter::once(alias.span())
                 .chain(core::iter::once(query.span()))
                 .chain(from.iter().map(|item| item.span))
-                .chain(core::iter::once(closing_paren_token.0.span)),
+                .chain(core::iter::once(closing_paren_token.0.span))
+                .chain(search.iter().flat_map(|clause| {
+                    clause
+                        .columns
+                        .iter()
+                        .map(|column| column.span)
+                        .chain(core::iter::once(clause.sequence_column.span))
+                }))
+                .chain(cycle.iter().flat_map(|clause| {
+                    clause
+                        .columns
+                        .iter()
+                        .map(|column| column.span)
+                        .chain([clause.mark_column.span, clause.path_column.span])
+                })),
         )
     }
 }
@@ -353,8 +375,11 @@ impl Spanned for Statement {
                 target: _,
                 options: _,
                 legacy_options: _,
+                where_clause,
                 values: _,
-            } => source.span(),
+            } => source
+                .span()
+                .union(&where_clause.as_ref().map_or(Span::empty(), Spanned::span)),
             Statement::CopyIntoSnowflake {
                 into: _,
                 into_columns: _,
@@ -393,6 +418,15 @@ impl Spanned for Statement {
             Statement::CreateIndex(create_index) => create_index.span(),
             Statement::CreateRole(create_role) => create_role.span(),
             Statement::CreateExtension(create_extension) => create_extension.span(),
+            Statement::CreateLanguage(create) => union_spans(
+                iter::once(create.name.span)
+                    .chain(iter::once(create.handler.span()))
+                    .chain(create.inline.iter().map(|name| name.span()))
+                    .chain(create.validator.iter().map(|name| name.span())),
+            ),
+            Statement::AlterLanguage(alter) => alter.name.span.union(&alter.new_name.span),
+            Statement::DropLanguage(drop) => union_spans(drop.names.iter().map(|name| name.span)),
+            Statement::AlterExtension(alter_extension) => alter_extension.name.span,
             Statement::CreateCollation(create_collation) => create_collation.span(),
             Statement::DropExtension(drop_extension) => drop_extension.span(),
             Statement::DropOperator(drop_operator) => drop_operator.span(),
@@ -408,6 +442,7 @@ impl Spanned for Statement {
             Statement::CreateOperatorClass(create_operator_class) => create_operator_class.span(),
             Statement::AlterTable(alter_table) => alter_table.span(),
             Statement::AlterIndex { name, operation } => name.span().union(&operation.span()),
+            Statement::AlterViewOptions { name, .. } => name.span(),
             Statement::AlterView {
                 name,
                 columns,
@@ -586,6 +621,7 @@ impl Spanned for CreateTable {
         let CreateTable {
             or_replace: _,    // bool
             temporary: _,     // bool
+            unlogged: _,      // bool
             external: _,      // bool
             global: _,        // bool
             dynamic: _,       // bool
@@ -595,7 +631,10 @@ impl Spanned for CreateTable {
             iceberg: _,       // bool, Snowflake specific
             snapshot: _,      // bool, BigQuery specific
             name,
+            of_type,
             columns,
+            query_columns,
+            with_data: _,
             constraints,
             elements: _,
             hive_distribution: _, // hive specific
@@ -651,7 +690,9 @@ impl Spanned for CreateTable {
         union_spans(
             core::iter::once(name.span())
                 .chain(core::iter::once(table_options.span()))
+                .chain(of_type.iter().map(|i| i.span()))
                 .chain(columns.iter().map(|i| i.span()))
+                .chain(query_columns.iter().map(|i| i.span))
                 .chain(constraints.iter().map(|i| i.span()))
                 .chain(query.iter().map(|i| i.span()))
                 .chain(clone.iter().map(|i| i.span()))
@@ -761,10 +802,8 @@ impl Spanned for TableConstraint {
 impl Spanned for PartitionBoundValue {
     fn span(&self) -> Span {
         match self {
-            PartitionBoundValue::Expr(expr) => expr.span(),
-            // MINVALUE and MAXVALUE are keywords without tracked spans
-            PartitionBoundValue::MinValue => Span::empty(),
-            PartitionBoundValue::MaxValue => Span::empty(),
+            Self::Expr(expr) => expr.span(),
+            Self::MinValue(token) | Self::MaxValue(token) => token.span(),
         }
     }
 }
@@ -772,15 +811,13 @@ impl Spanned for PartitionBoundValue {
 impl Spanned for ForValues {
     fn span(&self) -> Span {
         match self {
-            ForValues::In(exprs) => union_spans(exprs.iter().map(|e| e.span())),
-            ForValues::From { from, to } => union_spans(
-                from.iter()
-                    .map(|v| v.span())
-                    .chain(to.iter().map(|v| v.span())),
-            ),
-            // WITH (MODULUS n, REMAINDER r) - u64 values have no spans
-            ForValues::With { .. } => Span::empty(),
-            ForValues::Default => Span::empty(),
+            Self::In { values, token } => token
+                .span()
+                .union(&union_spans(values.iter().map(Spanned::span))),
+            Self::From { from, to, token } => token
+                .span()
+                .union(&union_spans(from.iter().chain(to).map(Spanned::span))),
+            Self::With { token, .. } | Self::Default { token } => token.span(),
         }
     }
 }
@@ -1009,9 +1046,15 @@ impl Spanned for AlterColumnOperation {
             | AlterColumnOperation::SetVisibility { .. } => Span::empty(),
             AlterColumnOperation::SetDataType {
                 data_type: _,
+                collation,
                 using,
                 had_set: _,
-            } => using.as_ref().map_or(Span::empty(), |u| u.span()),
+            } => union_spans(
+                collation
+                    .iter()
+                    .map(Spanned::span)
+                    .chain(using.iter().map(Spanned::span)),
+            ),
             AlterColumnOperation::AddGenerated { .. }
             | AlterColumnOperation::SetGenerated { .. }
             | AlterColumnOperation::SetSequenceOptions { .. }
@@ -1147,6 +1190,16 @@ impl Spanned for SqlOption {
             SqlOption::Clustered(table_options_clustered) => table_options_clustered.span(),
             SqlOption::Ident(ident) => ident.span,
             SqlOption::KeyValue { key, value } => key.span.union(&value.span()),
+            SqlOption::Namespaced {
+                namespace,
+                key,
+                value,
+            } => namespace.span.union(&key.span).union(
+                &value
+                    .as_ref()
+                    .map(Spanned::span)
+                    .unwrap_or_else(Span::empty),
+            ),
             SqlOption::Partition {
                 column_name,
                 range_direction: _,
@@ -1214,6 +1267,9 @@ impl Spanned for CreateTableOptions {
 impl Spanned for AlterTableOperation {
     fn span(&self) -> Span {
         match self {
+            AlterTableOperation::Inherit { parent, .. } => parent.span(),
+            AlterTableOperation::Of { type_name } => type_name.span(),
+            AlterTableOperation::NotOf => Span::empty(),
             AlterTableOperation::AddConstraint {
                 constraint,
                 not_valid: _,
@@ -1336,6 +1392,8 @@ impl Spanned for AlterTableOperation {
                 union_spans(table_properties.iter().map(|i| i.span()))
             }
             AlterTableOperation::OwnerTo { .. } => Span::empty(),
+            AlterTableOperation::SetSchema { schema_name } => schema_name.span,
+            AlterTableOperation::SetTablespace { tablespace_name } => tablespace_name.span,
             AlterTableOperation::ClusterBy { exprs } => union_spans(exprs.iter().map(|e| e.span())),
             AlterTableOperation::DropClusteringKey => Span::empty(),
             AlterTableOperation::AlterSortKey { .. } => Span::empty(),
@@ -1449,6 +1507,7 @@ impl Spanned for AlterIndexOperation {
 impl Spanned for Insert {
     fn span(&self) -> Span {
         let Insert {
+            postgres_insert_bindings: _, // compiler metadata has no source span
             insert_token,
             optimizer_hints: _,
             or: _,     // enum, sqlite specific
@@ -1519,7 +1578,15 @@ impl Spanned for OnConflict {
 impl Spanned for ConflictTarget {
     fn span(&self) -> Span {
         match self {
-            ConflictTarget::Columns(vec) => union_spans(vec.iter().map(|i| i.span)),
+            ConflictTarget::Inference {
+                elements,
+                predicate,
+            } => union_spans(
+                elements
+                    .iter()
+                    .map(Spanned::span)
+                    .chain(predicate.iter().map(Spanned::span)),
+            ),
             ConflictTarget::OnConstraint(object_name) => object_name.span(),
         }
     }
@@ -1588,6 +1655,10 @@ impl Spanned for Expr {
     fn span(&self) -> Span {
         match self {
             Expr::Identifier(ident) => ident.span,
+            Expr::CurrentOf { cursor_name, .. } => cursor_name
+                .as_ref()
+                .map(|name| name.span)
+                .unwrap_or(Span::empty()),
             Expr::UserVariable(ident) => ident.span,
             Expr::CompoundIdentifier(vec) => union_spans(vec.iter().map(|i| i.span)),
             Expr::CompoundFieldAccess { root, access_chain } => {
@@ -1696,6 +1767,21 @@ impl Spanned for Expr {
                 }
                 span
             }
+            Expr::JsonArray(array) => match &array.source {
+                super::JsonArraySource::Aggregate(input)
+                | super::JsonArraySource::QueryAggregate(input) => input.expr.span(),
+                super::JsonArraySource::Values(values) => {
+                    union_spans(values.iter().map(|value| value.expr.span()))
+                }
+                super::JsonArraySource::Query { query, .. } => query.span(),
+            },
+            Expr::JsonObject(object) => union_spans(
+                object
+                    .entries
+                    .iter()
+                    .flat_map(|entry| [entry.key.span(), entry.value.expr.span()]),
+            ),
+            Expr::IsJson(predicate) => predicate.expr.span(),
             Expr::AnyOp {
                 left,
                 compare_op: _,
@@ -2168,7 +2254,26 @@ impl Spanned for TableFactor {
                     .chain(alias.as_ref().map(|alias| alias.span())),
             ),
             TableFactor::JsonTable { .. } => Span::empty(),
-            TableFactor::XmlTable { .. } => Span::empty(),
+            TableFactor::XmlTable {
+                xmltable_token,
+                row_expression,
+                passing,
+                columns,
+                alias,
+                ..
+            } => {
+                let mut span = xmltable_token.0.span.union(&row_expression.span());
+                for argument in &passing.arguments {
+                    span = span.union(&argument.expr.span());
+                }
+                for column in columns {
+                    span = span.union(&column.name.span);
+                }
+                if let Some(alias) = alias {
+                    span = span.union(&alias.span());
+                }
+                span
+            }
             TableFactor::Pivot {
                 table,
                 aggregate_functions,
@@ -2374,6 +2479,7 @@ impl Spanned for ValueWithSpan {
 impl Spanned for Join {
     fn span(&self) -> Span {
         let Join {
+            postgres_using_bindings: _, // compiler programs have no source span
             relation,
             global: _, // bool
             join_operator,

@@ -64,6 +64,12 @@ pub use self::dcl::{
     AlterRoleOperation, CreateRole, Grant, ResetConfig, Revoke, RoleOption, SecondaryRoles,
     SetConfigValue, Use,
 };
+mod extension;
+pub use extension::{
+    AlterExtension, AlterExtensionOperation, ExtensionMember, ExtensionMemberKind,
+    ExtensionRoutineKind,
+};
+
 pub use self::ddl::{
     Alignment, AlterCollation, AlterCollationOperation, AlterColumnOperation, AlterConnectorOwner,
     AlterFunction, AlterFunctionAction, AlterFunctionKind, AlterFunctionOperation,
@@ -72,24 +78,25 @@ pub use self::ddl::{
     AlterPolicyOperation, AlterSchema, AlterSchemaOperation, AlterSchemaSetOperation, AlterTable,
     AlterTableAlgorithm, AlterTableLock, AlterTableOperation, AlterTableSetOperation,
     AlterTableType, AlterType, AlterTypeAddValue, AlterTypeAddValuePosition, AlterTypeOperation,
-    AlterTypeRename, AlterTypeRenameValue, ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef,
-    ColumnOptions, ColumnPolicy, ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation,
-    CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension, CreateFunction,
-    CreateIndex, CreateIndexKind, CreateOperator, CreateOperatorClass, CreateOperatorFamily,
-    CreatePolicy, CreatePolicyCommand, CreatePolicyType, CreateProcedure, CreateProcedureBody,
-    CreateTable, CreateTableElement, CreateTrigger, CreateView, Deduplicate, DeferrableInitial,
-    DistStyle, DropBehavior, DropExtension, DropFunction, DropOperator, DropOperatorClass,
-    DropOperatorFamily, DropOperatorSignature, DropPolicy, DropTrigger, ForValues,
-    FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters, IdentityProperty,
-    IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder, IndexColumn,
-    IndexOption, IndexType, KeyOrIndexDisplay, Msck, MySqlAlterTableComment,
+    AlterTypeRename, AlterTypeRenameValue, AlterViewOptions, ClusteredBy, ColumnDef, ColumnOption,
+    ColumnOptionDef, ColumnOptions, ColumnPolicy, ColumnPolicyProperty, ConstraintCharacteristics,
+    CreateCollation, CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension,
+    CreateFunction, CreateIndex, CreateIndexKind, CreateOperator, CreateOperatorClass,
+    CreateOperatorFamily, CreatePolicy, CreatePolicyCommand, CreatePolicyType, CreateProcedure,
+    CreateProcedureBody, CreateTable, CreateTableElement, CreateTrigger, CreateView, Deduplicate,
+    DeferrableInitial, DistStyle, DropBehavior, DropExtension, DropFunction, DropOperator,
+    DropOperatorClass, DropOperatorFamily, DropOperatorSignature, DropPolicy, DropTrigger,
+    ForValues, FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters,
+    IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder,
+    IndexColumn, IndexOption, IndexType, KeyOrIndexDisplay, Msck, MySqlAlterTableComment,
     MySqlCreateTableDuplicate, MySqlExchangeValidation, MySqlKeyAlgorithm, MySqlPartitionBound,
     MySqlPartitionBy, MySqlPartitionDefinition, MySqlPartitionMaintenance, MySqlPartitionMethod,
     MySqlPartitionOption, MySqlPartitionSelection, MySqlPartitionValues, MySqlProgramBody,
     MySqlSubpartitionBy, MySqlSubpartitionDefinition, MySqlSubpartitionMethod, NullsDistinctOption,
     OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem, OperatorFamilyItem,
-    OperatorOption, OperatorPurpose, Owner, Partition, PartitionBoundValue, ReferentialAction,
-    RenameTableNameKind, ReplicaIdentity, TagsColumnOption, TriggerObjectKind, Truncate,
+    OperatorOption, OperatorPurpose, Owner, ParsedRoutineSource, ParsedSourceToken,
+    ParsedSourceTokenKind, Partition, PartitionBoundValue, ReferentialAction, RenameTableNameKind,
+    ReplicaIdentity, RoutineSourceProvenance, TagsColumnOption, TriggerObjectKind, Truncate,
     UserDefinedTypeCompositeAttributeDef, UserDefinedTypeInternalLength,
     UserDefinedTypeRangeOption, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
     UserDefinedTypeStorage, ViewCheckOption, ViewCheckOptionKind, ViewColumnDef,
@@ -103,26 +110,26 @@ pub use self::dml::{
 };
 pub use self::operator::{BinaryOperator, UnaryOperator};
 pub use self::query::{
-    AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, DerivedTableOrigin, Distinct,
-    EmptyMatchesMode, ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy,
-    Fetch, ForClause, ForJson, ForXml, FormatClause, GroupByExpr, GroupByWithModifier,
-    IdentWithAlias, IlikeSelectItem, InputFormatClause, Interpolate, InterpolateExpr, Join,
-    JoinConstraint, JoinOperator, JsonTableColumn, JsonTableColumnErrorHandling,
-    JsonTableNamedColumn, JsonTableNestedColumn, LateralView, LimitClause, LockClause, LockType,
-    MatchRecognizePattern, MatchRecognizeSymbol, Measure, MySqlSelectIntoFile,
-    NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset, OffsetRows, OpenJsonTableColumn,
-    OrderBy, OrderByExpr, OrderByKind, OrderByOptions, PipeOperator, PivotValueSource,
-    ProjectionSelect, Query, RenameSelectItem, RepetitionQuantifier, ReplaceSelectElement,
-    ReplaceSelectItem, RowsFromItem, RowsPerMatch, Select, SelectFlavor, SelectInto,
-    SelectIntoFile, SelectIntoTarget, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers,
-    SetExpr, SetOperator, SetQuantifier, Setting, SymbolDefinition, Table, TableAlias,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableIndexHintForClause,
-    TableIndexHintType, TableIndexHints, TableIndexType, TableSample, TableSampleBucket,
-    TableSampleKind, TableSampleMethod, TableSampleModifier, TableSampleQuantity, TableSampleSeed,
-    TableSampleSeedModifier, TableSampleUnit, TableVersion, TableWithJoins, Top, TopQuantity,
-    UpdateTableFromKind, ValueTableMode, Values, WildcardAdditionalOptions, With, WithFill,
-    XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption,
+    AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, CteCycleClause, CteSearchClause,
+    DerivedTableOrigin, Distinct, EmptyMatchesMode, ExceptSelectItem, ExcludeSelectItem,
+    ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, ForClause, ForJson, ForXml, FormatClause,
+    GroupByExpr, GroupByWithModifier, IdentWithAlias, IlikeSelectItem, InputFormatClause,
+    Interpolate, InterpolateExpr, Join, JoinConstraint, JoinOperator, JoinUsingBinding,
+    JsonTableColumn, JsonTableColumnErrorHandling, JsonTableNamedColumn, JsonTableNestedColumn,
+    LateralView, LimitClause, LockClause, LockType, MatchRecognizePattern, MatchRecognizeSymbol,
+    Measure, MySqlSelectIntoFile, NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset,
+    OffsetRows, OpenJsonTableColumn, OrderBy, OrderByExpr, OrderByKind, OrderByOptions,
+    PipeOperator, PivotValueSource, ProjectionSelect, Query, RenameSelectItem,
+    RepetitionQuantifier, ReplaceSelectElement, ReplaceSelectItem, RowsFromItem, RowsPerMatch,
+    Select, SelectFlavor, SelectInto, SelectIntoFile, SelectIntoTarget, SelectItem,
+    SelectItemQualifiedWildcardKind, SelectModifiers, SetExpr, SetOperator, SetQuantifier, Setting,
+    SymbolDefinition, Table, TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs,
+    TableIndexHintForClause, TableIndexHintType, TableIndexHints, TableIndexType, TableSample,
+    TableSampleBucket, TableSampleKind, TableSampleMethod, TableSampleModifier,
+    TableSampleQuantity, TableSampleSeed, TableSampleSeedModifier, TableSampleUnit, TableVersion,
+    TableWithJoins, Top, TopQuantity, UpdateTableFromKind, ValueTableMode, Values,
+    WildcardAdditionalOptions, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument,
+    XmlPassingClause, XmlTableColumn, XmlTableColumnOption, XmlTableColumnType,
 };
 
 pub use self::trigger::{
@@ -148,6 +155,10 @@ pub use self::data_type::GeometricTypeKind;
 mod data_type;
 mod dcl;
 mod ddl;
+mod language;
+pub use language::{AlterLanguage, CreateLanguage, DropLanguage};
+mod partition;
+pub use partition::{PartitionKey, TablePartitionBy};
 mod dml;
 /// Helper modules for building and manipulating AST nodes.
 pub mod helpers;
@@ -549,7 +560,8 @@ pub struct Interval {
     pub value: Box<Expr>,
     /// Optional leading time unit (e.g., `HOUR`, `MINUTE`).
     pub leading_field: Option<DateTimeField>,
-    /// Optional leading precision for the leading field.
+    /// Optional leading precision for the leading field, or PostgreSQL's
+    /// full-range fractional precision in `INTERVAL(p) 'value'`.
     pub leading_precision: Option<u64>,
     /// Optional trailing time unit for a range (e.g., `SECOND`).
     pub last_field: Option<DateTimeField>,
@@ -567,6 +579,9 @@ impl fmt::Display for Interval {
             self.leading_precision,
             self.fractional_seconds_precision,
         ) {
+            (None, Some(precision), None) if self.last_field.is_none() => {
+                write!(f, "INTERVAL ({precision}) {value}")
+            }
             (
                 Some(DateTimeField::Second),
                 Some(leading_precision),
@@ -936,6 +951,169 @@ pub struct JsonValueExpr {
     pub on_error: Option<JsonValueClause>,
 }
 
+/// A PostgreSQL SQL/JSON `FORMAT JSON [ENCODING name]` clause.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonFormatClause {
+    /// Explicit input or output byte encoding, when specified.
+    pub encoding: Option<Ident>,
+}
+
+impl fmt::Display for JsonFormatClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FORMAT JSON")?;
+        if let Some(encoding) = &self.encoding {
+            write!(f, " ENCODING {encoding}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A value expression and its optional SQL/JSON input format.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonInput {
+    /// The actual SQL value expression.
+    pub expr: Expr,
+    /// An explicitly specified JSON input format.
+    pub format: Option<JsonFormatClause>,
+}
+
+impl fmt::Display for JsonInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.expr.fmt(f)?;
+        if let Some(format) = &self.format {
+            write!(f, " {format}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A SQL/JSON constructor's `RETURNING` type and optional format.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonOutputClause {
+    /// The declared output SQL type, including any modifiers.
+    pub data_type: DataType,
+    /// An explicitly specified output format.
+    pub format: Option<JsonFormatClause>,
+}
+
+impl fmt::Display for JsonOutputClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RETURNING {}", self.data_type)?;
+        if let Some(format) = &self.format {
+            write!(f, " {format}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The values or single-column query supplying a SQL/JSON array.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum JsonArraySource {
+    /// An ordered list of value expressions.
+    Values(Vec<JsonInput>),
+    /// The aggregate input used by native JSON_ARRAY query analysis and its
+    /// durable JSON_ARRAYAGG representation.
+    Aggregate(Box<JsonInput>),
+    /// The compiler's aggregate over a JSON_ARRAY query input. Its completed
+    /// derived query must supply exactly one column before output type binding.
+    QueryAggregate(Box<JsonInput>),
+    /// A query, and an optional format applied to each result value.
+    Query {
+        /// The original query expression.
+        query: Box<Query>,
+        /// The explicitly specified input format.
+        format: Option<JsonFormatClause>,
+    },
+}
+
+/// PostgreSQL's standard `JSON_ARRAY` constructor.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonArrayExpr {
+    /// Actual value expressions or the actual query.
+    pub source: JsonArraySource,
+    /// Explicit NULL handling; omission means ABSENT ON NULL.
+    pub null_clause: Option<JsonNullClause>,
+    /// Optional output type and format.
+    pub returning: Option<JsonOutputClause>,
+}
+
+/// One `key VALUE value` pair in a SQL/JSON object constructor.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonKeyValue {
+    /// The key expression, evaluated before its value.
+    pub key: Expr,
+    /// The value expression and any input format.
+    pub value: JsonInput,
+}
+
+/// PostgreSQL's standard `JSON_OBJECT` constructor.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonObjectExpr {
+    /// Ordered key/value expressions.
+    pub entries: Vec<JsonKeyValue>,
+    /// Explicit NULL handling; omission means NULL ON NULL.
+    pub null_clause: Option<JsonNullClause>,
+    /// Explicit key uniqueness; omission means WITHOUT UNIQUE KEYS.
+    pub unique_keys: Option<bool>,
+    /// Optional output type and format.
+    pub returning: Option<JsonOutputClause>,
+}
+
+/// The item category tested by `IS JSON`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum JsonPredicateType {
+    /// Any JSON value.
+    Value,
+    /// A JSON scalar value.
+    Scalar,
+    /// A JSON array.
+    Array,
+    /// A JSON object.
+    Object,
+}
+
+impl fmt::Display for JsonPredicateType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Value => "VALUE",
+            Self::Scalar => "SCALAR",
+            Self::Array => "ARRAY",
+            Self::Object => "OBJECT",
+        })
+    }
+}
+
+/// PostgreSQL's `IS [NOT] JSON` predicate, including recursive uniqueness.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct JsonIsPredicate {
+    /// The original input expression.
+    pub expr: Box<Expr>,
+    /// Whether NOT was specified.
+    pub negated: bool,
+    /// The explicit item category, if specified.
+    pub item_type: Option<JsonPredicateType>,
+    /// The explicit recursive key uniqueness constraint.
+    pub unique_keys: Option<bool>,
+}
+
 /// Quantifier for PostgreSQL pattern comparisons against an array.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -983,6 +1161,13 @@ impl fmt::Display for PatternQuantifier {
 pub enum Expr {
     /// Identifier e.g. table name or column name
     Identifier(Ident),
+    /// Positioned PostgreSQL UPDATE/DELETE predicate, never a scalar column reference.
+    CurrentOf {
+        /// Explicit cursor identifier, mutually exclusive with `cursor_param`.
+        cursor_name: Option<Ident>,
+        /// One-based parameter number supplying the cursor name instead of an identifier.
+        cursor_param: Option<u32>,
+    },
     /// A MySQL user variable, distinct from both a column and a parameter.
     /// The identifier stores the decoded name without the source `@` marker.
     UserVariable(Ident),
@@ -1025,6 +1210,12 @@ pub enum Expr {
     },
     /// MySQL `JSON_VALUE` with typed return and explicit empty/error behavior.
     JsonValue(JsonValueExpr),
+    /// PostgreSQL standard SQL/JSON array construction.
+    JsonArray(JsonArrayExpr),
+    /// PostgreSQL standard SQL/JSON object construction.
+    JsonObject(JsonObjectExpr),
+    /// PostgreSQL's typed and optionally unique `IS JSON` predicate.
+    IsJson(JsonIsPredicate),
     /// `IS FALSE` operator
     IsFalse(Box<Expr>),
     /// `IS NOT FALSE` operator
@@ -1852,6 +2043,14 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Expr::Identifier(s) => write!(f, "{s}"),
+            Expr::CurrentOf {
+                cursor_name,
+                cursor_param,
+            } => match (cursor_name, cursor_param) {
+                (Some(name), None) => write!(f, "CURRENT OF {name}"),
+                (None, Some(param)) => write!(f, "CURRENT OF ${param}"),
+                _ => Err(fmt::Error),
+            },
             Expr::UserVariable(ident) => value::fmt_user_variable(ident, f),
             Expr::Wildcard(_) => f.write_str("*"),
             Expr::QualifiedWildcard(prefix, _) => write!(f, "{prefix}.*"),
@@ -2058,6 +2257,7 @@ impl fmt::Display for Expr {
                 } else if matches!(
                     op,
                     UnaryOperator::Not
+                        | UnaryOperator::PGCustomUnaryOperator(_)
                         | UnaryOperator::Hash
                         | UnaryOperator::AtDashAt
                         | UnaryOperator::DoubleAt
@@ -2361,6 +2561,89 @@ impl fmt::Display for Expr {
                     write!(f, " {on_error} ON ERROR")?;
                 }
                 f.write_str(")")
+            }
+            Expr::JsonArray(array) => {
+                f.write_str(
+                    if matches!(
+                        array.source,
+                        JsonArraySource::Aggregate(_) | JsonArraySource::QueryAggregate(_)
+                    ) {
+                        "JSON_ARRAYAGG("
+                    } else {
+                        "JSON_ARRAY("
+                    },
+                )?;
+                match &array.source {
+                    JsonArraySource::Aggregate(input) | JsonArraySource::QueryAggregate(input) => {
+                        input.fmt(f)?
+                    }
+                    JsonArraySource::Values(values) => {
+                        display_comma_separated(values).fmt(f)?;
+                    }
+                    JsonArraySource::Query { query, format } => {
+                        query.fmt(f)?;
+                        if let Some(format) = format {
+                            write!(f, " {format}")?;
+                        }
+                    }
+                }
+                if let Some(null_clause) = &array.null_clause {
+                    write!(f, " {null_clause}")?;
+                }
+                if let Some(returning) = &array.returning {
+                    write!(f, " {returning}")?;
+                }
+                f.write_str(")")
+            }
+            Expr::JsonObject(object) => {
+                f.write_str("JSON_OBJECT(")?;
+                for (index, entry) in object.entries.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} VALUE {}", entry.key, entry.value)?;
+                }
+                if let Some(null_clause) = &object.null_clause {
+                    if !object.entries.is_empty() {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{null_clause}")?;
+                }
+                if let Some(unique) = object.unique_keys {
+                    if !object.entries.is_empty() || object.null_clause.is_some() {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{} UNIQUE KEYS", if unique { "WITH" } else { "WITHOUT" })?;
+                }
+                if let Some(returning) = &object.returning {
+                    if !object.entries.is_empty()
+                        || object.null_clause.is_some()
+                        || object.unique_keys.is_some()
+                    {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{returning}")?;
+                }
+                f.write_str(")")
+            }
+            Expr::IsJson(predicate) => {
+                write!(
+                    f,
+                    "{} IS {}JSON",
+                    predicate.expr,
+                    if predicate.negated { "NOT " } else { "" }
+                )?;
+                if let Some(item_type) = predicate.item_type {
+                    write!(f, " {item_type}")?;
+                }
+                if let Some(unique) = predicate.unique_keys {
+                    write!(
+                        f,
+                        " {} UNIQUE KEYS",
+                        if unique { "WITH" } else { "WITHOUT" }
+                    )?;
+                }
+                Ok(())
             }
             Expr::AtTimeZone {
                 timestamp,
@@ -2750,12 +3033,16 @@ pub enum CommentObject {
     Domain,
     /// An extension.
     Extension,
+    /// A database-local procedural language.
+    Language,
     /// A function.
     Function,
     /// An index.
     Index,
     /// A materialized view.
     MaterializedView,
+    /// An operator, identified by its two operand type slots.
+    Operator,
     /// A procedure.
     Procedure,
     /// A role.
@@ -2782,9 +3069,11 @@ impl fmt::Display for CommentObject {
             CommentObject::Database => f.write_str("DATABASE"),
             CommentObject::Domain => f.write_str("DOMAIN"),
             CommentObject::Extension => f.write_str("EXTENSION"),
+            CommentObject::Language => f.write_str("LANGUAGE"),
             CommentObject::Function => f.write_str("FUNCTION"),
             CommentObject::Index => f.write_str("INDEX"),
             CommentObject::MaterializedView => f.write_str("MATERIALIZED VIEW"),
+            CommentObject::Operator => f.write_str("OPERATOR"),
             CommentObject::Procedure => f.write_str("PROCEDURE"),
             CommentObject::Role => f.write_str("ROLE"),
             CommentObject::Schema => f.write_str("SCHEMA"),
@@ -3469,7 +3758,18 @@ impl fmt::Display for CreateTableOptions {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             CreateTableOptions::With(with_options) => {
-                write!(f, "WITH ({})", display_comma_separated(with_options))
+                let storage = with_options
+                    .iter()
+                    .filter(|option| !matches!(option, SqlOption::TableSpace(_)))
+                    .collect::<Vec<_>>();
+                write!(f, "WITH ({})", display_comma_separated(&storage))?;
+                for option in with_options
+                    .iter()
+                    .filter(|option| matches!(option, SqlOption::TableSpace(_)))
+                {
+                    write!(f, " {option}")?;
+                }
+                Ok(())
             }
             CreateTableOptions::Options(options) => {
                 write!(f, "OPTIONS({})", display_comma_separated(options))
@@ -4069,6 +4369,8 @@ pub enum Statement {
         options: Vec<CopyOption>,
         /// WITH options (before PostgreSQL version 9.0)
         legacy_options: Vec<CopyLegacyOption>,
+        /// Optional PostgreSQL COPY FROM row predicate.
+        where_clause: Option<Expr>,
         /// VALUES a vector of values to be copied
         values: Vec<Option<String>>,
     },
@@ -4249,6 +4551,16 @@ pub enum Statement {
         /// MySQL row-validation policy.
         check_option: Option<ViewCheckOption>,
     },
+    /// PostgreSQL `ALTER VIEW [IF EXISTS] name SET (...) / RESET (...)`.
+    AlterViewOptions {
+        /// Skip an absent relation.
+        if_exists: bool,
+        /// Actual view relation being altered.
+        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
+        name: ObjectName,
+        /// Named options changed on this view.
+        operation: AlterViewOptions,
+    },
     /// ```sql
     /// ALTER FUNCTION
     /// ALTER AGGREGATE
@@ -4372,6 +4684,8 @@ pub enum Statement {
     Drop {
         /// The type of the object to drop: TABLE, VIEW, etc.
         object_type: ObjectType,
+        /// PostgreSQL `DROP INDEX CONCURRENTLY` retirement.
+        concurrently: bool,
         /// An optional `IF EXISTS` clause. (Non-standard.)
         if_exists: bool,
         /// One or more objects to drop. (ANSI SQL requires exactly one.)
@@ -4462,6 +4776,14 @@ pub enum Statement {
     ///
     /// Note: this is a PostgreSQL-specific statement,
     CreateExtension(CreateExtension),
+    /// CREATE LANGUAGE with explicit callback identities.
+    CreateLanguage(CreateLanguage),
+    /// Rename an existing procedural language.
+    AlterLanguage(AlterLanguage),
+    /// DROP LANGUAGE with ordinary dependency semantics.
+    DropLanguage(DropLanguage),
+    /// PostgreSQL installed-extension version, schema, or membership mutation.
+    AlterExtension(AlterExtension),
     /// ```sql
     /// CREATE COLLATION
     /// ```
@@ -4837,6 +5159,8 @@ pub enum Statement {
     CreateSchema {
         /// `<schema name> | AUTHORIZATION <schema authorization identifier>  | <schema name>  AUTHORIZATION <schema authorization identifier>`
         schema_name: SchemaName,
+        /// PostgreSQL utility statements contained in this schema declaration.
+        schema_elements: Vec<Statement>,
         /// `true` when `IF NOT EXISTS` was present.
         if_not_exists: bool,
         /// Schema properties.
@@ -5802,6 +6126,7 @@ impl fmt::Display for Statement {
                 target,
                 options,
                 legacy_options,
+                where_clause,
                 values,
             } => {
                 write!(f, "COPY")?;
@@ -5823,6 +6148,9 @@ impl fmt::Display for Statement {
                 }
                 if !legacy_options.is_empty() {
                     write!(f, " {}", display_separated(legacy_options, " "))?;
+                }
+                if let Some(predicate) = where_clause {
+                    write!(f, " WHERE {predicate}")?;
                 }
                 if !values.is_empty() {
                     writeln!(f, ";")?;
@@ -6034,6 +6362,10 @@ impl fmt::Display for Statement {
             }
             Statement::CreateIndex(create_index) => create_index.fmt(f),
             Statement::CreateExtension(create_extension) => write!(f, "{create_extension}"),
+            Statement::CreateLanguage(value) => write!(f, "{value}"),
+            Statement::AlterLanguage(value) => write!(f, "{value}"),
+            Statement::DropLanguage(value) => write!(f, "{value}"),
+            Statement::AlterExtension(alter) => write!(f, "{alter}"),
             Statement::CreateCollation(create_collation) => write!(f, "{create_collation}"),
             Statement::DropExtension(drop_extension) => write!(f, "{drop_extension}"),
             Statement::DropOperator(drop_operator) => write!(f, "{drop_operator}"),
@@ -6118,6 +6450,17 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Statement::AlterViewOptions {
+                if_exists,
+                name,
+                operation,
+            } => {
+                write!(
+                    f,
+                    "ALTER VIEW {}{name} {operation}",
+                    if *if_exists { "IF EXISTS " } else { "" }
+                )
+            }
             Statement::AlterFunction(alter_function) => write!(f, "{alter_function}"),
             Statement::AlterType(AlterType { name, operation }) => {
                 write!(f, "ALTER TYPE {name} {operation}")
@@ -6181,6 +6524,7 @@ impl fmt::Display for Statement {
             }
             Statement::Drop {
                 object_type,
+                concurrently,
                 if_exists,
                 names,
                 cascade,
@@ -6191,9 +6535,10 @@ impl fmt::Display for Statement {
             } => {
                 write!(
                     f,
-                    "DROP {}{}{} {}{}{}{}",
+                    "DROP {}{}{}{} {}{}{}{}",
                     if *temporary { "TEMPORARY " } else { "" },
                     object_type,
+                    if *concurrently { " CONCURRENTLY" } else { "" },
                     if *if_exists { " IF EXISTS" } else { "" },
                     display_comma_separated(names),
                     if *cascade { " CASCADE" } else { "" },
@@ -6588,6 +6933,7 @@ impl fmt::Display for Statement {
             }
             Statement::CreateSchema {
                 schema_name,
+                schema_elements,
                 if_not_exists,
                 with,
                 options,
@@ -6615,6 +6961,9 @@ impl fmt::Display for Statement {
 
                 if let Some(clone) = clone {
                     write!(f, " CLONE {clone}")?;
+                }
+                for element in schema_elements {
+                    write!(f, " {element}")?;
                 }
                 Ok(())
             }
@@ -7389,8 +7738,13 @@ pub struct OnConflict {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Target specification for an `ON CONFLICT` clause.
 pub enum ConflictTarget {
-    /// Target specified as a list of columns.
-    Columns(Vec<Ident>),
+    /// PostgreSQL index inference uses the same key syntax as CREATE INDEX.
+    Inference {
+        /// Column or expression keys, with optional collation and operator class.
+        elements: Vec<IndexColumn>,
+        /// Predicate restricting the eligible partial indexes.
+        predicate: Option<Expr>,
+    },
     /// Target specified as a named constraint.
     OnConstraint(ObjectName),
 }
@@ -7440,7 +7794,16 @@ impl fmt::Display for OnConflict {
 impl fmt::Display for ConflictTarget {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ConflictTarget::Columns(cols) => write!(f, "({})", display_comma_separated(cols)),
+            ConflictTarget::Inference {
+                elements,
+                predicate,
+            } => {
+                write!(f, "({})", display_comma_separated(elements))?;
+                if let Some(predicate) = predicate {
+                    write!(f, " WHERE {predicate}")?;
+                }
+                Ok(())
+            }
             ConflictTarget::OnConstraint(name) => write!(f, " ON CONSTRAINT {name}"),
         }
     }
@@ -9780,6 +10143,16 @@ pub enum SqlOption {
         /// The expression value for the option.
         value: Expr,
     },
+    /// PostgreSQL storage option with a separately parsed namespace. An
+    /// absent value represents the SET shorthand or a RESET option name.
+    Namespaced {
+        /// The option namespace (normally `toast`).
+        namespace: Ident,
+        /// The option name; quoted identifiers retain their case.
+        key: Ident,
+        /// The supplied value, if any.
+        value: Option<Expr>,
+    },
     /// One or more table partitions and represents which partition the boundary values belong to,
     /// e.g.
     ///
@@ -9817,6 +10190,17 @@ impl fmt::Display for SqlOption {
             }
             SqlOption::KeyValue { key: name, value } => {
                 write!(f, "{name} = {value}")
+            }
+            SqlOption::Namespaced {
+                namespace,
+                key,
+                value,
+            } => {
+                write!(f, "{namespace}.{key}")?;
+                if let Some(value) = value {
+                    write!(f, " = {value}")?;
+                }
+                Ok(())
             }
             SqlOption::Partition {
                 column_name,
@@ -10014,6 +10398,8 @@ pub enum TransactionMode {
     AccessMode(TransactionAccessMode),
     /// Isolation level for a transaction (e.g. `SERIALIZABLE`).
     IsolationLevel(TransactionIsolationLevel),
+    /// PostgreSQL serializable snapshot deferral (DEFERRABLE / NOT DEFERRABLE).
+    Deferrable(bool),
 }
 
 impl fmt::Display for TransactionMode {
@@ -10022,6 +10408,11 @@ impl fmt::Display for TransactionMode {
         match self {
             AccessMode(access_mode) => write!(f, "{access_mode}"),
             IsolationLevel(iso_level) => write!(f, "ISOLATION LEVEL {iso_level}"),
+            Deferrable(value) => f.write_str(if *value {
+                "DEFERRABLE"
+            } else {
+                "NOT DEFERRABLE"
+            }),
         }
     }
 }
@@ -10302,8 +10693,12 @@ pub enum CopyOption {
     Delimiter(char),
     /// NULL 'null_string'
     Null(String),
+    /// DEFAULT 'default_string' (PostgreSQL COPY FROM)
+    Default(String),
     /// HEADER \[ boolean \]
     Header(bool),
+    /// HEADER MATCH validates input column names.
+    HeaderMatch,
     /// QUOTE 'quote_character'
     Quote(char),
     /// ESCAPE 'escape_character'
@@ -10327,8 +10722,10 @@ impl fmt::Display for CopyOption {
             Freeze(false) => write!(f, "FREEZE FALSE"),
             Delimiter(char) => write!(f, "DELIMITER '{char}'"),
             Null(string) => write!(f, "NULL '{}'", value::escape_single_quote_string(string)),
+            Default(string) => write!(f, "DEFAULT '{}'", value::escape_single_quote_string(string)),
             Header(true) => write!(f, "HEADER"),
             Header(false) => write!(f, "HEADER FALSE"),
+            HeaderMatch => write!(f, "HEADER MATCH"),
             Quote(char) => write!(f, "QUOTE '{char}'"),
             Escape(char) => write!(f, "ESCAPE '{char}'"),
             ForceQuote(columns) => write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns)),
@@ -13217,7 +13614,6 @@ impl Ord for OptimizerHintStyle {
 }
 impl core::hash::Hash for OptimizerHintStyle {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        use core::hash::Hash;
         self.ordinal().hash(state);
         match self {
             Self::SingleLine { prefix } => prefix.hash(state),

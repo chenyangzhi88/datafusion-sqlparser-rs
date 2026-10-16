@@ -534,6 +534,10 @@ fn test_snowflake_create_table_cluster_by() {
                     Expr::Identifier(Ident::new("a")),
                     Expr::Identifier(Ident::new("b")),
                     Expr::Function(Function {
+                        mysql_literal_source: None,
+                        origin: FunctionOrigin::Source,
+                        from_first_last: None,
+
                         name: ObjectName::from(vec![Ident::new("my_func")]),
                         uses_odbc_syntax: false,
                         parameters: FunctionArguments::None,
@@ -562,20 +566,13 @@ fn test_snowflake_create_table_comment() {
     match snowflake().verified_stmt("CREATE TABLE my_table (a INT) COMMENT = 'some comment'") {
         Statement::CreateTable(CreateTable {
             name,
+            comment,
             table_options,
             ..
         }) => {
             assert_eq!("my_table", name.to_string());
-            let plain_options = match table_options {
-                CreateTableOptions::Plain(options) => options,
-                _ => unreachable!(),
-            };
-            let comment = match plain_options.first().unwrap() {
-                SqlOption::Comment(CommentDef::WithEq(c))
-                | SqlOption::Comment(CommentDef::WithoutEq(c)) => c,
-                _ => unreachable!(),
-            };
-            assert_eq!("some comment", comment);
+            assert_eq!(comment, Some(CommentDef::WithEq("some comment".into())));
+            assert_eq!(table_options, CreateTableOptions::Plain(vec![]));
         }
         _ => unreachable!(),
     }
@@ -1436,6 +1433,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -1654,6 +1655,10 @@ fn test_alter_table_clustering() {
                     Expr::Identifier(Ident::new("c1")),
                     Expr::Identifier(Ident::with_quote('"', "c2")),
                     Expr::Function(Function {
+                        mysql_literal_source: None,
+                        origin: FunctionOrigin::Source,
+                        from_first_last: None,
+
                         name: ObjectName::from(vec![Ident::new("TO_DATE")]),
                         uses_odbc_syntax: false,
                         parameters: FunctionArguments::None,
@@ -3007,6 +3012,7 @@ fn asof_joins() {
         TableWithJoins {
             relation: table_with_alias("trades_unixtime", true, "tu"),
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: table_with_alias("quotes_unixtime", true, "qu"),
                 global: false,
                 join_operator: JoinOperator::AsOf {
@@ -4257,6 +4263,7 @@ fn test_nested_join_without_parentheses() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::NestedJoin {
                 table_with_joins: Box::new(TableWithJoins {
                     relation: TableFactor::Table {
@@ -4272,6 +4279,7 @@ fn test_nested_join_without_parentheses() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("products".to_string())]),
                             alias: table_alias(true, "p"),
@@ -4324,6 +4332,7 @@ fn test_nested_join_without_parentheses() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::NestedJoin {
                 table_with_joins: Box::new(TableWithJoins {
                     relation: TableFactor::Table {
@@ -4339,6 +4348,7 @@ fn test_nested_join_without_parentheses() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("products".to_string())]),
                             alias: table_alias(true, "p"),
@@ -4391,6 +4401,7 @@ fn test_nested_join_without_parentheses() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::NestedJoin {
                 table_with_joins: Box::new(TableWithJoins {
                     relation: TableFactor::Table {
@@ -4406,6 +4417,7 @@ fn test_nested_join_without_parentheses() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("products".to_string())]),
                             alias: table_alias(true, "p"),
@@ -4458,6 +4470,7 @@ fn test_nested_join_without_parentheses() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::NestedJoin {
                 table_with_joins: Box::new(TableWithJoins {
                     relation: TableFactor::Table {
@@ -4473,6 +4486,7 @@ fn test_nested_join_without_parentheses() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("products".to_string())]),
                             alias: table_alias(true, "p"),
@@ -4525,6 +4539,7 @@ fn test_nested_join_without_parentheses() {
         )
         .joins,
         vec![Join {
+            postgres_using_bindings: None,
             relation: TableFactor::NestedJoin {
                 table_with_joins: Box::new(TableWithJoins {
                     relation: TableFactor::Table {
@@ -4540,6 +4555,7 @@ fn test_nested_join_without_parentheses() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("products".to_string())]),
                             alias: table_alias(true, "p"),

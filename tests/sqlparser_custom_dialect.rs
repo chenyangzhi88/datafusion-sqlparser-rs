@@ -116,7 +116,7 @@ fn custom_statement_parser() -> Result<(), ParserError> {
                     let _ = parser.next_token();
                 }
                 Some(Ok(Statement::Commit {
-                    chain: false,
+                    completion: Default::default(),
                     end: false,
                     modifier: None,
                 }))

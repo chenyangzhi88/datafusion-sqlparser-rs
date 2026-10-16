@@ -250,7 +250,7 @@ impl Parser<'_> {
         let select_items = self.parse_projection()?;
         let into_table = if start_keyword == Keyword::OUTPUT && self.peek_keyword(Keyword::INTO) {
             self.expect_keyword_is(Keyword::INTO)?;
-            Some(self.parse_select_into()?)
+            Some(self.parse_select_into(false)?)
         } else {
             None
         };

@@ -482,8 +482,8 @@ fn test_insert_with_table_alias() {
     if let Statement::Insert(Insert { columns, .. }) = stmt {
         assert_eq!(
             vec![
-                ObjectName::from(vec![Ident::new("t"), Ident::new("id")]),
-                ObjectName::from(vec![Ident::new("t"), Ident::new("val")])
+                Expr::CompoundIdentifier(vec![Ident::new("t"), Ident::new("id")]),
+                Expr::CompoundIdentifier(vec![Ident::new("t"), Ident::new("val")])
             ],
             columns
         );

@@ -795,6 +795,112 @@ impl fmt::Display for CteAsMaterialized {
     }
 }
 
+/// PostgreSQL recursive traversal ordering clause.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct CteSearchClause {
+    /// `true` for `BREADTH FIRST`, `false` for `DEPTH FIRST` traversal ordering.
+    pub breadth_first: bool,
+    /// CTE output column names used as the ordered traversal key.
+    pub columns: Vec<Ident>,
+    /// Name of the generated traversal-order output column after `SET`.
+    pub sequence_column: Ident,
+    /// Selected output ordinals, populated only by the compiler.
+    pub key_indices: Vec<usize>,
+}
+
+impl fmt::Display for CteSearchClause {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "SEARCH {} FIRST BY {} SET {}",
+            if self.breadth_first {
+                "BREADTH"
+            } else {
+                "DEPTH"
+            },
+            display_comma_separated(&self.columns),
+            self.sequence_column
+        )
+    }
+}
+
+/// PostgreSQL cycle marking and path clause. Omitted mark values mean TRUE/FALSE.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct CteCycleClause {
+    /// CTE output column names whose values identify a repeated path entry.
+    pub columns: Vec<Ident>,
+    /// Name of the generated cycle-mark output column after `SET`.
+    pub mark_column: Ident,
+    /// Explicit `TO` cycle value and `DEFAULT` non-cycle value, if supplied.
+    pub mark_values: Option<(Expr, Expr)>,
+    /// Name of the generated path output column after `USING`.
+    pub path_column: Ident,
+    /// Same clause owner retains its selected native type and inequality.
+    pub key_indices: Vec<usize>,
+    /// Compiler-selected mark type OID, typmod and collation OID.
+    pub mark_identity: Option<(u32, i32, u32)>,
+    /// Compiler-selected inequality operator OID and implementing function OID.
+    pub mark_operator: Option<(u32, u32)>,
+}
+
+impl fmt::Display for CteCycleClause {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CYCLE {} SET {}",
+            display_comma_separated(&self.columns),
+            self.mark_column
+        )?;
+        if let Some((value, default)) = &self.mark_values {
+            write!(f, " TO {value} DEFAULT {default}")?;
+        }
+        write!(f, " USING {}", self.path_column)
+    }
+}
+
+// Compiler recipes carry selected ordinals/identities, not new syntax. Visitors
+// traverse only the source clause and its actual mark expressions.
+#[cfg(feature = "visitor")]
+impl Visit for CteSearchClause {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        self.columns.visit(visitor)?;
+        self.sequence_column.visit(visitor)
+    }
+}
+#[cfg(feature = "visitor")]
+impl VisitMut for CteSearchClause {
+    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        VisitMut::visit(&mut self.columns, visitor)?;
+        VisitMut::visit(&mut self.sequence_column, visitor)
+    }
+}
+#[cfg(feature = "visitor")]
+impl Visit for CteCycleClause {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        self.columns.visit(visitor)?;
+        self.mark_column.visit(visitor)?;
+        if let Some((value, default)) = &self.mark_values {
+            value.visit(visitor)?;
+            default.visit(visitor)?;
+        }
+        self.path_column.visit(visitor)
+    }
+}
+#[cfg(feature = "visitor")]
+impl VisitMut for CteCycleClause {
+    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        VisitMut::visit(&mut self.columns, visitor)?;
+        VisitMut::visit(&mut self.mark_column, visitor)?;
+        if let Some((value, default)) = &mut self.mark_values {
+            VisitMut::visit(value, visitor)?;
+            VisitMut::visit(default, visitor)?;
+        }
+        VisitMut::visit(&mut self.path_column, visitor)
+    }
+}
+
 /// A single CTE (used after `WITH`): `<alias> [(col1, col2, ...)] AS <materialized> ( <query> )`
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
@@ -811,6 +917,10 @@ pub struct Cte {
     pub from: Option<Ident>,
     /// Optional `AS MATERIALIZED` / `AS NOT MATERIALIZED` hint.
     pub materialized: Option<CteAsMaterialized>,
+    /// Optional PostgreSQL recursive traversal-order clause.
+    pub search: Option<CteSearchClause>,
+    /// Optional PostgreSQL recursive cycle-mark and path clause.
+    pub cycle: Option<CteCycleClause>,
     /// Token for the closing parenthesis of the CTE definition.
     pub closing_paren_token: AttachedToken,
 }
@@ -837,6 +947,12 @@ impl fmt::Display for Cte {
                 f.write_str(")")?;
             }
         };
+        if let Some(search) = &self.search {
+            write!(f, " {search}")?;
+        }
+        if let Some(cycle) = &self.cycle {
+            write!(f, " {cycle}")?;
+        }
         if let Some(ref fr) = self.from {
             write!(f, " FROM {fr}")?;
         }
@@ -1780,6 +1896,10 @@ pub enum TableFactor {
     /// );
     /// ````
     XmlTable {
+        /// The original XMLTABLE keyword, independent of expression rewrites.
+        xmltable_token: AttachedToken,
+        /// Explicit LATERAL syntax belongs to this source occurrence.
+        lateral: bool,
         /// Optional XMLNAMESPACES clause (empty if not present)
         namespaces: Vec<XmlNamespaceDefinition>,
         /// The row-generating XPath expression.
@@ -1933,7 +2053,7 @@ pub struct TableSampleSeed {
     /// Seed modifier (e.g. `REPEATABLE` or `SEED`).
     pub modifier: TableSampleSeedModifier,
     /// The seed value expression.
-    pub value: ValueWithSpan,
+    pub value: Expr,
 }
 
 impl fmt::Display for TableSampleSeed {
@@ -2561,7 +2681,12 @@ impl fmt::Display for TableFactor {
                 columns,
                 alias,
                 namespaces,
+                lateral,
+                ..
             } => {
+                if *lateral {
+                    write!(f, "LATERAL ")?;
+                }
                 write!(f, "XMLTABLE(")?;
                 if !namespaces.is_empty() {
                     write!(
@@ -2746,8 +2871,26 @@ impl Display for TableVersion {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// A single `JOIN` clause including relation and join operator/options.
+/// Compiler programs for one PostgreSQL USING/NATURAL output column.
+pub struct JoinUsingBinding {
+    /// Original common column name, in USING or left-side NATURAL order.
+    pub column_name: String,
+    /// Compiler-bound equality expression, retaining selected operator OID.
+    pub comparison: Expr,
+    /// Selected left merged-value program; absent when only the right value is used.
+    pub left: Option<Expr>,
+    /// Selected right merged-value program; FULL joins retain both sides.
+    pub right: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+/// A JOIN and its optional compiler binding for PostgreSQL common columns.
 pub struct Join {
+    /// Compiler-owned USING/NATURAL programs. Parsing always initializes None;
+    /// Display retains the original SQL join constraint.
+    pub postgres_using_bindings: Option<Vec<JoinUsingBinding>>,
     /// The joined table factor (table reference or derived table).
     pub relation: TableFactor,
     /// ClickHouse supports the optional `GLOBAL` keyword before the join operator.
@@ -3882,65 +4025,58 @@ pub struct SelectIntoFile {
 
 impl fmt::Display for SelectInto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let SelectIntoTarget::MySqlFile(file) = &self.target {
-            return file.fmt(f);
-        }
-        if let SelectIntoTarget::File(file) = &self.target {
-            let path = escape_mysql_file_literal(&file.path);
-            write!(
-                f,
-                "INTO {} '{path}'",
-                if file.dumpfile { "DUMPFILE" } else { "OUTFILE" }
-            )?;
-            if let Some(character_set) = &file.character_set {
-                write!(f, " CHARACTER SET {character_set}")?;
-            }
-            if !file.dumpfile
-                && (file.fields_terminated_by.is_some()
-                    || file.fields_enclosed_by.is_some()
-                    || file.fields_escaped_by.is_some())
-            {
-                f.write_str(" FIELDS")?;
-                if let Some(value) = &file.fields_terminated_by {
-                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.fields_enclosed_by {
-                    if file.fields_optionally_enclosed {
-                        f.write_str(" OPTIONALLY")?;
-                    }
-                    write!(f, " ENCLOSED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.fields_escaped_by {
-                    write!(f, " ESCAPED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-            }
-            if !file.dumpfile
-                && (file.lines_starting_by.is_some() || file.lines_terminated_by.is_some())
-            {
-                f.write_str(" LINES")?;
-                if let Some(value) = &file.lines_starting_by {
-                    write!(f, " STARTING BY '{}'", escape_mysql_file_literal(value))?;
-                }
-                if let Some(value) = &file.lines_terminated_by {
-                    write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
-                }
-            }
-            return Ok(());
-        }
-        let temporary = if self.temporary { " TEMPORARY" } else { "" };
-        let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
-        let table = if self.table { " TABLE" } else { "" };
-
         match &self.target {
+            SelectIntoTarget::MySqlFile(file) => file.fmt(f),
+            SelectIntoTarget::File(file) => {
+                let path = escape_mysql_file_literal(&file.path);
+                write!(
+                    f,
+                    "INTO {} '{path}'",
+                    if file.dumpfile { "DUMPFILE" } else { "OUTFILE" }
+                )?;
+                if let Some(character_set) = &file.character_set {
+                    write!(f, " CHARACTER SET {character_set}")?;
+                }
+                if !file.dumpfile
+                    && (file.fields_terminated_by.is_some()
+                        || file.fields_enclosed_by.is_some()
+                        || file.fields_escaped_by.is_some())
+                {
+                    f.write_str(" FIELDS")?;
+                    if let Some(value) = &file.fields_terminated_by {
+                        write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.fields_enclosed_by {
+                        if file.fields_optionally_enclosed {
+                            f.write_str(" OPTIONALLY")?;
+                        }
+                        write!(f, " ENCLOSED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.fields_escaped_by {
+                        write!(f, " ESCAPED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                }
+                if !file.dumpfile
+                    && (file.lines_starting_by.is_some() || file.lines_terminated_by.is_some())
+                {
+                    f.write_str(" LINES")?;
+                    if let Some(value) = &file.lines_starting_by {
+                        write!(f, " STARTING BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                    if let Some(value) = &file.lines_terminated_by {
+                        write!(f, " TERMINATED BY '{}'", escape_mysql_file_literal(value))?;
+                    }
+                }
+                Ok(())
+            }
             SelectIntoTarget::Table(name) => {
+                let temporary = if self.temporary { " TEMPORARY" } else { "" };
+                let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
+                let table = if self.table { " TABLE" } else { "" };
                 write!(f, "INTO{}{}{} {}", temporary, unlogged, table, name)
             }
             SelectIntoTarget::Variables(variables) => {
                 write!(f, "INTO {}", display_comma_separated(variables))
-            }
-            SelectIntoTarget::File(_) => unreachable!("file destination was formatted above"),
-            SelectIntoTarget::MySqlFile(_) => {
-                unreachable!("raw file destination was formatted above")
             }
         }
     }
@@ -3971,6 +4107,8 @@ fn escape_mysql_file_literal(value: &str) -> String {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Modifiers used with `GROUP BY` such as `WITH ROLLUP` or `WITH CUBE`.
 pub enum GroupByWithModifier {
+    /// PostgreSQL grouping-set quantifier before the grouping expressions.
+    Quantifier(DuplicateTreatment),
     /// `WITH ROLLUP` modifier.
     Rollup,
     /// `WITH CUBE` modifier.
@@ -3986,6 +4124,7 @@ pub enum GroupByWithModifier {
 impl fmt::Display for GroupByWithModifier {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            GroupByWithModifier::Quantifier(value) => write!(f, "{value}"),
             GroupByWithModifier::Rollup => write!(f, "WITH ROLLUP"),
             GroupByWithModifier::Cube => write!(f, "WITH CUBE"),
             GroupByWithModifier::Totals => write!(f, "WITH TOTALS"),
@@ -4028,10 +4167,17 @@ impl fmt::Display for GroupByExpr {
             }
             GroupByExpr::Expressions(col_names, modifiers) => {
                 f.write_str("GROUP BY")?;
+                for modifier in modifiers {
+                    if let GroupByWithModifier::Quantifier(value) = modifier {
+                        write!(f, " {value}")?;
+                    }
+                }
                 SpaceOrNewline.fmt(f)?;
                 Indent(display_comma_separated(col_names)).fmt(f)?;
-                if !modifiers.is_empty() {
-                    write!(f, " {}", display_separated(modifiers, " "))?;
+                for modifier in modifiers {
+                    if !matches!(modifier, GroupByWithModifier::Quantifier(_)) {
+                        write!(f, " {modifier}")?;
+                    }
                 }
                 Ok(())
             }
@@ -4497,6 +4643,28 @@ pub enum XmlTableColumnOption {
     ForOrdinality,
 }
 
+/// Compiler-bound type input for an XMLTABLE column. Parsing leaves this absent;
+/// SQL display preserves the original declaration rather than compiler metadata.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct XmlTableColumnType {
+    /// Encoded complete PostgreSQL type descriptor from the statement snapshot.
+    pub descriptor: String,
+    /// Actual declared type OID.
+    pub oid: u32,
+    /// Declared PostgreSQL type modifier.
+    pub typmod: i32,
+    /// Declared collation identity, if any.
+    pub collation: Option<u32>,
+    /// Exact input routine OID.
+    pub input_oid: u32,
+    /// Transactional type-input ABI uses its target OID as the second argument.
+    pub input_type_parameter: bool,
+    /// PostgreSQL numeric category permits XPath boolean-to-number conversion.
+    pub numeric: bool,
+}
+
 /// A single column definition in XMLTABLE
 ///
 /// ```sql
@@ -4513,6 +4681,8 @@ pub enum XmlTableColumnOption {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct XmlTableColumn {
+    /// Exact type input bound by the PostgreSQL compiler; absent in parsed SQL.
+    pub postgres_type: Option<XmlTableColumnType>,
     /// The name of the column.
     pub name: Ident,
     /// Column options: type/path/default or FOR ORDINALITY
@@ -4609,6 +4779,10 @@ pub struct XmlNamespaceDefinition {
 
 impl fmt::Display for XmlNamespaceDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} AS {}", self.uri, self.name)
+        if self.name.value.is_empty() {
+            write!(f, "DEFAULT {}", self.uri)
+        } else {
+            write!(f, "{} AS {}", self.uri, self.name)
+        }
     }
 }

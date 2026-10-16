@@ -122,110 +122,120 @@ fn parse_mssql_delimited_identifiers() {
 
 #[test]
 fn parse_create_procedure() {
-    let sql = "CREATE OR ALTER PROCEDURE test (@foo INT, @bar VARCHAR(256)) AS BEGIN SELECT 1; END";
+    let sql = "CREATE OR ALTER PROCEDURE test(@foo INT, @bar VARCHAR(256)) AS BEGIN SELECT 1; END";
 
     assert_eq!(
         ms().verified_stmt(sql),
-        Statement::CreateProcedure {
+        Statement::CreateProcedure(CreateProcedure {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
+            or_replace: false,
+            security: None,
+            set_params: vec![],
+
             or_alter: true,
-            body: ConditionalStatements::BeginEnd(BeginEndStatements {
-                begin_token: AttachedToken::empty(),
-                statements: vec![Statement::Query(Box::new(Query {
-                    with: None,
-                    limit_clause: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    order_by: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                    body: Box::new(SetExpr::Select(Box::new(Select {
-                        select_token: AttachedToken::empty(),
-                        optimizer_hints: vec![],
-                        distinct: None,
-                        select_modifiers: None,
-                        top: None,
-                        top_before_distinct: false,
-                        projection: vec![SelectItem::UnnamedExpr(Expr::Value(
-                            (number("1")).with_empty_span()
-                        ))],
-                        exclude: None,
-                        into: None,
-                        from: vec![],
-                        lateral_views: vec![],
-                        prewhere: None,
-                        selection: None,
-                        group_by: GroupByExpr::Expressions(vec![], vec![]),
-                        cluster_by: vec![],
-                        distribute_by: vec![],
-                        sort_by: vec![],
-                        having: None,
-                        named_window: vec![],
-                        window_before_qualify: false,
-                        qualify: None,
-                        value_table_mode: None,
-                        connect_by: vec![],
-                        flavor: SelectFlavor::Standard,
-                    })))
-                }))],
-                end_token: AttachedToken::empty(),
-            }),
-            params: Some(vec![
-                ProcedureParam {
-                    name: Ident {
+            body: Some(CreateProcedureBody::Statements(
+                ConditionalStatements::BeginEnd(BeginEndStatements {
+                    begin_token: AttachedToken::empty(),
+                    statements: vec![Statement::Query(Box::new(Query {
+                        with: None,
+                        limit_clause: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        order_by: None,
+                        settings: None,
+                        format_clause: None,
+                        pipe_operators: vec![],
+                        body: Box::new(SetExpr::Select(Box::new(Select {
+                            select_token: AttachedToken::empty(),
+                            optimizer_hints: vec![],
+                            distinct: None,
+                            select_modifiers: None,
+                            top: None,
+                            top_before_distinct: false,
+                            projection: vec![SelectItem::UnnamedExpr(Expr::Value(
+                                (number("1")).with_empty_span()
+                            ))],
+                            exclude: None,
+                            into: None,
+                            from: vec![],
+                            lateral_views: vec![],
+                            prewhere: None,
+                            selection: None,
+                            group_by: GroupByExpr::Expressions(vec![], vec![]),
+                            cluster_by: vec![],
+                            distribute_by: vec![],
+                            sort_by: vec![],
+                            having: None,
+                            named_window: vec![],
+                            window_before_qualify: false,
+                            qualify: None,
+                            value_table_mode: None,
+                            connect_by: vec![],
+                            flavor: SelectFlavor::Standard,
+                        })))
+                    }))],
+                    end_token: AttachedToken::empty(),
+                })
+            )),
+            args: vec![
+                OperateFunctionArg {
+                    name: Some(Ident {
                         value: "@foo".into(),
                         quote_style: None,
                         span: Span::empty(),
-                    },
+                    }),
                     data_type: DataType::Int(None),
                     mode: None,
-                    default: None,
+                    default_expr: None,
                 },
-                ProcedureParam {
-                    name: Ident {
+                OperateFunctionArg {
+                    name: Some(Ident {
                         value: "@bar".into(),
                         quote_style: None,
                         span: Span::empty(),
-                    },
+                    }),
                     data_type: DataType::Varchar(Some(CharacterLength::IntegerLength {
                         length: 256,
                         unit: None
                     })),
                     mode: None,
-                    default: None,
+                    default_expr: None,
                 }
-            ]),
+            ],
             name: ObjectName::from(vec![Ident {
                 value: "test".into(),
                 quote_style: None,
                 span: Span::empty(),
             }]),
             language: None,
-        }
+        })
     )
 }
 
 #[test]
 fn parse_mssql_create_procedure() {
-    let _ = ms_and_generic().verified_stmt("CREATE OR ALTER PROCEDURE foo AS SELECT 1;");
-    let _ = ms_and_generic().verified_stmt("CREATE OR ALTER PROCEDURE foo AS BEGIN SELECT 1; END");
-    let _ = ms_and_generic().verified_stmt("CREATE PROCEDURE foo AS BEGIN SELECT 1; END");
-    let _ = ms().verified_stmt(
+    for sql in [
+        "CREATE OR ALTER PROCEDURE foo AS SELECT 1;",
+        "CREATE OR ALTER PROCEDURE foo AS BEGIN SELECT 1; END",
+        "CREATE PROCEDURE foo AS BEGIN SELECT 1; END",
         "CREATE PROCEDURE foo AS BEGIN SELECT [myColumn] FROM [myschema].[mytable]; END",
-    );
-    let _ = ms_and_generic().verified_stmt(
         "CREATE PROCEDURE foo (@CustomerName NVARCHAR(50)) AS BEGIN SELECT * FROM DEV; END",
-    );
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; END");
-    // Test a statement with END in it
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN SELECT [foo], CASE WHEN [foo] IS NULL THEN 'empty' ELSE 'notempty' END AS [foo]; END");
-    // Multiple statements
-    let _ = ms().verified_stmt("CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; SELECT [foo] FROM BAR WHERE [FOO] > 10; END");
-
-    // parameters with default values
-    let sql = r#"CREATE PROCEDURE foo (IN @a INTEGER = 1, OUT @b TEXT = '2', INOUT @c DATETIME = NULL, @d BOOL = 0) AS BEGIN SELECT 1; END"#;
-    let _ = ms().verified_stmt(sql);
+        "CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; END",
+        "CREATE PROCEDURE [foo] AS BEGIN SELECT [foo], CASE WHEN [foo] IS NULL THEN 'empty' ELSE 'notempty' END AS [foo]; END",
+        "CREATE PROCEDURE [foo] AS BEGIN UPDATE bar SET col = 'test'; SELECT [foo] FROM BAR WHERE [FOO] > 10; END",
+        "CREATE PROCEDURE foo (IN @a INTEGER = 1, OUT @b TEXT = '2', INOUT @c DATETIME = NULL, @d BOOL = 0) AS BEGIN SELECT 1; END",
+    ] {
+        let canonical = sql.replace("foo AS", "foo() AS")
+            .replace("[foo] AS", "[foo]() AS").replace("foo (", "foo(");
+        let statement = ms().one_statement_parses_to(sql, &canonical);
+        if sql.contains("@CustomerName") || !sql.contains('(') {
+            assert!(TestedDialects::new(vec![Box::new(GenericDialect {})])
+                .parse_sql_statements(sql).is_err());
+        }
+        assert!(matches!(statement, Statement::CreateProcedure(_)));
+    }
 }
 
 #[test]
@@ -234,6 +244,9 @@ fn parse_create_function() {
     assert_eq!(
         ms().verified_stmt(return_expression_function),
         sqlparser::ast::Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
+
             or_alter: false,
             or_replace: false,
             temporary: false,
@@ -420,6 +433,9 @@ fn parse_create_function_parameter_default_values() {
     assert_eq!(
         ms().verified_stmt(single_default_sql),
         Statement::CreateFunction(CreateFunction {
+            parsed_source: RoutineSourceProvenance::default(),
+            mysql_body: None,
+
             or_alter: false,
             or_replace: false,
             temporary: false,
@@ -493,6 +509,7 @@ fn parse_mssql_openjson() {
                 index_hints: vec![]
             },
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: TableFactor::OpenJsonTable {
                     json_expr: Expr::CompoundIdentifier(
                         vec![Ident::new("A"), Ident::new("param"),]
@@ -547,6 +564,7 @@ fn parse_mssql_openjson() {
                 index_hints: vec![]
             },
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: TableFactor::OpenJsonTable {
                     json_expr: Expr::CompoundIdentifier(
                         vec![Ident::new("A"), Ident::new("param"),]
@@ -601,6 +619,7 @@ fn parse_mssql_openjson() {
                 index_hints: vec![]
             },
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: TableFactor::OpenJsonTable {
                     json_expr: Expr::CompoundIdentifier(
                         vec![Ident::new("A"), Ident::new("param"),]
@@ -655,6 +674,7 @@ fn parse_mssql_openjson() {
                 index_hints: vec![],
             },
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: TableFactor::OpenJsonTable {
                     json_expr: Expr::CompoundIdentifier(
                         vec![Ident::new("A"), Ident::new("param"),]
@@ -689,6 +709,7 @@ fn parse_mssql_openjson() {
                 index_hints: vec![],
             },
             joins: vec![Join {
+                postgres_using_bindings: None,
                 relation: TableFactor::OpenJsonTable {
                     json_expr: Expr::CompoundIdentifier(
                         vec![Ident::new("A"), Ident::new("param"),]
@@ -889,6 +910,10 @@ fn parse_delimited_identifiers() {
     );
     assert_eq!(
         &Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: FunctionOrigin::Source,
+            from_first_last: None,
+
             name: ObjectName::from(vec![Ident::with_quote('"', "myfun")]),
             uses_odbc_syntax: false,
             parameters: FunctionArguments::None,
@@ -1869,6 +1894,8 @@ fn parse_create_table_with_valid_options() {
                     },
                     value: Expr::Function(
                         Function {
+mysql_literal_source: None, origin: FunctionOrigin::Source, from_first_last: None,
+
                             name: ObjectName::from(
                                 vec![
                                     Ident {
@@ -1926,6 +1953,17 @@ fn parse_create_table_with_valid_options() {
         assert_eq!(
             ms_and_generic().verified_stmt(sql),
             Statement::CreateTable(CreateTable {
+                unlogged: false,
+                of_type: None,
+                query_columns: vec![],
+                with_data: None,
+                mysql_partitioning: None,
+                elements: vec![
+                    CreateTableElement::Column(0),
+                    CreateTableElement::Column(1),
+                    CreateTableElement::Column(2)
+                ],
+
                 or_replace: false,
                 temporary: false,
                 external: false,
@@ -2120,6 +2158,13 @@ fn parse_create_table_with_identity_column() {
         assert_eq!(
             ms_and_generic().verified_stmt(sql),
             Statement::CreateTable(CreateTable {
+                unlogged: false,
+                of_type: None,
+                query_columns: vec![],
+                with_data: None,
+                mysql_partitioning: None,
+                elements: vec![CreateTableElement::Column(0)],
+
                 or_replace: false,
                 temporary: false,
                 external: false,
@@ -2489,6 +2534,7 @@ fn parse_create_trigger() {
             trigger_object: None,
             condition: None,
             exec_body: None,
+            mysql_body: None,
             statements_as: true,
             statements: Some(ConditionalStatements::Sequence {
                 statements: vec![Statement::RaisError {

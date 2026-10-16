@@ -26,15 +26,15 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::{
     ast::display_separated,
-    display_utils::{Indent, SpaceOrNewline, indented_list},
+    display_utils::{indented_list, Indent, SpaceOrNewline},
 };
 
 use super::{
+    display_comma_separated, helpers::attached_token::AttachedToken, query::InputFormatClause,
     Assignment, Expr, FromTable, Ident, InsertAliases, MysqlInsertPriority, ObjectName, OnInsert,
     OptimizerHint, OrderByExpr, Query, SelectInto, SelectItem, Setting, SqliteOnConflict,
     TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
-    Values, display_comma_separated, helpers::attached_token::AttachedToken,
-    query::InputFormatClause,
+    Values,
 };
 
 /// PostgreSQL identity-column input policy for an INSERT source.
@@ -103,6 +103,9 @@ impl Display for InsertOverriding {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct Insert {
+    /// Compiler-owned PostgreSQL INSERT analysis receipt. Parsing initializes
+    /// `None`; SQL display and source spans exclude this metadata.
+    pub postgres_insert_bindings: Option<String>,
     /// Token for the `INSERT` keyword (or its substitutes)
     pub insert_token: AttachedToken,
     /// Query optimizer hints
@@ -121,8 +124,8 @@ pub struct Insert {
     /// `table_name as foo` (for PostgreSQL)
     /// `table_name foo` (for Oracle)
     pub table_alias: Option<TableAliasWithoutColumns>,
-    /// COLUMNS
-    pub columns: Vec<ObjectName>,
+    /// Target columns, including PostgreSQL composite fields and array indirection.
+    pub columns: Vec<Expr>,
     /// PostgreSQL identity input policy, placed after the column list.
     pub overriding: Option<InsertOverriding>,
     /// Overwrite (Hive)
@@ -391,7 +394,11 @@ impl Display for Delete {
                 f.write_str(" FROM")?;
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
-                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                    Indent(PostgresDmlTarget(
+                        &from[0],
+                        self.postgres_target_inheritance,
+                    ))
+                    .fmt(f)?;
                 } else {
                     indented_list(f, from)?;
                 }
@@ -399,7 +406,11 @@ impl Display for Delete {
             FromTable::WithoutKeyword(from) => {
                 if from.len() == 1 {
                     SpaceOrNewline.fmt(f)?;
-                    fmt_postgres_dml_target(f, &from[0], self.postgres_target_inheritance)?;
+                    Indent(PostgresDmlTarget(
+                        &from[0],
+                        self.postgres_target_inheritance,
+                    ))
+                    .fmt(f)?;
                 } else {
                     indented_list(f, from)?;
                 }
@@ -500,7 +511,7 @@ impl Display for Update {
             or.fmt(f)?;
             f.write_str(" ")?;
         }
-        fmt_postgres_dml_target(f, &self.table, self.postgres_target_inheritance)?;
+        PostgresDmlTarget(&self.table, self.postgres_target_inheritance).fmt(f)?;
         if let Some(UpdateTableFromKind::BeforeSet(from)) = &self.from {
             SpaceOrNewline.fmt(f)?;
             f.write_str("FROM")?;
@@ -544,34 +555,35 @@ impl Display for Update {
     }
 }
 
-fn fmt_postgres_dml_target(
-    f: &mut fmt::Formatter<'_>,
-    table: &TableWithJoins,
-    inheritance: PostgresTargetInheritance,
-) -> fmt::Result {
-    if inheritance == PostgresTargetInheritance::Only {
-        f.write_str("ONLY ")?;
-        return table.fmt(f);
+struct PostgresDmlTarget<'a>(&'a TableWithJoins, PostgresTargetInheritance);
+
+impl Display for PostgresDmlTarget<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(table, inheritance) = *self;
+        if inheritance == PostgresTargetInheritance::Only {
+            f.write_str("ONLY ")?;
+            return table.fmt(f);
+        }
+        if inheritance != PostgresTargetInheritance::Descendants {
+            return table.fmt(f);
+        }
+        let TableFactor::Table { alias, .. } = &table.relation else {
+            return table.fmt(f);
+        };
+        let mut relation = table.relation.clone();
+        if let TableFactor::Table { alias, .. } = &mut relation {
+            *alias = None;
+        }
+        relation.fmt(f)?;
+        f.write_str(" *")?;
+        if let Some(alias) = alias {
+            write!(f, " {alias}")?;
+        }
+        for join in &table.joins {
+            write!(f, " {join}")?;
+        }
+        Ok(())
     }
-    if inheritance != PostgresTargetInheritance::Descendants {
-        return table.fmt(f);
-    }
-    let TableFactor::Table { alias, .. } = &table.relation else {
-        return table.fmt(f);
-    };
-    let mut relation = table.relation.clone();
-    if let TableFactor::Table { alias, .. } = &mut relation {
-        *alias = None;
-    }
-    relation.fmt(f)?;
-    f.write_str(" *")?;
-    if let Some(alias) = alias {
-        write!(f, " {alias}")?;
-    }
-    for join in &table.joins {
-        write!(f, " {join}")?;
-    }
-    Ok(())
 }
 
 /// A `MERGE` statement.

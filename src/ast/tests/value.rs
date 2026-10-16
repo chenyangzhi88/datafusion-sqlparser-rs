@@ -360,5 +360,10 @@ fn alias_transport_and_reattachment_do_not_reissue_accepted_alias_or_ident() {
         "admission is not the real alias reduction"
     );
     assert!(detached.canonical_identifier_occurrence().is_none());
+    assert!(detached
+        .clone()
+        .with_role(MySqlTextRole::Literal)
+        .canonical_identifier_occurrence()
+        .is_none());
     assert_eq!(original.alias_system_bytes().unwrap(), b"\xff");
 }

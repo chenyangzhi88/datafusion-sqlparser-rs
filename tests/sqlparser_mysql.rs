@@ -50,10 +50,11 @@ fn mysql_option_dialect_keeps_the_actual_explain_connection_grammar() {
                         "{sql}"
                     );
                 }
-                assert!(
-                    sqlparser::parser::Parser::parse_sql(&dialect, "EXPLAIN FOR CONNECTION @id")
-                        .is_err()
-                );
+                assert!(sqlparser::parser::Parser::parse_sql(
+                    &dialect,
+                    "EXPLAIN FOR CONNECTION @id"
+                )
+                .is_err());
             }
         }
     }
@@ -555,32 +556,22 @@ fn parse_show_tables() {
 
 #[test]
 fn parse_show_extended_full() {
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("SHOW EXTENDED FULL TABLES")
-            .is_ok()
-    );
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("SHOW EXTENDED FULL COLUMNS FROM mytable")
-            .is_ok()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("SHOW EXTENDED FULL TABLES")
+        .is_ok());
+    assert!(mysql_and_generic()
+        .parse_sql_statements("SHOW EXTENDED FULL COLUMNS FROM mytable")
+        .is_ok());
     // SHOW EXTENDED/FULL can only be used with COLUMNS and TABLES
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("SHOW EXTENDED FULL CREATE TABLE mytable")
-            .is_err()
-    );
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("SHOW EXTENDED FULL COLLATION")
-            .is_err()
-    );
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("SHOW EXTENDED FULL VARIABLES")
-            .is_err()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("SHOW EXTENDED FULL CREATE TABLE mytable")
+        .is_err());
+    assert!(mysql_and_generic()
+        .parse_sql_statements("SHOW EXTENDED FULL COLLATION")
+        .is_err());
+    assert!(mysql_and_generic()
+        .parse_sql_statements("SHOW EXTENDED FULL VARIABLES")
+        .is_err());
 }
 
 #[test]
@@ -1176,11 +1167,9 @@ fn parse_create_table_multiple_options_order_independent() {
                     value: Expr::Value(test_utils::number("8").with_empty_span())
                 }));
 
-                assert!(
-                    !plain_options
-                        .iter()
-                        .any(|option| matches!(option, SqlOption::Comment(_)))
-                );
+                assert!(!plain_options
+                    .iter()
+                    .any(|option| matches!(option, SqlOption::Comment(_))));
                 assert_eq!(comment, Some(CommentDef::WithEq("abc".into())));
 
                 assert!(plain_options.contains(&SqlOption::KeyValue {
@@ -2058,8 +2047,8 @@ fn parse_simple_insert() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("title")),
-                    ObjectName::from(Ident::new("priority"))
+                    Expr::Identifier(Ident::new("title")),
+                    Expr::Identifier(Ident::new("priority"))
                 ],
                 columns
             );
@@ -2129,8 +2118,8 @@ fn parse_ignore_insert() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("title")),
-                    ObjectName::from(Ident::new("priority"))
+                    Expr::Identifier(Ident::new("title")),
+                    Expr::Identifier(Ident::new("priority"))
                 ],
                 columns
             );
@@ -2185,8 +2174,8 @@ fn parse_priority_insert() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("title")),
-                    ObjectName::from(Ident::new("priority"))
+                    Expr::Identifier(Ident::new("title")),
+                    Expr::Identifier(Ident::new("priority"))
                 ],
                 columns
             );
@@ -2238,8 +2227,8 @@ fn parse_priority_insert() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("title")),
-                    ObjectName::from(Ident::new("priority"))
+                    Expr::Identifier(Ident::new("title")),
+                    Expr::Identifier(Ident::new("priority"))
                 ],
                 columns
             );
@@ -2291,7 +2280,7 @@ fn parse_insert_as() {
                 table_name
             );
             assert_eq!(
-                vec![ObjectName::from(Ident::with_quote('`', "date"))],
+                vec![Expr::Identifier(Ident::with_quote('`', "date"))],
                 columns
             );
             let insert_alias = insert_alias.unwrap();
@@ -2347,8 +2336,8 @@ fn parse_insert_as() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::with_quote('`', "id")),
-                    ObjectName::from(Ident::with_quote('`', "date"))
+                    Expr::Identifier(Ident::with_quote('`', "id")),
+                    Expr::Identifier(Ident::with_quote('`', "date"))
                 ],
                 columns
             );
@@ -2413,8 +2402,8 @@ fn parse_replace_insert() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("title")),
-                    ObjectName::from(Ident::new("priority"))
+                    Expr::Identifier(Ident::new("title")),
+                    Expr::Identifier(Ident::new("priority"))
                 ],
                 columns
             );
@@ -2514,12 +2503,12 @@ fn parse_insert_with_on_duplicate_update() {
             );
             assert_eq!(
                 vec![
-                    ObjectName::from(Ident::new("name")),
-                    ObjectName::from(Ident::new("description")),
-                    ObjectName::from(Ident::new("perm_create")),
-                    ObjectName::from(Ident::new("perm_read")),
-                    ObjectName::from(Ident::new("perm_update")),
-                    ObjectName::from(Ident::new("perm_delete"))
+                    Expr::Identifier(Ident::new("name")),
+                    Expr::Identifier(Ident::new("description")),
+                    Expr::Identifier(Ident::new("perm_create")),
+                    Expr::Identifier(Ident::new("perm_read")),
+                    Expr::Identifier(Ident::new("perm_update")),
+                    Expr::Identifier(Ident::new("perm_delete"))
                 ],
                 columns
             );
@@ -2834,7 +2823,7 @@ fn parse_insert_with_numeric_prefix_column_name() {
                 table_name
             );
             assert_eq!(
-                vec![ObjectName::from(Ident::new("123col_$@length123"))],
+                vec![Expr::Identifier(Ident::new("123col_$@length123"))],
                 columns
             );
         }
@@ -2875,6 +2864,7 @@ fn parse_update_with_joins() {
                         index_hints: vec![],
                     },
                     joins: vec![Join {
+                        postgres_using_bindings: None,
                         relation: TableFactor::Table {
                             name: ObjectName::from(vec![Ident::new("customers")]),
                             alias: table_alias(true, "c"),
@@ -4128,12 +4118,10 @@ fn parse_grant() {
         );
         assert!(!with_grant_option);
         assert!(granted_by.is_none());
-        if let [
-            Grantee {
-                grantee_type: GranteesType::None,
-                name: Some(GranteeName::UserHost { user, host }),
-            },
-        ] = grantees.as_slice()
+        if let [Grantee {
+            grantee_type: GranteesType::None,
+            name: Some(GranteeName::UserHost { user, host }),
+        }] = grantees.as_slice()
         {
             assert_eq!(user.value, "jeffrey");
             assert_eq!(user.quote_style, Some('\''));
@@ -4175,12 +4163,10 @@ fn parse_revoke() {
                 "*".into()
             ])]))
         );
-        if let [
-            Grantee {
-                grantee_type: GranteesType::None,
-                name: Some(GranteeName::UserHost { user, host }),
-            },
-        ] = grantees.as_slice()
+        if let [Grantee {
+            grantee_type: GranteesType::None,
+            name: Some(GranteeName::UserHost { user, host }),
+        }] = grantees.as_slice()
         {
             assert_eq!(user.value, "jeffrey");
             assert_eq!(user.quote_style, Some('\''));
@@ -4390,25 +4376,40 @@ fn parse_create_trigger() {
             characteristics: None,
         })
     );
+    let Statement::CreateTrigger(mut expected_header) = create_stmt else {
+        unreachable!("Expected CREATE TRIGGER statement");
+    };
+    expected_header.exec_body = None;
+    assert_mysql_trigger_source(
+        sql_create_trigger,
+        "EXECUTE FUNCTION emp_stamp()",
+        expected_header,
+    );
 }
 
 #[test]
 fn parse_create_trigger_compound_statement() {
-    for (sql, name, table, period) in [
+    for (sql, name, table, period, body) in [
         (
             "CREATE TRIGGER mytrigger BEFORE INSERT ON mytable FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
             "mytrigger",
             "mytable",
             TriggerPeriod::Before,
+            "BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
         ),
         (
             "CREATE TRIGGER tr AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO t2 VALUES (NEW.id); END",
             "tr",
             "t1",
             TriggerPeriod::After,
+            "BEGIN INSERT INTO t2 VALUES (NEW.id); END",
         ),
     ] {
-        TestedDialects::new(vec![Box::new(GenericDialect {})]).verified_stmt(sql);
+        let Statement::CreateTrigger(mut expected_header) =
+            TestedDialects::new(vec![Box::new(GenericDialect {})]).verified_stmt(sql)
+        else {
+            unreachable!("Expected CREATE TRIGGER statement");
+        };
         let mut statements = mysql().parse_sql_statements(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let Statement::CreateTrigger(trigger) = statements.remove(0) else {
@@ -4427,6 +4428,9 @@ fn parse_create_trigger_compound_statement() {
         // The filled-string parser is deliberately header-only. Actual saved
         // bytes must be consumed by the original product's PSM callback, not
         // copied into a second portable statement list or a rendered SQL body.
+        assert!(expected_header.statements.is_some());
+        expected_header.statements = None;
+        assert_mysql_trigger_source(sql, body, expected_header);
     }
 }
 
@@ -4777,41 +4781,27 @@ fn parse_select_modifiers_canonical_ordering() {
 
 #[test]
 fn parse_select_modifiers_errors() {
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT DISTINCT DISTINCT * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT DISTINCTROW DISTINCTROW * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT DISTINCT DISTINCTROW * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT ALL DISTINCT * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT DISTINCT ALL * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT ALL DISTINCTROW * FROM t")
-            .is_err()
-    );
-    assert!(
-        mysql()
-            .parse_sql_statements("SELECT ALL ALL * FROM t")
-            .is_err()
-    );
+    assert!(mysql()
+        .parse_sql_statements("SELECT DISTINCT DISTINCT * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT DISTINCTROW DISTINCTROW * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT DISTINCT DISTINCTROW * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT ALL DISTINCT * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT DISTINCT ALL * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT ALL DISTINCTROW * FROM t")
+        .is_err());
+    assert!(mysql()
+        .parse_sql_statements("SELECT ALL ALL * FROM t")
+        .is_err());
 }
 
 #[test]
@@ -4834,6 +4824,7 @@ fn parse_drop_index() {
             purge,
             temporary,
             table,
+            concurrently: false,
         } => {
             assert!(!if_exists);
             assert_eq!(ObjectType::Index, object_type);
@@ -5068,32 +5059,24 @@ fn parse_create_database_with_charset() {
 #[test]
 fn parse_create_database_with_charset_errors() {
     // Missing charset name after CHARACTER SET
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("CREATE DATABASE mydb DEFAULT CHARACTER SET")
-            .is_err()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("CREATE DATABASE mydb DEFAULT CHARACTER SET")
+        .is_err());
 
     // Missing charset name after CHARSET
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("CREATE DATABASE mydb CHARSET")
-            .is_err()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("CREATE DATABASE mydb CHARSET")
+        .is_err());
 
     // Missing collation name after COLLATE
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("CREATE DATABASE mydb DEFAULT COLLATE")
-            .is_err()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("CREATE DATABASE mydb DEFAULT COLLATE")
+        .is_err());
 
     // Equals sign but no value
-    assert!(
-        mysql_and_generic()
-            .parse_sql_statements("CREATE DATABASE mydb CHARACTER SET =")
-            .is_err()
-    );
+    assert!(mysql_and_generic()
+        .parse_sql_statements("CREATE DATABASE mydb CHARACTER SET =")
+        .is_err());
 }
 
 #[test]
@@ -5237,11 +5220,9 @@ fn mysql_explain_for_connection_is_a_literal_target() {
         "EXPLAIN FOR CONNECTION 0xFFFFFFFF",
         "EXPLAIN FOR CONNECTION 4294967295",
     );
-    assert!(
-        TestedDialects::new(vec![Box::new(GenericDialect {})])
-            .parse_sql_statements("EXPLAIN FOR CONNECTION 1")
-            .is_err()
-    );
+    assert!(TestedDialects::new(vec![Box::new(GenericDialect {})])
+        .parse_sql_statements("EXPLAIN FOR CONNECTION 1")
+        .is_err());
 }
 
 #[cfg(feature = "serde")]
@@ -5655,4 +5636,105 @@ fn parse_character_array_cast_retains_charset_and_binary_modifier_without_changi
             Expr::Cast { array: true, .. }
         ));
     }
+}
+
+// These existing trigger inputs are ASCII. The standalone parser retains the
+// PSM source; the product's PSM compiler owns action semantics and execution.
+fn assert_mysql_trigger_source(sql: &str, action: &str, mut expected_header: CreateTrigger) {
+    use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::{MySqlLexicalUnit, MySqlSourceAdapter, MySqlSourceError};
+    use std::sync::Arc;
+
+    struct AsciiTriggerSource;
+    impl MySqlSourceAdapter for AsciiTriggerSource {
+        fn client_charset(&self) -> &str {
+            "ascii"
+        }
+        fn client_min_width(&self) -> u8 {
+            1
+        }
+        fn lexical_unit(&self, input: &[u8]) -> Result<MySqlLexicalUnit, MySqlSourceError> {
+            let byte = *input.first().ok_or("missing fixture byte")?;
+            Ok(MySqlLexicalUnit {
+                width: 1,
+                expected_width: 1,
+                state: 0,
+                valid: byte.is_ascii(),
+                ascii: byte.is_ascii(),
+                space: byte.is_ascii_whitespace(),
+                control: byte.is_ascii_control(),
+                identifier: byte.is_ascii_alphanumeric() || byte == b'_',
+            })
+        }
+        fn system_identifier(
+            &self,
+            bytes: &[u8],
+            _: bool,
+        ) -> Result<(String, SqlSourceAdmission), MySqlSourceError> {
+            Ok((
+                String::from_utf8(bytes.to_vec()).map_err(|_| "non-ASCII fixture identifier")?,
+                self.admit(bytes.len())?,
+            ))
+        }
+        fn system_text(
+            &self,
+            _: &MySqlText,
+        ) -> Result<(String, SqlSourceAdmission), MySqlSourceError> {
+            Err("these trigger fixtures have no system-text conversion".into())
+        }
+        fn admit(&self, _: usize) -> Result<SqlSourceAdmission, MySqlSourceError> {
+            Ok(SqlSourceAdmission::new(Arc::new(())))
+        }
+    }
+    assert!(sql.is_ascii());
+    let owner = SqlSourceOwner::adopt(
+        sql.as_bytes().to_vec(),
+        SqlSourceAdmission::new(Arc::new(())),
+    );
+    let dialect = MySqlDialect {};
+    let adapter = AsciiTriggerSource;
+    let (parsed, program) = Parser::new(&dialect)
+        .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &adapter)
+        .unwrap()
+        .parse_next_mysql_source_with_program_body(|parser| {
+            // Consume the original action through the same admitted cursor;
+            // action syntax is checked by the Generic fixture above.
+            while parser.peek_token().token != Token::EOF {
+                parser.next_token();
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(program, Some(()));
+    assert_eq!(parsed.source_occurrence.bytes().unwrap(), sql.as_bytes());
+    assert!(Arc::ptr_eq(
+        parsed.source_occurrence.owner().unwrap(),
+        &owner
+    ));
+    assert_eq!(parsed.consumed_end, sql.len());
+    let Statement::CreateTrigger(actual_header) = &parsed.statement else {
+        unreachable!("Expected CREATE TRIGGER header");
+    };
+    let actual_body = actual_header.mysql_body.as_ref().unwrap();
+    let source = actual_body.source.as_ref().unwrap();
+    assert_eq!(source.bytes().unwrap(), action.as_bytes());
+    assert_eq!(source.range(), sql.len() - action.len()..sql.len());
+    assert!(Arc::ptr_eq(source.owner().unwrap(), &owner));
+    let cpp = actual_body.cpp.as_ref().unwrap();
+    assert!(cpp.start < cpp.end);
+    assert!(cpp.end <= parsed.cpp.len());
+    expected_header.mysql_body = Some(MySqlProgramBody {
+        source: Some(source.clone()),
+        cpp: Some(*cpp),
+        definer: None,
+        if_not_exists: false,
+        deterministic: None,
+        data_access: None,
+        comment: None,
+        ordering: None,
+        parameter_type_modifiers: vec![],
+        return_type_modifiers: None,
+    });
+    assert_eq!(parsed.statement, Statement::CreateTrigger(expected_header));
 }

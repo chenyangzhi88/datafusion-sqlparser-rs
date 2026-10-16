@@ -1053,9 +1053,9 @@ mod mysql_byte_source {
                 self.tail_probes.fetch_add(1, Ordering::SeqCst);
                 return Err("tail was actually lexed".into());
             }
-            let width = if self.charset == "gbk" && bytes.starts_with(&[0x81, 0x5c]) {
-                2
-            } else if self.charset == "utf8mb4" && bytes.starts_with(&[0xc3, 0xa9]) {
+            let width = if (self.charset == "gbk" && bytes.starts_with(&[0x81, 0x5c]))
+                || (self.charset == "utf8mb4" && bytes.starts_with(&[0xc3, 0xa9]))
+            {
                 2
             } else if self.charset == "utf8mb4" && bytes.starts_with(&[0xf0, 0x9f, 0x98, 0x80]) {
                 4
@@ -2435,7 +2435,10 @@ mod mysql_byte_source {
             .parse_next_mysql_source()
             .unwrap()
             .is_none());
-        assert!(parsed.source_occurrence.slice(9..1).is_err());
+        assert!(parsed
+            .source_occurrence
+            .slice(core::ops::Range { start: 9, end: 1 })
+            .is_err());
         for sql in [
             b"--".as_slice(),
             b"#comment".as_slice(),
@@ -2579,8 +2582,8 @@ mod mysql_byte_source {
             vec![
                 Value::HexStringLiteral("0F".into()),
                 Value::HexStringLiteral("05".into()),
-                Value::Number("1.25e-3".into(), false),
-                Value::Number("2e+9".into(), false)
+                Value::Number("1.25e-3".parse().unwrap(), false),
+                Value::Number("2e+9".parse().unwrap(), false)
             ]
         );
         for sql in [br"SELECT X'4\1'".as_slice(), br"SELECT b'1\0'".as_slice()] {
@@ -2626,7 +2629,7 @@ mod mysql_byte_source {
         else {
             panic!("decimal plus real alias")
         };
-        assert_eq!(value.value, Value::Number("1.2".into(), false));
+        assert_eq!(value.value, Value::Number("1.2".parse().unwrap(), false));
         assert_eq!(alias.bytes().unwrap(), b"a");
         let invalid = b"SELECT 1.2e";
         let owner = facts.owner(invalid.to_vec());
@@ -3571,7 +3574,7 @@ mod mysql_byte_source {
                 b"'b'".as_slice(),
             ),
         ];
-        let attached_expected = expected
+        let mut attached_expected = expected
             .iter()
             .map(|(role, range, bytes, source)| {
                 (
@@ -3582,17 +3585,20 @@ mod mysql_byte_source {
                 )
             })
             .collect::<Vec<_>>();
-        let detached_expected = expected
+        attached_expected.sort_by_key(|(_, range, _, _)| range.start);
+        let mut detached_expected = expected
             .iter()
             .map(|(role, range, _, _)| (*role, range.clone(), None, None))
             .collect::<Vec<_>>();
+        detached_expected.sort_by_key(|(_, range, _, _)| range.start);
+        type ObservedText = (
+            MySqlTextRole,
+            core::ops::Range<usize>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
         struct Seen {
-            values: Vec<(
-                MySqlTextRole,
-                core::ops::Range<usize>,
-                Option<Vec<u8>>,
-                Option<Vec<u8>>,
-            )>,
+            values: Vec<ObservedText>,
             detached: bool,
         }
         impl Visitor for Seen {
@@ -4996,13 +5002,11 @@ fn array_character_cast_clones_and_serializes_the_original_convert_bit_and_visit
             });
         assert_eq!((cast, operand), (1, 1));
     }
-    assert!(
-        Parser::parse_sql(
-            &MySqlDialect {},
-            "SELECT CAST(j AS CHAR(4) CHARACTER SET binary ARRAY FORMAT 'x')"
-        )
-        .is_err()
-    );
+    assert!(Parser::parse_sql(
+        &MySqlDialect {},
+        "SELECT CAST(j AS CHAR(4) CHARACTER SET binary ARRAY FORMAT 'x')"
+    )
+    .is_err());
 }
 
 #[test]

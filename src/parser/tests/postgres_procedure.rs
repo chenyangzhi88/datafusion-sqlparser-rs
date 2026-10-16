@@ -37,7 +37,7 @@ fn postgres_procedure_accepts_unnamed_arguments_and_option_order() {
     let dialect = PostgreSqlDialect {};
     for sql in [
         "CREATE PROCEDURE p(INTEGER, INOUT TEXT) LANGUAGE sql AS 'SELECT 1'",
-        "CREATE PROCEDURE p(IN value INTEGER) SECURITY INVOKER SET work_mem TO '4MB' LANGUAGE plpgsql AS $$BEGIN NULL; END$$",
+        "CREATE PROCEDURE p(IN value INTEGER) EXTERNAL SECURITY INVOKER SET work_mem TO '4MB' LANGUAGE plpgsql AS $$BEGIN NULL; END$$",
         "CREATE PROCEDURE p(IN value INTEGER) SET work_mem FROM CURRENT SECURITY DEFINER LANGUAGE plpgsql AS $$BEGIN NULL; END$$",
     ] {
         let statement = parse_one(&dialect, sql);
@@ -125,12 +125,125 @@ fn generic_and_vendor_procedure_syntax_does_not_regress() {
         "CREATE PROCEDURE p(IN value INT) AS SELECT value; END"
     )
     .is_err());
-    for (statement, dialect) in [(
-        "CREATE PROCEDURE p AS SELECT 1; END",
-        &MsSqlDialect {} as &dyn crate::dialect::Dialect,
-    )] {
+    {
+        let statement = "CREATE PROCEDURE p AS SELECT 1; END";
+        let dialect = &MsSqlDialect {} as &dyn crate::dialect::Dialect;
         let parsed = Parser::parse_sql(dialect, statement)
             .unwrap_or_else(|error| panic!("vendor procedure syntax regressed: {error}"));
         assert_eq!(parsed.len(), 1);
     }
+}
+
+#[test]
+fn postgres_argument_modes_accept_either_name_order() {
+    let dialect = PostgreSqlDialect {};
+    for sql in [
+        "CREATE PROCEDURE p(a OUT integer, VARIADIC b integer[]) LANGUAGE sql AS 'SELECT 1'",
+        "CREATE FUNCTION f(a IN OUT integer) LANGUAGE sql AS 'SELECT a'",
+        "ALTER PROCEDURE p(a OUT integer, b integer[]) RENAME TO q",
+        "DROP PROCEDURE p(a OUT integer, b integer[])",
+    ] {
+        let statement = parse_one(&dialect, sql);
+        assert_eq!(parse_one(&dialect, &statement.to_string()), statement);
+    }
+}
+
+#[test]
+fn postgres_routine_ddl_preserves_kind_across_round_trip() {
+    let dialect = PostgreSqlDialect {};
+    for sql in [
+        "ALTER ROUTINE p(integer) RENAME TO q",
+        "ALTER ROUTINE p SET SCHEMA destination",
+        "ALTER ROUTINE p(integer) SECURITY DEFINER",
+        "DROP ROUTINE IF EXISTS p(integer), q CASCADE",
+    ] {
+        let statement = parse_one(&dialect, sql);
+        assert_eq!(parse_one(&dialect, &statement.to_string()), statement);
+        assert!(statement.to_string().contains("ROUTINE"));
+    }
+}
+
+#[test]
+fn postgres_create_user_and_group_are_role_aliases() {
+    for (sql, login) in [
+        ("CREATE USER u", Some(true)),
+        ("CREATE USER u NOLOGIN", Some(false)),
+        ("CREATE GROUP g", None),
+    ] {
+        let Statement::CreateRole(role) = parse_one(&PostgreSqlDialect {}, sql) else {
+            panic!("{sql}")
+        };
+        assert_eq!(role.login, login);
+    }
+    assert!(matches!(
+        parse_one(&MySqlDialect {}, "CREATE USER u"),
+        Statement::CreateUser(_)
+    ));
+}
+
+#[test]
+fn postgres_encrypted_password_uses_the_existing_password_option() {
+    let dialect = PostgreSqlDialect {};
+    for (encrypted, ordinary) in [
+        (
+            "CREATE USER test2 WITH ENCRYPTED PASSWORD 'abc123'",
+            "CREATE USER test2 WITH PASSWORD 'abc123'",
+        ),
+        (
+            "CREATE ROLE test2 ENCRYPTED PASSWORD $$abc123$$ LOGIN",
+            "CREATE ROLE test2 PASSWORD $$abc123$$ LOGIN",
+        ),
+        (
+            "ALTER ROLE test2 WITH ENCRYPTED PASSWORD 'abc123'",
+            "ALTER ROLE test2 WITH PASSWORD 'abc123'",
+        ),
+    ] {
+        assert_eq!(
+            parse_one(&dialect, encrypted),
+            parse_one(&dialect, ordinary)
+        );
+    }
+    for sql in [
+        "CREATE USER u ENCRYPTED PASSWORD NULL",
+        "CREATE USER u ENCRYPTED PASSWORD 123",
+        "CREATE USER u ENCRYPTED 'x'",
+        "CREATE USER u PASSWORD 'x' ENCRYPTED PASSWORD 'y'",
+        "ALTER ROLE u ENCRYPTED PASSWORD NULL",
+        "ALTER ROLE u ENCRYPTED PASSWORD 123",
+    ] {
+        assert!(Parser::parse_sql(&dialect, sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn postgres_system_user_is_a_bare_function_and_quoted_names_remain_columns() {
+    use crate::ast::{Expr, FunctionArguments, FunctionOrigin, SelectItem, SetExpr};
+    let Statement::Query(query) =
+        parse_one(&PostgreSqlDialect {}, "SELECT system_user, \"system_user\"")
+    else {
+        panic!("SELECT");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("SELECT body")
+    };
+    let SelectItem::UnnamedExpr(Expr::Function(function)) = &select.projection[0] else {
+        panic!("bare function")
+    };
+    assert_eq!(function.name.to_string(), "system_user");
+    assert_eq!(function.origin, FunctionOrigin::Source);
+    assert_eq!(function.args, FunctionArguments::None);
+    assert!(
+        matches!(&select.projection[1], SelectItem::UnnamedExpr(Expr::Identifier(name)) if name.quote_style == Some('"'))
+    );
+    assert!(Parser::parse_sql(&PostgreSqlDialect {}, "SELECT system_user()").is_err());
+    let Statement::Query(query) = parse_one(&GenericDialect {}, "SELECT system_user") else {
+        panic!("generic SELECT")
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("generic SELECT body")
+    };
+    assert!(matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::Identifier(_))
+    ));
 }

@@ -29,7 +29,7 @@ use sqlparser_derive::{Visit, VisitMut};
 use super::display_separated;
 
 /// Unary operators
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum UnaryOperator {
@@ -60,6 +60,8 @@ pub enum UnaryOperator {
     PGPostfixFactorial,
     /// Factorial, e.g. `!!9` (PostgreSQL-specific)
     PGPrefixFactorial,
+    /// A PostgreSQL prefix operator, optionally qualified with `OPERATOR(schema.name)`.
+    PGCustomUnaryOperator(Vec<String>),
     /// Square root, e.g. `|/9` (PostgreSQL-specific)
     PGSquareRoot,
     /// `?-` Is horizontal? (PostgreSQL/Redshift geometric operator)
@@ -84,6 +86,13 @@ impl fmt::Display for UnaryOperator {
             UnaryOperator::PGCubeRoot => "||/",
             UnaryOperator::PGPostfixFactorial => "!",
             UnaryOperator::PGPrefixFactorial => "!!",
+            UnaryOperator::PGCustomUnaryOperator(parts) => {
+                return if parts.len() == 1 {
+                    f.write_str(&parts[0])
+                } else {
+                    write!(f, "OPERATOR({})", parts.join("."))
+                };
+            }
             UnaryOperator::PGSquareRoot => "|/",
             UnaryOperator::Plus => "+",
             UnaryOperator::QuestionDash => "?-",

@@ -73,7 +73,8 @@ impl fmt::Debug for SqlSourceAdmission {
 /// Adopted Vec capacity, not just its length, must be admitted before this call.
 pub struct SqlSourceOwner {
     bytes: Vec<u8>,
-    admission: SqlSourceAdmission,
+    // Drop the original byte allocation before its retained admission lease.
+    _admission: SqlSourceAdmission,
 }
 
 impl SqlSourceOwner {
@@ -81,7 +82,10 @@ impl SqlSourceOwner {
     /// The caller must admit the Vec's capacity and shared-owner header before
     /// calling; this constructor does not reserve memory or validate SQL.
     pub fn adopt(bytes: Vec<u8>, admission: SqlSourceAdmission) -> Arc<Self> {
-        Arc::new(Self { bytes, admission })
+        Arc::new(Self {
+            bytes,
+            _admission: admission,
+        })
     }
 
     /// Shared physical owner header, excluding the separately admitted Vec capacity.
@@ -407,6 +411,8 @@ fn check_mysql_text_segments(parts: &[MySqlTextSegment], length: usize) -> Resul
 #[derive(Clone, Debug)]
 enum MySqlTextSemantic {
     Admitted(SqlSourceOccurrence),
+    /// Catalog bytes with restored ownership, never a fresh lexer or alias issuance.
+    Reattached(SqlSourceOccurrence),
     /// Same semantic owner after the actual native declaration adapter bound
     /// its connection/binary byte domain. Original occurrence remains in segments.
     Declaration(SqlSourceOccurrence),
@@ -432,6 +438,7 @@ impl MySqlText {
             | MySqlTextSemantic::Declaration(source)
             | MySqlTextSemantic::System(source) => Some(source),
             MySqlTextSemantic::AliasSystem(_)
+            | MySqlTextSemantic::Reattached(_)
             | MySqlTextSemantic::Detached(_)
             | MySqlTextSemantic::DetachedDeclaration(_)
             | MySqlTextSemantic::DetachedSystem(_) => None,
@@ -508,6 +515,7 @@ impl MySqlText {
             || matches!(
                 self.semantic,
                 MySqlTextSemantic::System(_)
+                    | MySqlTextSemantic::Reattached(_)
                     | MySqlTextSemantic::AliasSystem(_)
                     | MySqlTextSemantic::DetachedSystem(_)
             )
@@ -729,6 +737,7 @@ impl MySqlText {
     pub fn bytes(&self) -> Result<&[u8], String> {
         match &self.semantic {
             MySqlTextSemantic::Admitted(value)
+            | MySqlTextSemantic::Reattached(value)
             | MySqlTextSemantic::Declaration(value)
             | MySqlTextSemantic::AliasSystem(value)
             | MySqlTextSemantic::System(value) => value.bytes(),
@@ -742,6 +751,7 @@ impl MySqlText {
     fn semantic_bytes(&self) -> &[u8] {
         match &self.semantic {
             MySqlTextSemantic::Admitted(value)
+            | MySqlTextSemantic::Reattached(value)
             | MySqlTextSemantic::Declaration(value)
             | MySqlTextSemantic::AliasSystem(value)
             | MySqlTextSemantic::System(value) => value.bytes().expect("constructed checked text"),
@@ -785,6 +795,7 @@ impl MySqlText {
     pub fn semantic_allocation_bytes(&self) -> Option<usize> {
         let semantic = match &self.semantic {
             MySqlTextSemantic::Admitted(_)
+            | MySqlTextSemantic::Reattached(_)
             | MySqlTextSemantic::Declaration(_)
             | MySqlTextSemantic::AliasSystem(_)
             | MySqlTextSemantic::System(_) => 0,
@@ -836,30 +847,25 @@ impl MySqlText {
                 parts_owner.admission = Some(semantic_admission.clone());
             }
         }
-        if matches!(
-            &self.semantic,
-            MySqlTextSemantic::Detached(_)
-                | MySqlTextSemantic::DetachedDeclaration(_)
-                | MySqlTextSemantic::DetachedSystem(_)
-        ) {
-            let old =
-                core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
-            let (bytes, declaration) = match old {
-                MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedSystem(bytes) => {
-                    (bytes, false)
-                }
-                MySqlTextSemantic::DetachedDeclaration(bytes) => (bytes, true),
-                _ => unreachable!(),
-            };
-            let length = bytes.len();
-            let semantic = SqlSourceOwner::adopt(bytes, semantic_admission);
-            let occurrence = semantic.occurrence(0..length)?;
-            self.semantic = if declaration {
-                MySqlTextSemantic::Declaration(occurrence)
-            } else {
-                MySqlTextSemantic::Admitted(occurrence)
-            };
-        }
+        let old = core::mem::replace(&mut self.semantic, MySqlTextSemantic::Detached(Vec::new()));
+        let (bytes, declaration) = match old {
+            MySqlTextSemantic::Detached(bytes) | MySqlTextSemantic::DetachedSystem(bytes) => {
+                (bytes, false)
+            }
+            MySqlTextSemantic::DetachedDeclaration(bytes) => (bytes, true),
+            attached => {
+                self.semantic = attached;
+                return Ok(());
+            }
+        };
+        let length = bytes.len();
+        let semantic = SqlSourceOwner::adopt(bytes, semantic_admission);
+        let occurrence = semantic.occurrence(0..length)?;
+        self.semantic = if declaration {
+            MySqlTextSemantic::Declaration(occurrence)
+        } else {
+            MySqlTextSemantic::Reattached(occurrence)
+        };
         Ok(())
     }
 }
