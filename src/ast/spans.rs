@@ -309,6 +309,7 @@ impl Spanned for Values {
 /// - [Statement::Kill]
 /// - [Statement::ExplainTable]
 /// - [Statement::Explain]
+/// - [Statement::ExplainForConnection]
 /// - [Statement::Savepoint]
 /// - [Statement::ReleaseSavepoint]
 /// - [Statement::Cache]
@@ -501,7 +502,7 @@ impl Spanned for Statement {
             Statement::Prepare { .. } => Span::empty(),
             Statement::Kill { .. } => Span::empty(),
             Statement::ExplainTable { .. } => Span::empty(),
-            Statement::Explain { .. } => Span::empty(),
+            Statement::Explain { .. } | Statement::ExplainForConnection { .. } => Span::empty(),
             Statement::Do(_) => Span::empty(),
             Statement::Savepoint { .. } => Span::empty(),
             Statement::ReleaseSavepoint { .. } => Span::empty(),
@@ -602,7 +603,8 @@ impl Spanned for CreateTable {
             file_format: _,       // enum
             location: _,          // string, no span
             query,
-            without_rowid: _, // bool
+            mysql_on_duplicate: _, // scalar treatment, inside name/query extent
+            without_rowid: _,      // bool
             like: _,
             clone,
             comment: _, // todo, no span
@@ -921,6 +923,7 @@ impl Spanned for ColumnOption {
     fn span(&self) -> Span {
         match self {
             ColumnOption::Null => Span::empty(),
+            ColumnOption::EngineAttribute { .. } => Span::empty(),
             ColumnOption::NotNull => Span::empty(),
             ColumnOption::Default(expr) => expr.span(),
             ColumnOption::Materialized(expr) => expr.span(),
@@ -1245,6 +1248,9 @@ impl Spanned for AlterTableOperation {
                 name,
                 drop_behavior: _,
             } => name.span,
+            AlterTableOperation::DropCheck { name }
+            | AlterTableOperation::AlterCheck { name, enforced: _ }
+            | AlterTableOperation::AlterConstraintEnforcement { name, enforced: _ } => name.span,
             AlterTableOperation::DropColumn {
                 has_column_keyword: _,
                 column_names,
@@ -1707,6 +1713,7 @@ impl Spanned for Expr {
                 data_type: _,
                 charset,
                 binary_attribute: _,
+                array: _,
                 target_before_value: _,
                 styles,
                 is_try: _,

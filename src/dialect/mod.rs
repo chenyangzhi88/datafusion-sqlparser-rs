@@ -51,8 +51,8 @@ pub use self::mysql::MySqlDialect;
 pub use self::oracle::OracleDialect;
 pub use self::postgresql::PostgreSqlDialect;
 pub use self::redshift::RedshiftSqlDialect;
-pub use self::snowflake::parse_snowflake_stage_name;
 pub use self::snowflake::SnowflakeDialect;
+pub use self::snowflake::parse_snowflake_stage_name;
 pub use self::spark::SparkSqlDialect;
 pub use self::sqlite::SQLiteDialect;
 pub use self::teradata::TeradataDialect;
@@ -1126,8 +1126,13 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if the dialect supports `EXPLAIN` statements with utility options
-    /// e.g. `EXPLAIN (ANALYZE TRUE, BUFFERS TRUE) SELECT * FROM tbl;`
+    /// Supports MySQL EXPLAIN FOR CONNECTION with a literal connection ID.
+    fn supports_explain_for_connection(&self) -> bool {
+        false
+    }
+
+    /// Returns true if the dialect supports EXPLAIN utility options.
+    /// e.g. EXPLAIN (ANALYZE TRUE, BUFFERS TRUE) SELECT * FROM tbl;
     fn supports_explain_with_utility_options(&self) -> bool {
         false
     }
@@ -1221,6 +1226,12 @@ pub trait Dialect: Debug + Any {
 
     /// Returns true if the dialect supports the `CREATE TABLE SELECT` statement
     fn supports_create_table_select(&self) -> bool {
+        false
+    }
+
+    /// Whether CREATE TABLE accepts `[IGNORE | REPLACE] [AS] query`, including
+    /// a bare WITH or parenthesized query. This is row treatment, not OR REPLACE.
+    fn supports_create_table_query_duplicate(&self) -> bool {
         false
     }
 
@@ -1388,6 +1399,15 @@ pub trait Dialect: Debug + Any {
     fn supports_array_typedef_with_brackets(&self) -> bool {
         false
     }
+
+    /// Whether ordinary `CAST(... AS TIME ... ARRAY)` accepts a time zone
+    /// qualifier, including `WITH TIME ZONE`, `WITHOUT TIME ZONE` and `TIMETZ`.
+    /// This only describes syntax, not conversion or index capabilities.
+    /// The default preserves the existing permissive array-cast grammar.
+    fn supports_time_zone_in_array_cast(&self) -> bool {
+        true
+    }
+
     /// Returns true if the dialect supports geometric types.
     ///
     /// Postgres: <https://www.postgresql.org/docs/9.5/functions-geometry.html>
@@ -1431,6 +1451,19 @@ pub trait Dialect: Debug + Any {
     ///  ALTER TABLE tbl ALTER COLUMN col SET DATA TYPE <type> USING <exp>`
     /// ```
     fn supports_alter_column_type_using(&self) -> bool {
+        false
+    }
+
+    /// Supports type-specific `DROP CHECK` and `ALTER CHECK`/`ALTER
+    /// CONSTRAINT ... [NOT] ENFORCED`. These constraint clauses use bare names,
+    /// without `IF EXISTS`, `CASCADE` or `RESTRICT` on DROP.
+    fn supports_check_constraint_enforcement(&self) -> bool {
+        false
+    }
+
+    /// Supports a final, non-comma `PARTITION BY` or `REMOVE PARTITIONING`
+    /// tail after the ordinary `ALTER TABLE` action list.
+    fn supports_alter_table_partition_tail(&self) -> bool {
         false
     }
 
@@ -2010,6 +2043,10 @@ mod tests {
                 self.0.supports_within_after_array_aggregation()
             }
 
+            fn supports_time_zone_in_array_cast(&self) -> bool {
+                self.0.supports_time_zone_in_array_cast()
+            }
+
             fn supports_group_by_expr(&self) -> bool {
                 self.0.supports_group_by_expr()
             }
@@ -2063,5 +2100,14 @@ mod tests {
         let res2 = Parser::parse_sql(&WrappedDialect(MySqlDialect {}), statement);
         assert!(res1.is_ok());
         assert_eq!(res1, res2);
+        let wrapped = WrappedDialect(MySqlDialect {});
+        assert!(!wrapped.supports_time_zone_in_array_cast());
+        for target in ["TIME WITH TIME ZONE", "TIME(6) WITHOUT TIME ZONE", "TIMETZ"] {
+            let sql = format!("SELECT CAST(j AS {target} ARRAY)");
+            let native = Parser::parse_sql(&MySqlDialect {}, &sql);
+            assert!(native.is_err());
+            assert_eq!(Parser::parse_sql(&wrapped, &sql), native);
+            assert!(Parser::parse_sql(&wrapped, &format!("SELECT CAST(j AS {target})")).is_ok());
+        }
     }
 }

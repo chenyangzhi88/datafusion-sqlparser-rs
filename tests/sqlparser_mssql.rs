@@ -1306,6 +1306,8 @@ fn parse_convert() {
         expr,
         data_type,
         charset,
+        binary_attribute,
+        array,
         target_before_value,
         styles,
     } = ms().verified_expr(sql)
@@ -1313,6 +1315,8 @@ fn parse_convert() {
         unreachable!()
     };
     assert!(!is_try);
+    assert!(!binary_attribute);
+    assert!(!array);
     assert_eq!(Expr::value(number("1")), *expr);
     assert_eq!(Some(DataType::Int(None)), data_type);
     assert!(charset.is_none());
@@ -1969,6 +1973,7 @@ fn parse_create_table_with_valid_options() {
                 hive_formats: None,
                 file_format: None,
                 location: None,
+                mysql_on_duplicate: None,
                 query: None,
                 without_rowid: false,
                 like: None,
@@ -2145,6 +2150,7 @@ fn parse_create_table_with_identity_column() {
                 hive_formats: None,
                 file_format: None,
                 location: None,
+                mysql_on_duplicate: None,
                 query: None,
                 without_rowid: false,
                 like: None,

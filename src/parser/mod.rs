@@ -28,9 +28,9 @@ use core::{
 use helpers::attached_token::AttachedToken;
 use log::debug;
 
+use recursion::RecursionCounter;
 use IsLateral::*;
 use IsOptional::*;
-use recursion::RecursionCounter;
 
 use crate::ast::*;
 use crate::ast::{
@@ -43,7 +43,7 @@ use crate::ast::{
     },
 };
 use crate::dialect::*;
-use crate::keywords::{ALL_KEYWORDS, Keyword};
+use crate::keywords::{Keyword, ALL_KEYWORDS};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
 
@@ -93,7 +93,7 @@ pub enum MySqlSetAssignment<T> {
 }
 
 /// Errors produced by the SQL parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum ParserError {
     /// Error originating from the tokenizer with a message.
     TokenizerError(String),
@@ -115,6 +115,86 @@ pub enum ParserError {
     MySqlDuplicateCte(String),
     /// Native YEAR_SYM opt_field_length reduction, before Item FIX.
     MySqlInvalidYearWidth,
+    /// Native engine-attribute JSON grammar's3980 message, without a location suffix.
+    MySqlInvalidJsonAttribute(String, Option<SqlSourceAdmission>),
+    /// Native first error3157; the Source owner holds the following3980 condition.
+    MySqlJsonAttributeDepth(Option<SqlSourceAdmission>),
+    /// Original TEXT_STRING_validated cross-charset failure3854 and its real
+    /// Source message admission; not a syntax/English-message classification.
+    MySqlCharacterConversionFailed(String, Option<SqlSourceAdmission>),
+}
+
+impl PartialEq for ParserError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::TokenizerError(a), Self::TokenizerError(b))
+            | (Self::ParserError(a), Self::ParserError(b))
+            | (Self::ResourceExhausted(a), Self::ResourceExhausted(b))
+            | (Self::MySqlDuplicateCte(a), Self::MySqlDuplicateCte(b))
+            | (Self::MySqlInvalidJsonAttribute(a, _), Self::MySqlInvalidJsonAttribute(b, _)) => {
+                a == b
+            }
+            (
+                Self::MySqlCharacterConversionFailed(a, _),
+                Self::MySqlCharacterConversionFailed(b, _),
+            ) => a == b,
+            (Self::RecursionLimitExceeded, Self::RecursionLimitExceeded)
+            | (Self::Cancelled, Self::Cancelled)
+            | (Self::DeadlineExceeded, Self::DeadlineExceeded)
+            | (Self::MySqlConflictingSchemaReadOnly, Self::MySqlConflictingSchemaReadOnly)
+            | (Self::MySqlInvalidYearWidth, Self::MySqlInvalidYearWidth)
+            | (Self::MySqlJsonAttributeDepth(_), Self::MySqlJsonAttributeDepth(_)) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for ParserError {}
+impl fmt::Debug for ParserError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TokenizerError(message) => {
+                f.debug_tuple("TokenizerError").field(message).finish()
+            }
+            Self::ParserError(message) => f.debug_tuple("ParserError").field(message).finish(),
+            Self::ResourceExhausted(message) => {
+                f.debug_tuple("ResourceExhausted").field(message).finish()
+            }
+            Self::MySqlDuplicateCte(message) => {
+                f.debug_tuple("MySqlDuplicateCte").field(message).finish()
+            }
+            Self::MySqlInvalidJsonAttribute(message, _) => f
+                .debug_tuple("MySqlInvalidJsonAttribute")
+                .field(message)
+                .finish(),
+            Self::MySqlCharacterConversionFailed(message, _) => f
+                .debug_tuple("MySqlCharacterConversionFailed")
+                .field(message)
+                .finish(),
+            Self::RecursionLimitExceeded => f.write_str("RecursionLimitExceeded"),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::DeadlineExceeded => f.write_str("DeadlineExceeded"),
+            Self::MySqlConflictingSchemaReadOnly => f.write_str("MySqlConflictingSchemaReadOnly"),
+            Self::MySqlInvalidYearWidth => f.write_str("MySqlInvalidYearWidth"),
+            Self::MySqlJsonAttributeDepth(_) => f.write_str("MySqlJsonAttributeDepth"),
+        }
+    }
+}
+
+impl From<(TokenizerError, Option<SqlSourceAdmission>)> for ParserError {
+    fn from((error, admission): (TokenizerError, Option<SqlSourceAdmission>)) -> Self {
+        match error.source_kind {
+            crate::tokenizer::MySqlSourceErrorKind::InvalidJsonAttribute => {
+                Self::MySqlInvalidJsonAttribute(error.message, admission)
+            }
+            crate::tokenizer::MySqlSourceErrorKind::JsonAttributeDepth => {
+                Self::MySqlJsonAttributeDepth(admission)
+            }
+            crate::tokenizer::MySqlSourceErrorKind::CharacterConversionFailed => {
+                Self::MySqlCharacterConversionFailed(error.message, admission)
+            }
+            _ => Self::from(error),
+        }
+    }
 }
 
 // Use `Parser::expected` instead, if possible
@@ -252,7 +332,16 @@ impl From<TokenizerError> for ParserError {
             crate::tokenizer::MySqlSourceErrorKind::DeadlineExceeded => {
                 return Self::DeadlineExceeded;
             }
+            crate::tokenizer::MySqlSourceErrorKind::InvalidJsonAttribute => {
+                return Self::MySqlInvalidJsonAttribute(e.message, None);
+            }
+            crate::tokenizer::MySqlSourceErrorKind::JsonAttributeDepth => {
+                return Self::MySqlJsonAttributeDepth(None);
+            }
             crate::tokenizer::MySqlSourceErrorKind::Message => {}
+            crate::tokenizer::MySqlSourceErrorKind::CharacterConversionFailed => {
+                return Self::MySqlCharacterConversionFailed(e.message, None);
+            }
         }
         if e.message == QUERY_CANCELLED_MESSAGE {
             return ParserError::Cancelled;
@@ -278,6 +367,10 @@ impl fmt::Display for ParserError {
                 ParserError::MySqlDuplicateCte(name) =>
                     return write!(f, "sql parser error: Not unique table/alias: '{name}'"),
                 ParserError::MySqlInvalidYearWidth => "Invalid display width. Use YEAR instead.",
+                ParserError::MySqlInvalidJsonAttribute(message, _) => message,
+                ParserError::MySqlCharacterConversionFailed(message, _) => message,
+                ParserError::MySqlJsonAttributeDepth(_) =>
+                    "The JSON document exceeds the maximum depth.",
             }
         )
     }
@@ -1455,7 +1548,7 @@ impl<'a> Parser<'a> {
             )
         {
             Ok(ObjectName::from(vec![
-                self.parse_mysql_character_identifier()?,
+                self.parse_mysql_character_identifier()?
             ]))
         } else {
             self.parse_object_name(false)
@@ -4324,6 +4417,7 @@ impl<'a> Parser<'a> {
             data_type: Some(data_type),
             charset: None,
             binary_attribute: false,
+            array: false,
             target_before_value: true,
             styles,
         })
@@ -4349,6 +4443,7 @@ impl<'a> Parser<'a> {
                 data_type: None,
                 charset: Some(charset),
                 binary_attribute: false,
+                array: false,
                 target_before_value: false,
                 styles: vec![],
             });
@@ -4382,6 +4477,7 @@ impl<'a> Parser<'a> {
             data_type: Some(data_type),
             charset,
             binary_attribute,
+            array: false,
             target_before_value: false,
             styles: vec![],
         })
@@ -4498,12 +4594,33 @@ impl<'a> Parser<'a> {
             self.mysql_character_attribute_condition("BINARY");
         }
         let array = self.parse_keyword(Keyword::ARRAY);
+        if array
+            && !self.dialect.supports_time_zone_in_array_cast()
+            && kind == CastKind::Cast
+            && matches!(&data_type, DataType::Time(_, zone) if *zone != TimezoneInfo::None)
+        {
+            // Native cast_type is TIME type_datetime_precision, not the
+            // timezone-qualified ordinary type production. This guard is
+            // exclusive to the original MySQL ARRAY CAST receiving front.
+            let location = (data_type_start..self.index)
+                .filter_map(|index| self.tokens.get(index))
+                .find(|token| {
+                    matches!(&token.token, Token::Word(word)
+                    if matches!(word.keyword, Keyword::WITH | Keyword::WITHOUT | Keyword::TIMETZ))
+                })
+                .map(|token| token.span.start)
+                .unwrap_or_else(|| self.peek_token_ref().span.start);
+            return parser_err!(
+                "MySQL ARRAY CAST does not permit a time zone qualifier",
+                location
+            );
+        }
         let format = self.parse_optional_cast_format()?;
         self.expect_token(&Token::RParen)?;
         if charset.is_some() || binary_attribute {
-            if array || format.is_some() {
+            if format.is_some() {
                 return parser_err!(
-                    "CHARACTER SET cannot be combined with ARRAY or FORMAT in CAST",
+                    "CHARACTER SET cannot be combined with FORMAT in CAST",
                     self.peek_token_ref()
                 );
             }
@@ -4513,6 +4630,7 @@ impl<'a> Parser<'a> {
                 data_type: Some(data_type),
                 charset,
                 binary_attribute,
+                array,
                 target_before_value: false,
                 styles: vec![],
             });
@@ -6270,22 +6388,20 @@ impl<'a> Parser<'a> {
     /// See [`Self::peek_token`] for an example.
     pub fn peek_tokens_with_location<const N: usize>(&self) -> [TokenWithSpan; N] {
         let mut index = self.index;
-        core::array::from_fn(|_| {
-            loop {
-                let token = self.tokens.get(index);
-                index += 1;
-                if let Some(TokenWithSpan {
-                    token: Token::Whitespace(_),
-                    span: _,
-                }) = token
-                {
-                    continue;
-                }
-                break token.cloned().unwrap_or(TokenWithSpan {
-                    token: Token::EOF,
-                    span: Span::empty(),
-                });
+        core::array::from_fn(|_| loop {
+            let token = self.tokens.get(index);
+            index += 1;
+            if let Some(TokenWithSpan {
+                token: Token::Whitespace(_),
+                span: _,
+            }) = token
+            {
+                continue;
             }
+            break token.cloned().unwrap_or(TokenWithSpan {
+                token: Token::EOF,
+                span: Span::empty(),
+            });
         })
     }
 
@@ -6295,19 +6411,17 @@ impl<'a> Parser<'a> {
     /// See [`Self::peek_tokens`] for an example.
     pub fn peek_tokens_ref<const N: usize>(&self) -> [&TokenWithSpan; N] {
         let mut index = self.index;
-        core::array::from_fn(|_| {
-            loop {
-                let token = self.tokens.get(index);
-                index += 1;
-                if let Some(TokenWithSpan {
-                    token: Token::Whitespace(_),
-                    span: _,
-                }) = token
-                {
-                    continue;
-                }
-                break token.unwrap_or(&EOF_TOKEN);
+        core::array::from_fn(|_| loop {
+            let token = self.tokens.get(index);
+            index += 1;
+            if let Some(TokenWithSpan {
+                token: Token::Whitespace(_),
+                span: _,
+            }) = token
+            {
+                continue;
             }
+            break token.unwrap_or(&EOF_TOKEN);
         })
     }
 
@@ -11037,12 +11151,33 @@ impl<'a> Parser<'a> {
                 None
             };
 
-        // Parse optional `AS ( query )`
+        let mysql_on_duplicate = if self.dialect.supports_create_table_query_duplicate() {
+            if self.parse_keyword(Keyword::IGNORE) {
+                Some(MySqlCreateTableDuplicate::Ignore)
+            } else if self.parse_keyword(Keyword::REPLACE) {
+                Some(MySqlCreateTableDuplicate::Replace)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Keep one real query AST, including MySQL's native WITH/parenthesized tail.
         let query = if self.parse_keyword(Keyword::AS) {
+            Some(self.parse_query()?)
+        } else if self.dialect.supports_create_table_query_duplicate()
+            && (mysql_on_duplicate.is_some()
+                || matches!(
+                    self.peek_token().token,
+                    Token::Word(Word {
+                        keyword: Keyword::SELECT | Keyword::WITH,
+                        ..
+                    }) | Token::LParen
+                ))
+        {
             Some(self.parse_query()?)
         } else if self.dialect.supports_create_table_select() && self.parse_keyword(Keyword::SELECT)
         {
-            // rewind the SELECT keyword
             self.prev_token();
             Some(self.parse_query()?)
         } else {
@@ -11061,6 +11196,7 @@ impl<'a> Parser<'a> {
             .hive_formats(hive_formats)
             .global(global)
             .query(query)
+            .mysql_on_duplicate(mysql_on_duplicate)
             .without_rowid(without_rowid)
             .like(like)
             .clone_clause(clone)
@@ -11354,15 +11490,16 @@ impl<'a> Parser<'a> {
         // <https://dev.mysql.com/doc/refman/8.4/en/create-table.html>
         if self.parse_keywords(&[Keyword::COMMENT]) {
             let has_eq = self.consume_token(&Token::Eq);
+            if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                let value = self.parse_mysql_system_value(false)?;
+                let Value::MySqlText(text) = value.value else {
+                    unreachable!()
+                };
+                return Ok(Some(SqlOption::Comment(CommentDef::MySql { has_eq, text })));
+            }
             let value = self.next_token();
 
             let comment = match (has_eq, value.token) {
-                (has_eq, Token::MySqlText(text)) => {
-                    Ok(Some(SqlOption::Comment(CommentDef::MySql {
-                        has_eq,
-                        text: text.with_role(MySqlTextRole::System),
-                    })))
-                }
                 (true, Token::SingleQuotedString(s)) => {
                     Ok(Some(SqlOption::Comment(CommentDef::WithEq(s))))
                 }
@@ -11531,6 +11668,13 @@ impl<'a> Parser<'a> {
 
         let _ = self.consume_token(&Token::Eq);
 
+        if key.value == "ENGINE_ATTRIBUTE" || key.value == "SECONDARY_ENGINE_ATTRIBUTE" {
+            return Ok(Some(SqlOption::KeyValue {
+                key,
+                value: Expr::Value(self.parse_mysql_json_attribute()?),
+            }));
+        }
+
         let value = match self
             .maybe_parse(|parser| parser.parse_value())?
             .map(Expr::Value)
@@ -11576,9 +11720,11 @@ impl<'a> Parser<'a> {
     pub fn parse_optional_inline_comment(&mut self) -> Result<Option<CommentDef>, ParserError> {
         let comment = if self.parse_keyword(Keyword::COMMENT) {
             let has_eq = self.consume_token(&Token::Eq);
-            if let Token::MySqlText(text) = &self.peek_token_ref().token {
-                let text = text.clone().with_role(MySqlTextRole::System);
-                self.advance_token();
+            if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                let value = self.parse_mysql_system_value(false)?;
+                let Value::MySqlText(text) = value.value else {
+                    unreachable!()
+                };
                 return Ok(Some(CommentDef::MySql { has_eq, text }));
             }
             let comment = self.parse_comment_value()?;
@@ -11912,6 +12058,19 @@ impl<'a> Parser<'a> {
 
     fn parse_optional_column_option_inner(&mut self) -> Result<Option<ColumnOption>, ParserError> {
         if dialect_of!(self is MySqlDialect | GenericDialect)
+            && (self.peek_keyword(Keyword::ENGINE_ATTRIBUTE)
+                || self.peek_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE))
+        {
+            let secondary = self.parse_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE);
+            if !secondary {
+                self.expect_keyword(Keyword::ENGINE_ATTRIBUTE)?;
+            }
+            let _ = self.consume_token(&Token::Eq);
+            Ok(Some(ColumnOption::EngineAttribute {
+                secondary,
+                value: self.parse_mysql_json_attribute()?,
+            }))
+        } else if dialect_of!(self is MySqlDialect | GenericDialect)
             && self.parse_keyword(Keyword::ZEROFILL)
         {
             self.mysql_numeric_condition("ZEROFILL");
@@ -11942,9 +12101,11 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
             Ok(Some(ColumnOption::NotNull))
         } else if self.parse_keywords(&[Keyword::COMMENT]) {
-            if let Token::MySqlText(text) = &self.peek_token_ref().token {
-                let text = text.clone().with_role(MySqlTextRole::System);
-                self.advance_token();
+            if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                let value = self.parse_mysql_system_value(false)?;
+                let Value::MySqlText(text) = value.value else {
+                    unreachable!()
+                };
                 return Ok(Some(ColumnOption::MySqlComment(text)));
             }
             Ok(Some(ColumnOption::Comment(self.parse_comment_value()?)))
@@ -12833,11 +12994,32 @@ impl<'a> Parser<'a> {
 
     /// Parse an optional index option such as `USING <type>` or `COMMENT <string>`.
     pub fn parse_optional_index_option(&mut self) -> Result<Option<IndexOption>, ParserError> {
-        if let Some(index_type) = self.parse_optional_using_then_index_type()? {
+        if dialect_of!(self is MySqlDialect | GenericDialect)
+            && (self.peek_keyword(Keyword::ENGINE_ATTRIBUTE)
+                || self.peek_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE))
+        {
+            let secondary = self.parse_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE);
+            if !secondary {
+                self.expect_keyword(Keyword::ENGINE_ATTRIBUTE)?;
+            }
+            let _ = self.consume_token(&Token::Eq);
+            Ok(Some(IndexOption::EngineAttribute {
+                secondary,
+                value: self.parse_mysql_json_attribute()?,
+            }))
+        } else if let Some(index_type) = self.parse_optional_using_then_index_type()? {
             Ok(Some(IndexOption::Using(index_type)))
         } else if self.parse_keyword(Keyword::COMMENT) {
-            let s = self.parse_literal_string()?;
-            Ok(Some(IndexOption::Comment(s)))
+            if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                let value = self.parse_mysql_system_value(false)?;
+                let Value::MySqlText(text) = value.value else {
+                    unreachable!()
+                };
+                Ok(Some(IndexOption::MySqlComment(text)))
+            } else {
+                let s = self.parse_literal_string()?;
+                Ok(Some(IndexOption::Comment(s)))
+            }
         } else if self.parse_keywords(&[Keyword::WITH, Keyword::PARSER]) {
             Ok(Some(IndexOption::Parser(self.parse_identifier()?)))
         } else if self.parse_keyword(Keyword::VISIBLE) {
@@ -13071,7 +13253,13 @@ impl<'a> Parser<'a> {
                 }
             } else if self.parse_keyword(Keyword::COMMENT) {
                 let _ = self.consume_token(&Token::Eq);
-                MySqlPartitionOption::Comment(self.parse_mysql_partition_string_literal()?)
+                MySqlPartitionOption::Comment(
+                    if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                        self.parse_mysql_system_value(false)?
+                    } else {
+                        self.parse_mysql_partition_string_literal()?
+                    },
+                )
             } else if self.peek_keywords(&[Keyword::DATA, Keyword::DIRECTORY]) {
                 self.expect_keywords(&[Keyword::DATA, Keyword::DIRECTORY])?;
                 let _ = self.consume_token(&Token::Eq);
@@ -13828,12 +14016,21 @@ impl<'a> Parser<'a> {
                     partitions,
                     if_exists: false,
                 }
-            } else if self.parse_keyword(Keyword::CONSTRAINT)
-                || (dialect_of!(self is MySqlDialect) && self.parse_keyword(Keyword::CHECK))
+            } else if self.dialect.supports_check_constraint_enforcement()
+                && self.parse_keyword(Keyword::CHECK)
             {
-                let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+                AlterTableOperation::DropCheck {
+                    name: self.parse_identifier()?,
+                }
+            } else if self.parse_keyword(Keyword::CONSTRAINT) {
+                let if_exists = !self.dialect.supports_check_constraint_enforcement()
+                    && self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
                 let name = self.parse_identifier()?;
-                let drop_behavior = self.parse_optional_drop_behavior();
+                let drop_behavior = if self.dialect.supports_check_constraint_enforcement() {
+                    None
+                } else {
+                    self.parse_optional_drop_behavior()
+                };
                 AlterTableOperation::DropConstraint {
                     if_exists,
                     name,
@@ -13928,6 +14125,21 @@ impl<'a> Parser<'a> {
                 column_position,
             }
         } else if self.parse_keyword(Keyword::ALTER) {
+            if self.dialect.supports_check_constraint_enforcement() {
+                if let Some(kind) =
+                    self.parse_one_of_keywords(&[Keyword::CHECK, Keyword::CONSTRAINT])
+                {
+                    let check = kind == Keyword::CHECK;
+                    let name = self.parse_identifier()?;
+                    let enforced = !self.parse_keyword(Keyword::NOT);
+                    self.expect_keyword(Keyword::ENFORCED)?;
+                    return Ok(if check {
+                        AlterTableOperation::AlterCheck { name, enforced }
+                    } else {
+                        AlterTableOperation::AlterConstraintEnforcement { name, enforced }
+                    });
+                }
+            }
             if self.peek_keyword(Keyword::SORTKEY) {
                 self.prev_token();
                 return self.parse_alter_sort_key();
@@ -14568,6 +14780,21 @@ impl<'a> Parser<'a> {
         let mut comment = None;
         loop {
             if dialect_of!(self is MySqlDialect | GenericDialect)
+                && (self.peek_keyword(Keyword::ENGINE_ATTRIBUTE)
+                    || self.peek_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE))
+            {
+                let secondary = self.parse_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE);
+                if !secondary {
+                    self.expect_keyword(Keyword::ENGINE_ATTRIBUTE)?;
+                }
+                let _ = self.consume_token(&Token::Eq);
+                operations.push(AlterTableOperation::SetOptionsParens {
+                    options: AlterTableSetOperation::MySqlEngineAttribute {
+                        secondary,
+                        value: self.parse_mysql_json_attribute()?,
+                    },
+                });
+            } else if dialect_of!(self is MySqlDialect | GenericDialect)
                 && self.peek_keyword(Keyword::COMMENT)
             {
                 if comment.is_some() {
@@ -14576,10 +14803,8 @@ impl<'a> Parser<'a> {
                 }
                 let comment_token = AttachedToken(self.expect_keyword(Keyword::COMMENT)?);
                 let _ = self.consume_token(&Token::Eq);
-                let value = if let Token::MySqlText(text) = &self.peek_token_ref().token {
-                    let text = text.clone().with_role(MySqlTextRole::System);
-                    let span = self.next_token().span;
-                    Value::MySqlText(text).with_span(span)
+                let value = if matches!(&self.peek_token_ref().token, Token::MySqlText(_)) {
+                    self.parse_mysql_system_value(false)?
                 } else {
                     let span = self.peek_token_ref().span;
                     Value::SingleQuotedString(self.parse_literal_string()?).with_span(span)
@@ -14592,10 +14817,81 @@ impl<'a> Parser<'a> {
                 });
             } else {
                 operations.push(self.parse_alter_table_operation()?);
+                if self.dialect.supports_alter_table_partition_tail()
+                    && matches!(
+                        operations.last(),
+                        Some(AlterTableOperation::SetOptionsParens {
+                            options: AlterTableSetOperation::MySqlPartition(
+                                MySqlPartitionMaintenance::PartitionBy(_)
+                                    | MySqlPartitionMaintenance::RemovePartitioning
+                            ),
+                        })
+                    )
+                {
+                    if !matches!(self.peek_token_ref().token, Token::EOF | Token::SemiColon) {
+                        return self.expected_ref(
+                            "end of ALTER TABLE after the partition tail",
+                            self.peek_token_ref(),
+                        );
+                    }
+                    break;
+                }
             }
-            if !self.consume_token(&Token::Comma) {
-                break;
+            if matches!(
+                operations.last(),
+                Some(AlterTableOperation::SetOptionsParens {
+                    options: AlterTableSetOperation::MySqlEngineAttribute { .. }
+                })
+            ) && (self.peek_keyword(Keyword::ENGINE_ATTRIBUTE)
+                || self.peek_keyword(Keyword::SECONDARY_ENGINE_ATTRIBUTE))
+            {
+                continue;
             }
+            if self.consume_token(&Token::Comma) {
+                if self.dialect.supports_alter_table_partition_tail()
+                    && (self.peek_mysql_words(&["PARTITION", "BY"])
+                        || self.peek_mysql_words(&["REMOVE", "PARTITIONING"]))
+                {
+                    return self.expected_ref(
+                        "a partition tail without a preceding comma",
+                        self.peek_token_ref(),
+                    );
+                }
+                continue;
+            }
+            if self.dialect.supports_alter_table_partition_tail()
+                && (self.peek_mysql_words(&["PARTITION", "BY"])
+                    || self.peek_mysql_words(&["REMOVE", "PARTITIONING"]))
+            {
+                operations.push(self.parse_alter_table_operation()?);
+                if !matches!(self.peek_token_ref().token, Token::EOF | Token::SemiColon) {
+                    return self.expected_ref(
+                        "end of ALTER TABLE after the partition tail",
+                        self.peek_token_ref(),
+                    );
+                }
+            }
+            break;
+        }
+
+        if self.dialect.supports_alter_table_partition_tail()
+            && operations.iter().any(|operation| matches!(operation,
+                AlterTableOperation::SetOptionsParens {
+                    options: AlterTableSetOperation::MySqlPartition(maintenance),
+                } if !matches!(maintenance, MySqlPartitionMaintenance::PartitionBy(_) | MySqlPartitionMaintenance::RemovePartitioning)))
+            && (comment.is_some()
+                || operations.iter().filter(|operation| matches!(operation,
+                    AlterTableOperation::SetOptionsParens {
+                        options: AlterTableSetOperation::MySqlPartition(_),
+                    })).count() != 1
+                || operations.iter().any(|operation| !matches!(operation,
+                    AlterTableOperation::Algorithm { .. } | AlterTableOperation::Lock { .. }
+                    | AlterTableOperation::SetOptionsParens { options: AlterTableSetOperation::MySqlPartition(_) }))
+                || !matches!(operations.last(), Some(AlterTableOperation::SetOptionsParens {
+                    options: AlterTableSetOperation::MySqlPartition(_),
+                })))
+        {
+            return self.expected_ref("standalone partition maintenance after ALGORITHM/LOCK modifiers", self.peek_token_ref());
         }
 
         let mut location = None;
@@ -16050,6 +16346,100 @@ impl<'a> Parser<'a> {
             .map_err(ParserError::from)
     }
 
+    fn parse_mysql_json_attribute(&mut self) -> Result<ValueWithSpan, ParserError> {
+        self.parse_mysql_system_value(true)
+    }
+
+    // Both reductions retain the existing MySqlText System entity. Only JSON
+    // requests SAX here; COMMENT waits for its real DDL receiver's validation.
+    fn parse_mysql_system_value(
+        &mut self,
+        json_attribute: bool,
+    ) -> Result<ValueWithSpan, ParserError> {
+        let span = self.peek_token_ref().span;
+        match &self.peek_token_ref().token {
+            Token::MySqlText(text)
+                if text.segments().len() == 1
+                    && text.introducer().is_none()
+                    && text.binary_literal().is_none() =>
+            {
+                let raw = self.tokens.raw().ok_or_else(|| {
+                    ParserError::ParserError("JSON attribute lost its native Source".into())
+                })?;
+                // The copied single segment charset and its replacement coexist;
+                // retain the same receiving loan through the existing semantic
+                // owner. Admission precedes the actual copy/Arc allocations.
+                let capacity = SqlSourceOwner::owner_allocation_bytes()
+                    .checked_add(text.charset().len())
+                    .and_then(|n| n.checked_add("utf8mb3".len()))
+                    .and_then(|n| {
+                        n.checked_add(
+                            core::mem::size_of::<(SqlSourceAdmission, SqlSourceAdmission)>(),
+                        )
+                    })
+                    .and_then(|n| n.checked_add(2 * core::mem::size_of::<usize>()))
+                    .ok_or_else(|| {
+                        ParserError::ParserError("System semantic allocation overflow".into())
+                    })?;
+                let header = raw.cursor.borrow().admit_source(capacity)?;
+                let expected = raw
+                    .cursor
+                    .borrow()
+                    .source()
+                    .owner()
+                    .cloned()
+                    .ok_or_else(|| ParserError::ParserError("System Source is detached".into()))?;
+                let mut text = text.clone().with_role(MySqlTextRole::System);
+                self.advance_token();
+                let raw = self.tokens.raw().ok_or_else(|| {
+                    ParserError::ParserError("JSON attribute lost its native Source".into())
+                })?;
+                let (bytes, admission) = if json_attribute {
+                    raw.cursor
+                        .borrow_mut()
+                        .json_attribute(&text)
+                        .map_err(ParserError::from)?
+                } else {
+                    raw.cursor
+                        .borrow_mut()
+                        .system_text_value(&text)
+                        .map_err(ParserError::from)?
+                };
+                let length = bytes.len();
+                #[cfg(feature = "std")]
+                let admission = SqlSourceAdmission::new(std::sync::Arc::new((admission, header)));
+                #[cfg(not(feature = "std"))]
+                let admission = {
+                    // Existing no-std admission token has no runtime guard.
+                    // No-std source constructors keep that original contract.
+                    drop(header);
+                    admission
+                };
+                let owner = SqlSourceOwner::adopt(bytes, admission);
+                text.bind_system(
+                    owner
+                        .occurrence(0..length)
+                        .map_err(ParserError::ParserError)?,
+                    &expected,
+                )
+                .map_err(ParserError::ParserError)?;
+                Ok(Value::MySqlText(text).with_span(span))
+            }
+            Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+                if self.tokens.raw().is_none() =>
+            {
+                // Portable UTF8 syntax is data, not native Source issuance.
+                match self.next_token().token {
+                    Token::SingleQuotedString(value) | Token::DoubleQuotedString(value) => {
+                        Ok(Value::SingleQuotedString(value).with_span(span))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => self.expected("one TEXT_STRING_sys value", self.peek_token()),
+        }
+    }
+
     /// Consume an already issued single native text token in the actual
     /// connection-byte domain, retaining its original adapter admission.
     /// This does not accept rendered strings or decoded/foreign Source facts.
@@ -16832,6 +17222,114 @@ impl<'a> Parser<'a> {
             parser.dialect.is_select_item_alias(explicit, kw, parser)
         }
         self.parse_optional_alias_inner(None, validator)
+    }
+
+    // Native SELECT aliases keep one accepted system-byte semantic owner.
+    // Quoted TEXT_STRING_validated and already accepted IDENT_sys Word values
+    // use different real frontiers; neither goes through an invented Ident.
+    fn mysql_projection_alias(&mut self, explicit: bool) -> Result<Option<MySqlText>, ParserError> {
+        let quoted = match &self.peek_token_ref().token {
+            Token::MySqlText(_) => true,
+            Token::Word(word) => {
+                let keyword = word.keyword;
+                if !self.dialect.is_select_item_alias(explicit, &keyword, self) {
+                    if explicit {
+                        return self.expected("an identifier after AS", self.peek_token());
+                    }
+                    return Ok(None);
+                }
+                false
+            }
+            _ => {
+                if explicit {
+                    return self.expected("an identifier after AS", self.peek_token());
+                }
+                return Ok(None);
+            }
+        };
+        // Advance without cloning Word/String. Its original accepted value is
+        // borrowed below and the sole alias copy is admitted before allocation.
+        self.advance_token();
+        let raw = self
+            .tokens
+            .raw()
+            .ok_or_else(|| ParserError::ParserError("alias lost its native Source".into()))?;
+        let token = raw
+            .get(self.get_current_index())
+            .ok_or_else(|| ParserError::ParserError("alias lost its actual token".into()))?;
+        let text = if quoted {
+            let Token::MySqlText(text) = &token.token.token else {
+                return Err(ParserError::ParserError(
+                    "quoted alias changed its token".into(),
+                ));
+            };
+            text
+        } else {
+            token.identifier_text.as_ref().ok_or_else(|| {
+                ParserError::ParserError("IDENT alias lost its actual Source text".into())
+            })?
+        };
+        if text.segments().len() != 1
+            || text.introducer().is_some()
+            || text.binary_literal().is_some()
+        {
+            return Err(ParserError::ParserError(
+                "alias requires one unintroduced native token".into(),
+            ));
+        }
+        let accepted_word = if quoted {
+            None
+        } else {
+            let Token::Word(word) = &token.token.token else {
+                return Err(ParserError::ParserError(
+                    "IDENT alias changed its token".into(),
+                ));
+            };
+            Some(word.value.as_bytes())
+        };
+        let capacity = SqlSourceOwner::owner_allocation_bytes()
+            .checked_add(text.charset().len())
+            .and_then(|bytes| bytes.checked_add("utf8mb3".len()))
+            .and_then(|bytes| bytes.checked_add(accepted_word.map_or(0, <[u8]>::len)))
+            .and_then(|bytes| {
+                bytes.checked_add(core::mem::size_of::<(SqlSourceAdmission, SqlSourceAdmission)>())
+            })
+            .and_then(|bytes| bytes.checked_add(2 * core::mem::size_of::<usize>()))
+            .ok_or_else(|| ParserError::ParserError("output alias capacity overflow".into()))?;
+        let header = raw.cursor.borrow().admit(capacity)?;
+        let expected = raw
+            .cursor
+            .borrow()
+            .source()
+            .owner()
+            .cloned()
+            .ok_or_else(|| ParserError::ParserError("output alias Source is detached".into()))?;
+        let mut text = text.clone().with_role(MySqlTextRole::Alias);
+        let (bytes, admission) = match accepted_word {
+            Some(bytes) => (bytes.to_vec(), header.clone()),
+            None => raw
+                .cursor
+                .borrow_mut()
+                .projection_alias_text(&text)
+                .map_err(ParserError::from)?,
+        };
+        let length = bytes.len();
+        #[cfg(feature = "std")]
+        let admission = SqlSourceAdmission::new(std::sync::Arc::new((admission, header)));
+        #[cfg(not(feature = "std"))]
+        let admission = {
+            drop(header);
+            admission
+        };
+        let owner = SqlSourceOwner::adopt(bytes, admission);
+        text.bind_alias_system(
+            owner
+                .occurrence(0..length)
+                .map_err(ParserError::ParserError)?,
+            &expected,
+        )
+        .map_err(ParserError::ParserError)?;
+        Ok(Some(text))
     }
 
     /// Optionally parses an alias for a table like in `... FROM generate_series(1, 10) AS t (col)`.
@@ -18174,10 +18672,49 @@ impl<'a> Parser<'a> {
             }
         }
 
+        if self.dialect.supports_explain_for_connection()
+            && !verbose
+            && !query_plan
+            && !estimate
+            && options.is_none()
+            && self.parse_keyword(Keyword::FOR)
+        {
+            self.expect_keyword(Keyword::CONNECTION)?;
+            let target = self.next_token();
+            let connection_id = match &target.token {
+                Token::Number(value, _) => Self::parse::<u64>(value.clone(), target.span.start)?,
+                Token::MySqlHexStringLiteral(value, MySqlHexLiteralKind::HexNumber) => {
+                    // Pinned sql_yacc.yy real_ulong_num uses my_strtoll,
+                    // i.e. signed strtoll(base16) with ignored ERANGE. Positive
+                    // HEX_NUM overflow saturates LLONG_MAX before uint32 THD
+                    // conversion; decimal ULONG_LONG_NUM has a different rule.
+                    match i64::from_str_radix(value, 16) {
+                        Ok(value) => value as u64,
+                        Err(error) if *error.kind() == core::num::IntErrorKind::PosOverflow => {
+                            i64::MAX as u64
+                        }
+                        Err(_) => {
+                            return self
+                                .expected("literal hexadecimal connection identifier", target);
+                        }
+                    }
+                }
+                _ => return self.expected("literal unsigned connection identifier", target),
+            };
+            return Ok(Statement::ExplainForConnection {
+                describe_alias,
+                connection_id,
+                analyze,
+                format,
+            });
+        }
+
         match self.maybe_parse(|parser| parser.parse_statement())? {
-            Some(Statement::Explain { .. }) | Some(Statement::ExplainTable { .. }) => Err(
-                ParserError::ParserError("Explain must be root of the plan".to_string()),
-            ),
+            Some(Statement::ExplainForConnection { .. })
+            | Some(Statement::Explain { .. })
+            | Some(Statement::ExplainTable { .. }) => Err(ParserError::ParserError(
+                "Explain must be root of the plan".to_string(),
+            )),
             Some(statement)
                 if dialect_of!(self is MySqlDialect)
                     && !matches!(
@@ -23697,28 +24234,7 @@ impl<'a> Parser<'a> {
                 let (source_occurrence, cpp_piece_range) =
                     self.mysql_source_range(source_start, expression_end)?;
                 let explicit = self.parse_keyword(Keyword::AS);
-                let alias = if let Token::MySqlText(text) = &self.peek_token_ref().token {
-                    let text = text.clone();
-                    self.advance_token();
-                    Some(text.with_role(MySqlTextRole::Alias))
-                } else {
-                    if explicit {
-                        self.prev_token();
-                    }
-                    let identifier = self.maybe_parse_select_item_alias()?;
-                    if identifier.is_some() {
-                        let raw = self.tokens.raw().expect("raw projection");
-                        raw.get(self.get_current_index())
-                            .and_then(|token| token.identifier_text.clone())
-                            .ok_or_else(|| {
-                                ParserError::ParserError("alias has no native source text".into())
-                            })?
-                            .with_role(MySqlTextRole::Alias)
-                            .into()
-                    } else {
-                        None
-                    }
-                };
+                let alias = self.mysql_projection_alias(explicit)?;
                 Ok(SelectItem::MySqlProjection {
                     expr: maybe_prefixed_expr(expr, prefix),
                     alias,
@@ -26460,7 +26976,7 @@ mod tests {
     mod postgres_procedure;
     mod postgres_table_definition;
 
-    use crate::test_utils::{TestedDialects, all_dialects};
+    use crate::test_utils::{all_dialects, TestedDialects};
 
     use super::*;
 
@@ -27249,13 +27765,11 @@ mod tests {
             Parser::parse_sql(&MySqlDialect {}, nulls).unwrap()[0].to_string(),
             nulls
         );
-        assert!(
-            Parser::parse_sql(
-                &MySqlDialect {},
-                "SELECT JSON_VALUE(document, '$' NULL ON EMPTY ERROR ON EMPTY)"
-            )
-            .is_err()
-        );
+        assert!(Parser::parse_sql(
+            &MySqlDialect {},
+            "SELECT JSON_VALUE(document, '$' NULL ON EMPTY ERROR ON EMPTY)"
+        )
+        .is_err());
     }
 
     #[test]

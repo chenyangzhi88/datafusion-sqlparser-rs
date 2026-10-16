@@ -50,7 +50,7 @@ use crate::dialect::{
     BigQueryDialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
     SnowflakeDialect,
 };
-use crate::keywords::{ALL_KEYWORDS, ALL_KEYWORDS_INDEX, Keyword};
+use crate::keywords::{Keyword, ALL_KEYWORDS, ALL_KEYWORDS_INDEX};
 use crate::{
     ast::{
         DollarQuotedString, MySqlText, QuoteDelimitedString, SqlCppPiece, SqlCppPieceRange,
@@ -844,6 +844,12 @@ pub enum MySqlSourceErrorKind {
     Cancelled,
     /// The original armed deadline expired.
     DeadlineExceeded,
+    /// Actual json_attribute syntax failure, before DDL contextualization.
+    InvalidJsonAttribute,
+    /// Actual native depth failure; the first status is3157, not3980.
+    JsonAttributeDepth,
+    /// Actual cross-charset TEXT_STRING_validated conversion failure3854.
+    CharacterConversionFailed,
 }
 
 /// The one error value carried from native source services to the parser.
@@ -1400,6 +1406,37 @@ pub trait MySqlSourceAdapter {
         &self,
         text: &MySqlText,
     ) -> Result<(String, SqlSourceAdmission), MySqlSourceError>;
+    /// Borrow the genuine single TEXT_STRING_sys conversion as bytes. A
+    /// native grammar receiver retains this same admission until its late
+    /// validation; a foreign adapter must not invent System issuance.
+    fn system_text_value(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), MySqlSourceError> {
+        Err("System value requires the actual native Source service".into())
+    }
+    /// One actual quoted output-alias TEXT_STRING_validated reduction, with
+    /// its original admission on success or a native fatal condition.
+    fn projection_alias_text(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (MySqlSourceError, Option<SqlSourceAdmission>)> {
+        Err((
+            "output alias requires the actual validated Source service".into(),
+            None,
+        ))
+    }
+    /// The genuine single TEXT_STRING_sys JSON reduction. The original
+    /// System carrier retains every byte; a foreign adapter has no issuer.
+    fn json_attribute(
+        &self,
+        _text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (MySqlSourceError, Option<SqlSourceAdmission>)> {
+        Err((
+            "JSON attribute requires the actual native Source service".into(),
+            None,
+        ))
+    }
     /// Native TEXT_STRING_literal conversion into the captured connection
     /// character domain. Unlike TEXT_STRING_sys, its result is raw bytes and
     /// need not be representable as UTF-8. The actual adapter admits before
@@ -1465,6 +1502,7 @@ struct MySqlByteState<'a> {
 enum MySqlCursorFailure {
     Source(MySqlSourceError),
     Tokenizer(TokenizerError),
+    Admitted(TokenizerError, SqlSourceAdmission),
 }
 
 impl MySqlCursorFailure {
@@ -1472,6 +1510,7 @@ impl MySqlCursorFailure {
         match self {
             Self::Source(error) => &error.message,
             Self::Tokenizer(error) => &error.message,
+            Self::Admitted(error, _) => &error.message,
         }
     }
 }
@@ -1522,6 +1561,14 @@ impl MySqlByteState<'_> {
         let mut first = self.error.borrow_mut();
         let selected = match first.as_ref() {
             Some(MySqlCursorFailure::Tokenizer(original)) => return original.clone(),
+            Some(MySqlCursorFailure::Admitted(_, _)) => {
+                // The admitted fatal JSON branch has a distinct inline loan
+                // handback below. Ordinary cursor recovery cannot discard it.
+                return TokenizerError::source(
+                    "terminal Source condition requires its admitted handback".into(),
+                    error.location,
+                );
+            }
             Some(MySqlCursorFailure::Source(original)) => {
                 TokenizerError::source(original.clone(), error.location)
             }
@@ -1533,6 +1580,12 @@ impl MySqlByteState<'_> {
     fn first_error(&self, location: Location) -> Option<TokenizerError> {
         let selected = match self.error.borrow().as_ref() {
             Some(MySqlCursorFailure::Tokenizer(original)) => return Some(original.clone()),
+            Some(MySqlCursorFailure::Admitted(_, _)) => {
+                return Some(TokenizerError::source(
+                    "terminal Source condition requires its admitted handback".into(),
+                    location,
+                ));
+            }
             Some(MySqlCursorFailure::Source(original)) => {
                 TokenizerError::source(original.clone(), location)
             }
@@ -3660,6 +3713,90 @@ impl<'a> MySqlTokenCursor<'a> {
         raw.retain_admission(admission)
             .map_err(|message| raw.token_error(message, location))?;
         Ok(value)
+    }
+
+    pub(crate) fn system_text_value(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), TokenizerError> {
+        let location = self.state.location();
+        let raw = self.state.raw.as_mut().expect("raw cursor");
+        if let Some(error) = raw.first_error(location) {
+            return Err(error);
+        }
+        let (value, admission) = raw
+            .adapter
+            .system_text_value(text)
+            .map_err(|error| raw.record_error(TokenizerError::source(error, location)))?;
+        raw.retain_admission(admission.clone())
+            .map_err(|message| raw.token_error(message, location))?;
+        Ok((value, admission))
+    }
+
+    pub(crate) fn json_attribute(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        self.admitted_system_text(text, true)
+    }
+
+    pub(crate) fn projection_alias_text(
+        &mut self,
+        text: &MySqlText,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        self.admitted_system_text(text, false)
+    }
+
+    fn admitted_system_text(
+        &mut self,
+        text: &MySqlText,
+        json_attribute: bool,
+    ) -> Result<(Vec<u8>, SqlSourceAdmission), (TokenizerError, Option<SqlSourceAdmission>)> {
+        let location = self.state.location();
+        let raw = self.state.raw.as_mut().expect("raw cursor");
+        if let Some(MySqlCursorFailure::Admitted(original, _)) = raw.error.borrow().as_ref() {
+            let admission = raw
+                .adapter
+                .admit(original.message.len())
+                .map_err(|error| (TokenizerError::source(error, location), None))?;
+            return Err((original.clone(), Some(admission)));
+        }
+        if let Some(error) = raw.first_error(location) {
+            return Err((error, None));
+        }
+        let result = if json_attribute {
+            raw.adapter.json_attribute(text)
+        } else {
+            raw.adapter.projection_alias_text(text)
+        };
+        let (value, admission) = match result {
+            Ok(value) => value,
+            Err((error, Some(admission))) => {
+                let error = TokenizerError::source(error, location);
+                // The original first-error slot owns its own actual String
+                // copy. Admit before Clone; do not share the returning copy's
+                // grant as if it paid two allocations.
+                let copy = match raw.adapter.admit(error.message.len()) {
+                    Ok(copy) => copy,
+                    Err(refusal) => {
+                        *raw.error.borrow_mut() =
+                            Some(MySqlCursorFailure::Admitted(error, admission));
+                        return Err((TokenizerError::source(refusal, location), None));
+                    }
+                };
+                *raw.error.borrow_mut() = Some(MySqlCursorFailure::Admitted(error.clone(), copy));
+                return Err((error, Some(admission)));
+            }
+            Err((error, None)) => {
+                return Err((
+                    raw.record_error(TokenizerError::source(error, location)),
+                    None,
+                ));
+            }
+        };
+        raw.retain_admission(admission.clone())
+            .map_err(|message| (raw.token_error(message, location), None))?;
+        Ok((value, admission))
     }
 
     /// Borrows the same actual token Source and connection-domain adapter.
@@ -6316,7 +6453,11 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
 
     #[inline]
     fn check_null(c: char) -> Option<char> {
-        if c == '\0' { None } else { Some(c) }
+        if c == '\0' {
+            None
+        } else {
+            Some(c)
+        }
     }
 
     #[inline]
@@ -6326,7 +6467,11 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
             Err(_) => None,
             Ok(n) => {
                 let n = n & 0xFF;
-                if n <= 127 { char::from_u32(n) } else { None }
+                if n <= 127 {
+                    char::from_u32(n)
+                } else {
+                    None
+                }
             }
         }
     }

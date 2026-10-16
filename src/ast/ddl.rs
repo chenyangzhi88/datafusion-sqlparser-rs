@@ -36,6 +36,11 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::value::escape_single_quote_string;
 use crate::ast::{
+    display_comma_separated, display_separated,
+    table_constraints::{
+        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
+        UniqueConstraint,
+    },
     AttachedToken, BeginEndStatements, CommentDef, ConditionalStatements, CreateFunctionBody,
     CreateFunctionUsing, CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr,
     FileFormat, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
@@ -45,12 +50,7 @@ use crate::ast::{
     OrderByExpr, ProjectionSelect, Query, RefreshModeKind, ResetConfig, RowAccessPolicy,
     SequenceOptions, Spanned, SqlOption, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod,
-    TriggerReferencing, Value, ValueWithSpan, WrappedCollection, display_comma_separated,
-    display_separated,
-    table_constraints::{
-        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
-        UniqueConstraint,
-    },
+    TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
 };
 use crate::display_utils::{Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
@@ -664,6 +664,13 @@ impl fmt::Display for MySqlPartitionMaintenance {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterTableSetOperation {
+    /// The original native table option, not portable SET(...) syntax.
+    MySqlEngineAttribute {
+        /// Whether this declares SECONDARY_ENGINE_ATTRIBUTE rather than ENGINE_ATTRIBUTE.
+        secondary: bool,
+        /// Original System value and Source; receiving object owns later normalization.
+        value: ValueWithSpan,
+    },
     /// Portable `SET (...)` options.
     Options(Vec<SqlOption>),
     /// MySQL table defaults changed without rewriting existing character data.
@@ -698,6 +705,11 @@ impl AlterTableSetOperation {
 impl fmt::Display for AlterTableSetOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MySqlEngineAttribute { secondary, value } => write!(
+                f,
+                "{}ENGINE_ATTRIBUTE={value}",
+                if *secondary { "SECONDARY_" } else { "" }
+            ),
             Self::Options(options) => {
                 write!(f, "SET ({})", display_comma_separated(options))
             }
@@ -816,6 +828,25 @@ pub enum AlterTableOperation {
         name: Ident,
         /// Optional drop behavior (`CASCADE`/`RESTRICT`).
         drop_behavior: Option<DropBehavior>,
+    },
+    /// MySQL's type-specific CHECK operation, not generic CONSTRAINT.
+    DropCheck {
+        /// Name of the CHECK constraint to drop.
+        name: Ident,
+    },
+    /// `ALTER CHECK <name> [NOT] ENFORCED` (MySQL).
+    AlterCheck {
+        /// Name of the CHECK constraint whose enforcement is changed.
+        name: Ident,
+        /// `true` for `ENFORCED`; `false` for `NOT ENFORCED`.
+        enforced: bool,
+    },
+    /// `ALTER CONSTRAINT <name> [NOT] ENFORCED` (MySQL).
+    AlterConstraintEnforcement {
+        /// Constraint name whose SQL kind is resolved during semantic binding.
+        name: Ident,
+        /// `true` for `ENFORCED`; `false` for `NOT ENFORCED`.
+        enforced: bool,
     },
     /// `DROP [ COLUMN ] [ IF EXISTS ] <column_name> [ , <column_name>, ... ] [ CASCADE ]`
     DropColumn {
@@ -1449,6 +1480,17 @@ impl fmt::Display for AlterTableOperation {
                 }
                 Ok(())
             }
+            AlterTableOperation::DropCheck { name } => write!(f, "DROP CHECK {name}"),
+            AlterTableOperation::AlterCheck { name, enforced } => write!(
+                f,
+                "ALTER CHECK {name} {}ENFORCED",
+                if *enforced { "" } else { "NOT " }
+            ),
+            AlterTableOperation::AlterConstraintEnforcement { name, enforced } => write!(
+                f,
+                "ALTER CONSTRAINT {name} {}ENFORCED",
+                if *enforced { "" } else { "NOT " }
+            ),
             AlterTableOperation::DropPrimaryKey { drop_behavior } => {
                 write!(f, "DROP PRIMARY KEY")?;
                 if let Some(drop_behavior) = drop_behavior {
@@ -2141,12 +2183,22 @@ impl fmt::Display for IndexType {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum IndexOption {
+    /// Native JSON declaration metadata, not storage engine capability.
+    EngineAttribute {
+        /// Whether this declares SECONDARY_ENGINE_ATTRIBUTE rather than ENGINE_ATTRIBUTE.
+        secondary: bool,
+        /// Original System value and Source; receiving object owns later normalization.
+        value: ValueWithSpan,
+    },
     /// `USING { BTREE | HASH }`: Index type to use for the index.
     ///
     /// Note that we permissively parse non-MySQL index types, like `GIN`.
     Using(IndexType),
-    /// `COMMENT 'string'`: Specifies a comment for the index.
+    /// `COMMENT 'string'`: Specifies a portable UTF8 comment for the index.
     Comment(String),
+    /// Original native System comment. Validation belongs to the late DDL
+    /// receiver, not the Source lexer or JSON attribute reduction.
+    MySqlComment(MySqlText),
     /// `WITH PARSER parser_name`: MySQL FULLTEXT parser selection.
     Parser(Ident),
     /// MySQL optimizer visibility. Invisible indexes remain maintained and
@@ -2157,8 +2209,14 @@ pub enum IndexOption {
 impl fmt::Display for IndexOption {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::EngineAttribute { secondary, value } => write!(
+                f,
+                "{}ENGINE_ATTRIBUTE={value}",
+                if *secondary { "SECONDARY_" } else { "" }
+            ),
             Self::Using(index_type) => write!(f, "USING {index_type}"),
             Self::Comment(s) => write!(f, "COMMENT '{s}'"),
+            Self::MySqlComment(text) => write!(f, "COMMENT {text}"),
             Self::Parser(parser) => write!(f, "WITH PARSER {parser}"),
             Self::Visibility(true) => write!(f, "VISIBLE"),
             Self::Visibility(false) => write!(f, "INVISIBLE"),
@@ -2697,6 +2755,13 @@ impl fmt::Display for TagsColumnOption {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum ColumnOption {
+    /// The completed single TEXT_STRING_sys engine JSON declaration.
+    EngineAttribute {
+        /// Whether this declares SECONDARY_ENGINE_ATTRIBUTE rather than ENGINE_ATTRIBUTE.
+        secondary: bool,
+        /// Original System value and Source; receiving object owns later normalization.
+        value: ValueWithSpan,
+    },
     /// `NULL`
     Null,
     /// `NOT NULL`
@@ -2842,6 +2907,11 @@ impl fmt::Display for ColumnOption {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use ColumnOption::*;
         match self {
+            EngineAttribute { secondary, value } => write!(
+                f,
+                "{}ENGINE_ATTRIBUTE={value}",
+                if *secondary { "SECONDARY_" } else { "" }
+            ),
             Null => write!(f, "NULL"),
             NotNull => write!(f, "NOT NULL"),
             Default(expr) => write!(f, "DEFAULT {expr}"),
@@ -3088,7 +3158,11 @@ impl ConstraintCharacteristics {
     fn enforced_text(&self) -> Option<&'static str> {
         self.enforced.map(
             |enforced| {
-                if enforced { "ENFORCED" } else { "NOT ENFORCED" }
+                if enforced {
+                    "ENFORCED"
+                } else {
+                    "NOT ENFORCED"
+                }
             },
         )
     }
@@ -3722,6 +3796,27 @@ pub enum CreateTableElement {
     Like(crate::ast::CreateTableLike),
 }
 
+/// Explicit MySQL CREATE TABLE query duplicate-row treatment. Omission
+/// retains ERROR; this never means replacement of an existing table.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum MySqlCreateTableDuplicate {
+    /// Skip a duplicate row and emit its original duplicate-key warning.
+    Ignore,
+    /// Delete conflicting rows, then insert the incoming row.
+    Replace,
+}
+
+impl fmt::Display for MySqlCreateTableDuplicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ignore => "IGNORE",
+            Self::Replace => "REPLACE",
+        })
+    }
+}
+
 /// CREATE TABLE statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -3768,6 +3863,8 @@ pub struct CreateTable {
     pub location: Option<String>,
     /// Query used to populate the table
     pub query: Option<Box<Query>>,
+    /// MySQL query-row duplicate treatment before `[AS] query`; None is ERROR.
+    pub mysql_on_duplicate: Option<MySqlCreateTableDuplicate>,
     /// If the table should be created without a rowid (SQLite)
     pub without_rowid: bool,
     /// `LIKE` clause
@@ -3901,6 +3998,9 @@ impl CreateTable {
     /// kind's canonical vector retains its declaration order: no allocation,
     /// duplicate definitions, omitted owners, or guessed name matching.
     pub fn validate_source_order(&self) -> Result<(), &'static str> {
+        if self.mysql_on_duplicate.is_some() && (self.query.is_none() || self.like.is_some()) {
+            return Err("CREATE TABLE duplicate treatment requires its query");
+        }
         Self::validate_definition_order(
             &self.elements,
             self.columns.len(),
@@ -4335,6 +4435,7 @@ impl fmt::Display for CreateTable {
         }
 
         match &self.table_options {
+            CreateTableOptions::Plain(options) if options.is_empty() => (),
             options @ CreateTableOptions::With(_)
             | options @ CreateTableOptions::Plain(_)
             | options @ CreateTableOptions::TableProperties(_) => write!(f, " {options}")?,
@@ -4485,6 +4586,9 @@ impl fmt::Display for CreateTable {
         if let Some(query) = &self.query {
             if let Some(partitioning) = &self.mysql_partitioning {
                 write!(f, " {partitioning}")?;
+            }
+            if let Some(duplicate) = &self.mysql_on_duplicate {
+                write!(f, " {duplicate}")?;
             }
             write!(f, " AS {query}")?;
         } else if let Some(partitioning) = &self.mysql_partitioning {
@@ -5984,12 +6088,31 @@ impl fmt::Display for AlterTable {
         if let Some(cluster) = &self.on_cluster {
             write!(f, "ON CLUSTER {cluster} ")?;
         }
-        write!(f, "{}", display_comma_separated(&self.operations))?;
+        let (operations, partition_tail) = match self.operations.split_last() {
+            Some((
+                tail @ AlterTableOperation::SetOptionsParens {
+                    options:
+                        AlterTableSetOperation::MySqlPartition(
+                            MySqlPartitionMaintenance::PartitionBy(_)
+                            | MySqlPartitionMaintenance::RemovePartitioning,
+                        ),
+                },
+                operations,
+            )) => (operations, Some(tail)),
+            _ => (self.operations.as_slice(), None),
+        };
+        write!(f, "{}", display_comma_separated(operations))?;
         if let Some(comment) = &self.comment {
-            if !self.operations.is_empty() {
+            if !operations.is_empty() {
                 write!(f, ", ")?;
             }
             write!(f, "{comment}")?;
+        }
+        if let Some(tail) = partition_tail {
+            if !operations.is_empty() || self.comment.is_some() {
+                write!(f, " ")?;
+            }
+            write!(f, "{tail}")?;
         }
         if let Some(loc) = &self.location {
             write!(f, " {loc}")?

@@ -2070,3 +2070,57 @@ fn canonical_hint_keyword_mapping_keeps_fixed_lexical_identity() {
         "a default adapter has no true hint service; metadata lookup is not authority"
     );
 }
+
+#[test]
+fn json_attribute_source_kinds_are_typed_before_location_decoration_and_foreign_adapter_refuses() {
+    for (kind, expected) in [
+        (
+            MySqlSourceErrorKind::InvalidJsonAttribute,
+            crate::parser::ParserError::MySqlInvalidJsonAttribute(
+                "actual native reason".into(),
+                None,
+            ),
+        ),
+        (
+            MySqlSourceErrorKind::JsonAttributeDepth,
+            crate::parser::ParserError::MySqlJsonAttributeDepth(None),
+        ),
+    ] {
+        let error = TokenizerError {
+            message: "actual native reason".into(),
+            location: Location::new(9, 17),
+            source_kind: kind,
+        };
+        assert_eq!(crate::parser::ParserError::from(error), expected);
+    }
+    let dialect = crate::dialect::MySqlDialect {};
+    let facts = first_error_facts();
+    let input = b"'{}'";
+    let owner = SqlSourceOwner::adopt(input.to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    let mut cursor = MySqlTokenCursor::new(
+        &dialect,
+        owner.occurrence(0..input.len()).unwrap(),
+        &facts,
+        None,
+    )
+    .unwrap();
+    let Token::MySqlText(text) = cursor.next_token().unwrap().unwrap().token.token else {
+        panic!("actual text")
+    };
+    let consumed = cursor.consumed();
+    let error = cursor
+        .json_attribute(&text.with_role(crate::ast::MySqlTextRole::System))
+        .unwrap_err();
+    assert_eq!(error.0.source_kind, MySqlSourceErrorKind::Message);
+    assert!(error.0.message.contains("actual native Source service"));
+    assert!(
+        error.1.is_none(),
+        "foreign refusal does not issue a Source grant"
+    );
+    assert_eq!(
+        cursor.consumed(),
+        consumed,
+        "no hidden suffix lex/second cursor"
+    );
+    let _ = owner.bytes();
+}

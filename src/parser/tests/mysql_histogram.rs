@@ -58,24 +58,49 @@ fn analyze_modifiers_and_table_synonym_share_the_typed_histogram_action() {
         "ANALYZE TABLE t LOCAL",
         "ANALYZE NO_WRITE_TO_BINLOG t",
         "CHECK LOCAL TABLE t",
-        "OPTIMIZE LOCAL TABLE t",
-        "REPAIR NO_WRITE_TO_BINLOG TABLE t",
-        "CHECK TABLES t",
-        "OPTIMIZE TABLES t",
-        "REPAIR TABLES t",
+        "OPTIMIZE LOCAL NO_WRITE_TO_BINLOG TABLE t",
+        "REPAIR NO_WRITE_TO_BINLOG LOCAL TABLE t",
     ] {
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
     }
-    for command in ["CHECK", "OPTIMIZE", "REPAIR"] {
-        let sql = format!("{command} TABLE t");
-        assert!(matches!(
-            Parser::parse_sql(&MySqlDialect {}, &sql).unwrap()[0],
-            Statement::MySqlTableMaintenance {
-                location: None,
-                histogram: None,
-                ..
+    // The pinned native grammar uses table_or_tables for all four commands,
+    // and opt_no_write_to_binlog for ANALYZE, OPTIMIZE and REPAIR, not CHECK.
+    for (command, operation) in [
+        ("CHECK", MySqlTableMaintenanceOperation::Check),
+        ("OPTIMIZE", MySqlTableMaintenanceOperation::Optimize),
+        ("REPAIR", MySqlTableMaintenanceOperation::Repair),
+    ] {
+        for (modifier, location) in [
+            ("", None),
+            ("LOCAL ", Some(FlushLocation::Local)),
+            ("NO_WRITE_TO_BINLOG ", Some(FlushLocation::NoWriteToBinlog)),
+        ] {
+            if operation == MySqlTableMaintenanceOperation::Check && location.is_some() {
+                continue;
             }
-        ));
+            for table_keyword in ["TABLE", "TABLES"] {
+                let sql = format!("{command} {modifier}{table_keyword} db.t,db.u");
+                let parsed = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap().remove(0);
+                assert!(
+                    matches!(
+                        &parsed,
+                        Statement::MySqlTableMaintenance {
+                            operation: actual_operation,
+                            location: actual_location,
+                            tables,
+                            histogram: None,
+                            ..
+                        } if *actual_operation == operation && *actual_location == location
+                            && tables.len() == 2
+                    ),
+                    "{sql}: {parsed:?}"
+                );
+                assert_eq!(
+                    Parser::parse_sql(&MySqlDialect {}, &parsed.to_string()).unwrap()[0],
+                    parsed
+                );
+            }
+        }
     }
 }
 

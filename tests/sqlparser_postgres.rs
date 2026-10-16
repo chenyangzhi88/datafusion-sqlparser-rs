@@ -6674,6 +6674,7 @@ fn parse_trigger_related_functions() {
             hive_formats: None,
             file_format: None,
             location: None,
+            mysql_on_duplicate: None,
             query: None,
             without_rowid: false,
             like: None,

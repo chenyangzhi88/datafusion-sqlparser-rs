@@ -83,8 +83,8 @@ pub use self::ddl::{
     FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters, IdentityProperty,
     IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder, IndexColumn,
     IndexOption, IndexType, KeyOrIndexDisplay, Msck, MySqlAlterTableComment,
-    MySqlExchangeValidation, MySqlKeyAlgorithm, MySqlPartitionBound, MySqlPartitionBy,
-    MySqlPartitionDefinition, MySqlPartitionMaintenance, MySqlPartitionMethod,
+    MySqlCreateTableDuplicate, MySqlExchangeValidation, MySqlKeyAlgorithm, MySqlPartitionBound,
+    MySqlPartitionBy, MySqlPartitionDefinition, MySqlPartitionMaintenance, MySqlPartitionMethod,
     MySqlPartitionOption, MySqlPartitionSelection, MySqlPartitionValues, MySqlProgramBody,
     MySqlSubpartitionBy, MySqlSubpartitionDefinition, MySqlSubpartitionMethod, NullsDistinctOption,
     OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem, OperatorFamilyItem,
@@ -131,10 +131,10 @@ pub use self::trigger::{
 };
 
 pub use self::value::{
-    DateTimeField, DollarQuotedString, MySqlProjectionLiteral, MySqlText, MySqlTextRole,
-    MySqlTextSegment, NormalizationForm, QuoteDelimitedString, SqlCppLedger, SqlCppPiece,
-    SqlCppPieceRange, SqlSourceAdmission, SqlSourceOccurrence, SqlSourceOwner, TrimWhereField,
-    Value, ValueWithSpan, escape_double_quote_string, escape_quoted_string,
+    escape_double_quote_string, escape_quoted_string, DateTimeField, DollarQuotedString,
+    MySqlProjectionLiteral, MySqlText, MySqlTextRole, MySqlTextSegment, NormalizationForm,
+    QuoteDelimitedString, SqlCppLedger, SqlCppPiece, SqlCppPieceRange, SqlSourceAdmission,
+    SqlSourceOccurrence, SqlSourceOwner, TrimWhereField, Value, ValueWithSpan,
 };
 
 use crate::ast::helpers::key_value_options::KeyValueOptions;
@@ -1196,6 +1196,10 @@ pub enum Expr {
         /// This changes the result collation to the target character set's
         /// binary collation without changing the result into a binary string.
         binary_attribute: bool,
+        /// MySQL CAST(... AS CHAR CHARACTER SET ... ARRAY), restricted to
+        /// functional-index declarations by the receiving application binder.
+        /// Ordinary CONVERT constructors always set this to false.
+        array: bool,
         /// `true` when target precedes the value (MSSQL syntax).
         target_before_value: bool,
         /// How to translate the expression.
@@ -2072,8 +2076,22 @@ impl fmt::Display for Expr {
                 data_type,
                 charset,
                 binary_attribute,
+                array,
                 styles,
             } => {
+                if *array {
+                    write!(f, "CAST({expr} AS ")?;
+                    if let Some(data_type) = data_type {
+                        write!(f, "{data_type}")?;
+                    }
+                    if let Some(charset) = charset {
+                        write!(f, " CHARACTER SET {charset}")?;
+                    }
+                    if *binary_attribute {
+                        write!(f, " BINARY")?;
+                    }
+                    return write!(f, " ARRAY)");
+                }
                 write!(f, "{}CONVERT(", if *is_try { "TRY_" } else { "" })?;
                 if let Some(data_type) = data_type {
                     if let Some(charset) = charset {
@@ -5094,6 +5112,18 @@ pub enum Statement {
         /// Postgres style utility options, `(analyze, verbose true)`
         options: Option<Vec<UtilityOption>>,
     },
+    /// MySQL's non-executing loan of another connection's current plan.
+    /// The connection identifier is a literal unsigned integer, not an expression.
+    ExplainForConnection {
+        /// Keyword spelling used to request the plan, such as EXPLAIN or DESC.
+        describe_alias: DescribeAlias,
+        /// Literal connection identifier before the server's thread-id conversion.
+        connection_id: u64,
+        /// Whether ANALYZE was spelled; the MySQL executor rejects this combination.
+        analyze: bool,
+        /// Optional TRADITIONAL, JSON, or TREE output format.
+        format: Option<AnalyzeFormatKind>,
+    },
     /// ```sql
     /// SAVEPOINT
     /// ```
@@ -5566,6 +5596,21 @@ impl fmt::Display for Statement {
                 }
 
                 write!(f, "{table_name}")
+            }
+            Statement::ExplainForConnection {
+                describe_alias,
+                connection_id,
+                analyze,
+                format,
+            } => {
+                write!(f, "{describe_alias} ")?;
+                if *analyze {
+                    write!(f, "ANALYZE ")?;
+                }
+                if let Some(format) = format {
+                    write!(f, "{format} ")?;
+                }
+                write!(f, "FOR CONNECTION {connection_id}")
             }
             Statement::Explain {
                 describe_alias,
@@ -12985,6 +13030,15 @@ pub struct OptimizerHint {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum MySqlHintDirective {
+    /// Original native derived-condition table/query-block policy.
+    DerivedConditionPushdown {
+        /// Optional initial query-block token; overrides per-table QB tokens.
+        query_block: Option<String>,
+        /// Original table tokens and their individual optional QB suffixes.
+        tables: Vec<(String, Option<String>)>,
+        /// Positive versus negative native hint switch.
+        enabled: bool,
+    },
     /// Native SET_VAR name and its already parsed literal Item.
     Variable(String, Expr),
     /// Native MAX_EXECUTION_TIME integer instruction.
@@ -12992,6 +13046,23 @@ pub enum MySqlHintDirective {
     /// Native first-valid name of the original query block. Copies borrow
     /// this same immutable spelling; it is not a query-block identifier issuer.
     QueryBlockName(String),
+    /// Native original subquery strategy hint; no query-block id is guessed.
+    Subquery {
+        /// Optional query-block name from the original `@` token.
+        query_block: Option<String>,
+        /// `true` selects MATERIALIZATION; `false` selects INTOEXISTS.
+        materialization: bool,
+    },
+    /// Native semijoin hint. Strategy bits are the original four native
+    /// strategies, not an execution algorithm or an optimizer plan.
+    Semijoin {
+        /// Optional query-block name from the original `@` token.
+        query_block: Option<String>,
+        /// `true` denotes SEMIJOIN; `false` denotes NO_SEMIJOIN.
+        enabled: bool,
+        /// Native strategy bitmask; zero means no strategy was explicitly named.
+        strategies: u32,
+    },
     /// Native table/index range instruction with its actual optional QB name.
     NoRangeOptimization {
         /// Actual optional QB name, from the original @ token.
@@ -13031,6 +13102,8 @@ pub enum OptimizerHintStyle {
         ansi_quotes: bool,
         /// Original consumer's immutable typed prefix, shared by cache/copies.
         directives: Arc<Vec<MySqlHintDirective>>,
+        /// Original program's pending relation/QB condition obligation.
+        resolve_conditions: bool,
         /// Reached grammar condition, already issued by the original Source.
         syntax: Arc<Vec<(usize, String)>>,
         /// Original Source budget leases for this immutable typed program.
@@ -13106,6 +13179,7 @@ impl Ord for OptimizerHintStyle {
                     directives: e,
                     syntax: f,
                     unsupported: g,
+                    resolve_conditions: p,
                     ..
                 },
                 S::MySqlBoundSource {
@@ -13116,9 +13190,10 @@ impl Ord for OptimizerHintStyle {
                     directives: l,
                     syntax: m,
                     unsupported: n,
+                    resolve_conditions: q,
                     ..
                 },
-            ) => (a, b, c, d, e, f, g).cmp(&(h, i, j, k, l, m, n)),
+            ) => (a, b, c, d, e, f, g, p).cmp(&(h, i, j, k, l, m, n, q)),
             (
                 S::MySqlNoRangeOptimization {
                     query_block_name: n,
@@ -13156,6 +13231,7 @@ impl core::hash::Hash for OptimizerHintStyle {
                 directives,
                 syntax,
                 unsupported,
+                resolve_conditions,
                 ..
             } => (
                 source,
@@ -13165,6 +13241,7 @@ impl core::hash::Hash for OptimizerHintStyle {
                 directives,
                 syntax,
                 unsupported,
+                resolve_conditions,
             )
                 .hash(state),
             Self::MySqlNoRangeOptimization {

@@ -226,3 +226,41 @@ fn json_table_literal_slots_visit_the_same_expr_owner_and_preserve_their_source_
         matches!(column.on_error.as_ref(),Some(JsonTableColumnErrorHandling::Default(Expr::Nested(value))) if matches!(value.as_ref(),Expr::Value(value) if matches!(&value.value,Value::SingleQuotedString(value) if value=="8")))
     );
 }
+#[test]
+fn derived_hint_bound_source_pending_fact_clone_hash_and_payload_are_logical_not_admission() {
+    use crate::ast::{MySqlHintDirective,OptimizerHintStyle,SqlSourceAdmission,SqlSourceOwner};
+    use std::{sync::Arc,hash::{Hash,Hasher}};
+    let owner = SqlSourceOwner::adopt(b"/*+ DERIVED_CONDITION_PUSHDOWN(@q d@other) */".to_vec(),
+        SqlSourceAdmission::new(Arc::new(())));
+    let source = owner.occurrence(0..owner.bytes().len()).unwrap();
+    let directives = Arc::new(vec![MySqlHintDirective::DerivedConditionPushdown {
+        query_block:Some("q".into()),tables:vec![("d".into(),Some("other".into()))],enabled:true,
+    }]);
+    let style = OptimizerHintStyle::MySqlBoundSource {
+        source:source.clone(),text:source,client_collation:33,ansi_quotes:false,
+        directives:Arc::clone(&directives),resolve_conditions:true,syntax:Arc::new(vec![]),
+        admission:Some(SqlSourceAdmission::new(Arc::new(()))),unsupported:None,
+    };
+    let clone = style.clone();
+    let OptimizerHintStyle::MySqlBoundSource {directives:borrowed,..} = &clone else {panic!("bound")};
+    assert!(Arc::ptr_eq(&directives,borrowed));
+    assert_eq!(clone,style);
+    let mut completed = clone;
+    let OptimizerHintStyle::MySqlBoundSource {resolve_conditions,admission,..} = &mut completed else {panic!("bound")};
+    *resolve_conditions=false;
+    *admission=None;
+    assert_ne!(completed,style,"one pending logical obligation belongs to the original program");
+    fn hash(value:&OptimizerHintStyle)->u64 {
+        let mut hasher=std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);hasher.finish()
+    }
+    assert_ne!(hash(&completed),hash(&style));
+    #[cfg(feature="serde")]
+    {
+        let detached: OptimizerHintStyle = serde_json::from_str(&serde_json::to_string(&style).unwrap()).unwrap();
+        let OptimizerHintStyle::MySqlBoundSource {source,admission,resolve_conditions,..}=detached else {panic!("bound")};
+        assert!(source.bytes().is_err());
+        assert!(admission.is_none());
+        assert!(resolve_conditions,"serialization copies logical facts but cannot reissue Source rights");
+    }
+}
