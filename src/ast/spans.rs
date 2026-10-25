@@ -502,7 +502,8 @@ impl Spanned for Statement {
                 .as_ref()
                 .map_or(Span::empty(), |database| database.span)
                 .union(&match filter {
-                    Some(super::ShowStatementFilter::Where(expression)) => expression.span(),
+                    Some(super::ShowStatementFilter::Where(expression)
+                        | super::ShowStatementFilter::MySqlLike(expression)) => expression.span(),
                     _ => Span::empty(),
                 }),
             Statement::ShowTables { .. } => Span::empty(),
@@ -1380,7 +1381,8 @@ impl Spanned for AlterTableOperation {
             } => {
                 union_spans(core::iter::once(col_name.span).chain(options.iter().map(|i| i.span())))
             }
-            AlterTableOperation::RenameConstraint { old_name, new_name } => {
+            AlterTableOperation::RenameIndex { old_name, new_name }
+            | AlterTableOperation::RenameConstraint { old_name, new_name } => {
                 old_name.span.union(&new_name.span)
             }
             AlterTableOperation::AlterColumn { column_name, op } => {

@@ -10569,6 +10569,9 @@ impl fmt::Display for TransactionModifier {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Filter forms usable in SHOW statements.
 pub enum ShowStatementFilter {
+    /// The original native TEXT_STRING_literal, bound by its Source owner.
+    /// Its connection character domain must not pass through system text.
+    MySqlLike(Expr),
     /// Filter using LIKE pattern.
     Like(String),
     /// Filter using ILIKE pattern.
@@ -10583,6 +10586,7 @@ impl fmt::Display for ShowStatementFilter {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use ShowStatementFilter::*;
         match self {
+            MySqlLike(pattern) => write!(f, "LIKE {pattern}"),
             Like(pattern) => write!(f, "LIKE '{}'", value::escape_single_quote_string(pattern)),
             ILike(pattern) => write!(f, "ILIKE {}", value::escape_single_quote_string(pattern)),
             Where(expr) => write!(f, "WHERE {expr}"),

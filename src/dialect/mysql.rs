@@ -146,6 +146,10 @@ impl Dialect for MySqlDialect {
         true
     }
 
+    fn supports_alter_table_rename_index(&self) -> bool {
+        true
+    }
+
     fn supports_alter_table_partition_tail(&self) -> bool {
         true
     }
@@ -298,7 +302,7 @@ impl Dialect for MySqlDialect {
         // MySQL permits END as an unquoted select-item alias. A stored-program
         // END is reached only after the statement delimiter, so accepting it
         // here does not consume a properly delimited block terminator.
-        *kw != Keyword::WINDOW
+        !self.is_reserved_for_identifier(*kw)
             && (*kw == Keyword::END || explicit || self.is_column_alias(kw, parser))
     }
 
@@ -341,6 +345,10 @@ impl Dialect for MySqlDialect {
 
     /// See: <https://dev.mysql.com/doc/refman/8.4/en/update.html>
     fn supports_update_order_by(&self) -> bool {
+        true
+    }
+
+    fn boolean_type_is_tinyint(&self) -> bool {
         true
     }
 
@@ -393,6 +401,10 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_check_constraint_enforcement(&self) -> bool {
         MySqlDialect {}.supports_check_constraint_enforcement()
+    }
+
+    fn supports_alter_table_rename_index(&self) -> bool {
+        MySqlDialect {}.supports_alter_table_rename_index()
     }
 
     fn supports_alter_table_partition_tail(&self) -> bool {
@@ -567,6 +579,10 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_update_order_by(&self) -> bool {
         MySqlDialect {}.supports_update_order_by()
+    }
+
+    fn boolean_type_is_tinyint(&self) -> bool {
+        MySqlDialect {}.boolean_type_is_tinyint()
     }
 
     fn supports_data_type_signed_suffix(&self) -> bool {

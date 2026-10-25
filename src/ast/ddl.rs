@@ -1072,6 +1072,14 @@ pub enum AlterTableOperation {
         /// MySQL-specific column position (`FIRST`/`AFTER`).
         column_position: Option<MySQLColumnPosition>,
     },
+    /// MySQL `RENAME { INDEX | KEY } old_name TO new_name`.
+    /// This renames the existing index; it does not declare a new one.
+    RenameIndex {
+        /// Existing index name.
+        old_name: Ident,
+        /// New index name.
+        new_name: Ident,
+    },
     /// `RENAME CONSTRAINT <old_constraint_name> TO <new_constraint_name>`
     ///
     /// Note: this is a PostgreSQL-specific operation.
@@ -1652,6 +1660,9 @@ impl fmt::Display for AlterTableOperation {
                 }
 
                 Ok(())
+            }
+            AlterTableOperation::RenameIndex { old_name, new_name } => {
+                write!(f, "RENAME INDEX {old_name} TO {new_name}")
             }
             AlterTableOperation::RenameConstraint { old_name, new_name } => {
                 write!(f, "RENAME CONSTRAINT {old_name} TO {new_name}")

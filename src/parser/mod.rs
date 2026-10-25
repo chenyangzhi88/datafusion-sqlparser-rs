@@ -209,6 +209,7 @@ mod extensions;
 mod language;
 mod merge;
 mod partition;
+mod table;
 mod xml;
 
 #[cfg(feature = "std")]
@@ -1397,7 +1398,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn mysql_numeric_type_conditions(&self, data_type: &DataType) {
+    fn mysql_numeric_type_declaration(&self, data_type: &mut DataType) {
+        if self.dialect.boolean_type_is_tinyint() && matches!(data_type, DataType::Bool | DataType::Boolean) {
+            // Native PT_boolean_type supplies implicit length 1 without the
+            // PT_numeric_type display-width condition. Publish the canonical
+            // declaration only here, after its original grammar/options.
+            *data_type = DataType::TinyInt(Some(1));
+            return;
+        }
         let integer_display_width = matches!(
             data_type,
             DataType::TinyInt(Some(_))
@@ -12855,7 +12863,7 @@ impl<'a> Parser<'a> {
                     .expect("actual ZEROFILL option");
                 self.mysql_source_push(&mut options, ColumnOptionDef { name: None, option })?;
             }
-            self.mysql_numeric_type_conditions(&data_type);
+            self.mysql_numeric_type_declaration(&mut data_type);
             self.parse_mysql_column_character_options(&mut options)?;
         }
         loop {
@@ -14921,31 +14929,7 @@ impl<'a> Parser<'a> {
                 }
             }
         } else if self.parse_keyword(Keyword::RENAME) {
-            if dialect_of!(self is PostgreSqlDialect) && self.parse_keyword(Keyword::CONSTRAINT) {
-                let old_name = self.parse_identifier()?;
-                self.expect_keyword_is(Keyword::TO)?;
-                let new_name = self.parse_identifier()?;
-                AlterTableOperation::RenameConstraint { old_name, new_name }
-            } else if self.parse_keyword(Keyword::TO) {
-                let table_name = self.parse_object_name(false)?;
-                AlterTableOperation::RenameTable {
-                    table_name: RenameTableNameKind::To(table_name),
-                }
-            } else if self.parse_keyword(Keyword::AS) {
-                let table_name = self.parse_object_name(false)?;
-                AlterTableOperation::RenameTable {
-                    table_name: RenameTableNameKind::As(table_name),
-                }
-            } else {
-                let _ = self.parse_keyword(Keyword::COLUMN); // [ COLUMN ]
-                let old_column_name = self.parse_identifier()?;
-                self.expect_keyword_is(Keyword::TO)?;
-                let new_column_name = self.parse_identifier()?;
-                AlterTableOperation::RenameColumn {
-                    old_column_name,
-                    new_column_name,
-                }
-            }
+            self.parse_alter_table_rename()?
         } else if self.parse_keyword(Keyword::DISABLE) {
             if self.parse_keywords(&[Keyword::ROW, Keyword::LEVEL, Keyword::SECURITY]) {
                 AlterTableOperation::DisableRowLevelSecurity {}
@@ -15973,7 +15957,9 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let end_token = if self.peek_token_ref().token == Token::SemiColon {
+        let end_token = if matches!(self.peek_token_ref().token, Token::SemiColon | Token::EOF) {
+            // EOF is the actual boundary too. Reusing the previous token here
+            // duplicates its raw literal/declaration edge during AST visits.
             self.peek_token_ref().clone()
         } else {
             self.get_current_token().clone()
@@ -17366,6 +17352,15 @@ impl<'a> Parser<'a> {
             Token::DoubleQuotedString(ref s) => Ok(Expr::Value(
                 Value::DoubleQuotedString(s.to_string()).with_span(span),
             )),
+            Token::MySqlHexStringLiteral(digits, kind) if self.tokens.raw().is_some() => {
+                // Native UNDERSCORE_CHARSET HEX_NUM/BIN_NUM constructs an
+                // Item_string, not the bare hybrid hex/bin Item. Use the same
+                // admitted binary text producer and original introducer fact
+                // already consumed by the ordinary literal binder.
+                let text = self.mysql_binary_text_string(digits, kind, span)?
+                    .with_introducer(introducer).map_err(ParserError::ParserError)?;
+                Ok(Expr::Value(Value::MySqlText(text).with_span(span)))
+            }
             Token::HexStringLiteral(ref s) | Token::MySqlHexStringLiteral(ref s, _) => Ok(
                 Expr::Value(Value::HexStringLiteral(s.to_string()).with_span(span)),
             ),
@@ -17787,7 +17782,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.mysql_numeric_type_conditions(&ty);
+        self.mysql_numeric_type_declaration(&mut ty);
         Ok(ty)
     }
 
@@ -17816,6 +17811,17 @@ impl<'a> Parser<'a> {
         let mut trailing_bracket: MatchedTrailingBracket = false.into();
         let mut data = match &next_token.token {
             Token::Word(w) => match w.keyword {
+                Keyword::BOOLEAN | Keyword::BOOL if self.dialect.boolean_type_is_tinyint() => {
+                    // BOOL has its own declaration production, without the
+                    // signedness, ZEROFILL or width options of numeric_type.
+                    if self.peek_keyword(Keyword::UNSIGNED) || self.peek_keyword(Keyword::SIGNED)
+                        || self.peek_keyword(Keyword::ZEROFILL)
+                        || self.peek_token_ref().token == Token::LParen
+                    {
+                        return self.expected_ref("an unmodified BOOL/BOOLEAN declaration", self.peek_token_ref());
+                    }
+                    Ok(if w.keyword == Keyword::BOOL { DataType::Bool } else { DataType::Boolean })
+                }
                 Keyword::BOOLEAN => Ok(DataType::Boolean),
                 Keyword::BOOL => Ok(DataType::Bool),
                 Keyword::FLOAT => {
@@ -21920,7 +21926,13 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let filter = if self.parse_keyword(Keyword::LIKE) {
-                    Some(ShowStatementFilter::Like(self.parse_literal_string()?))
+                    Some(if self.tokens.raw().is_some() {
+                        ShowStatementFilter::MySqlLike(Expr::Value(
+                            self.parse_mysql_load_text(MySqlTextRole::Literal, false)?,
+                        ))
+                    } else {
+                        ShowStatementFilter::Like(self.parse_literal_string()?)
+                    })
                 } else if self.parse_keyword(Keyword::WHERE) {
                     Some(ShowStatementFilter::Where(self.parse_expr()?))
                 } else {
@@ -22161,15 +22173,23 @@ impl<'a> Parser<'a> {
         &mut self,
     ) -> Result<Option<ShowStatementFilter>, ParserError> {
         if self.parse_keyword(Keyword::LIKE) {
-            Ok(Some(ShowStatementFilter::Like(
-                self.parse_literal_string()?,
-            )))
-        } else if self.parse_keyword(Keyword::ILIKE) {
+            // Native opt_wild_or_where borrows TEXT_STRING_literal, never
+            // system text. The original Source binder owns its Itemization.
+            Ok(Some(if self.tokens.raw().is_some() {
+                ShowStatementFilter::MySqlLike(Expr::Value(
+                    self.parse_mysql_load_text(MySqlTextRole::Literal, false)?,
+                ))
+            } else {
+                ShowStatementFilter::Like(self.parse_literal_string()?)
+            }))
+        } else if self.tokens.raw().is_none() && self.parse_keyword(Keyword::ILIKE) {
             Ok(Some(ShowStatementFilter::ILike(
                 self.parse_literal_string()?,
             )))
         } else if self.parse_keyword(Keyword::WHERE) {
             Ok(Some(ShowStatementFilter::Where(self.parse_expr()?)))
+        } else if self.tokens.raw().is_some() {
+            Ok(None)
         } else {
             self.maybe_parse(|parser| -> Result<String, ParserError> {
                 parser.parse_literal_string()
@@ -22616,123 +22636,6 @@ impl<'a> Parser<'a> {
             self.parse_snowflake_stage_table_factor()
         } else {
             self.parse_named_table_factor()
-        }
-    }
-
-    fn parse_parenthesized_table_factor(&mut self) -> Result<TableFactor, ParserError> {
-        // A left paren introduces either a derived table (i.e., a subquery)
-        // or a nested join. It's nearly impossible to determine ahead of
-        // time which it is... so we just try to parse both.
-        //
-        // Here's an example that demonstrates the complexity:
-        //                     /-------------------------------------------------------\
-        //                     | /-----------------------------------\                 |
-        //     SELECT * FROM ( ( ( (SELECT 1) UNION (SELECT 2) ) AS t1 NATURAL JOIN t2 ) )
-        //                   ^ ^ ^ ^
-        //                   | | | |
-        //                   | | | |
-        //                   | | | (4) belongs to a SetExpr::Query inside the subquery
-        //                   | | (3) starts a derived table (subquery)
-        //                   | (2) starts a nested join
-        //                   (1) an additional set of parens around a nested join
-        //
-
-        // If the recently consumed '(' starts a derived table, the call to
-        // `parse_derived_table_factor` below will return success after parsing the
-        // subquery, followed by the closing ')', and the alias of the derived table.
-        // In the example above this is case (3).
-        if let Some(mut table) =
-            self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))?
-        {
-            while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT]) {
-                table = match kw {
-                    Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
-                    Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                    unexpected_keyword => {
-                        return Err(ParserError::ParserError(format!(
-                            "Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"
-                        )));
-                    }
-                }
-            }
-            return Ok(table);
-        }
-
-        // A parsing error from `parse_derived_table_factor` indicates that the '(' we've
-        // recently consumed does not start a derived table (cases 1, 2, or 4).
-        // `maybe_parse` will ignore such an error and rewind to be after the opening '('.
-
-        // Inside the parentheses we expect to find an (A) table factor
-        // followed by some joins or (B) another level of nesting.
-        let mut table_and_joins = self.parse_table_and_joins()?;
-
-        #[allow(clippy::if_same_then_else)]
-        if !table_and_joins.joins.is_empty() {
-            self.expect_token(&Token::RParen)?;
-            let alias = self.maybe_parse_table_alias()?;
-            Ok(TableFactor::NestedJoin {
-                table_with_joins: Box::new(table_and_joins),
-                alias,
-            }) // (A)
-        } else if let TableFactor::NestedJoin {
-            table_with_joins: _,
-            alias: _,
-        } = &table_and_joins.relation
-        {
-            // (B): `table_and_joins` (what we found inside the parentheses)
-            // is a nested join `(foo JOIN bar)`, not followed by other joins.
-            self.expect_token(&Token::RParen)?;
-            let alias = self.maybe_parse_table_alias()?;
-            Ok(TableFactor::NestedJoin {
-                table_with_joins: Box::new(table_and_joins),
-                alias,
-            })
-        } else if self.dialect.supports_parens_around_table_factor() {
-            // Dialect-specific behavior: Snowflake diverges from the
-            // standard and from most of the other implementations by
-            // allowing extra parentheses not only around a join (B), but
-            // around lone table names (e.g. `FROM (mytable [AS alias])`)
-            // and around derived tables (e.g. `FROM ((SELECT ...)
-            // [AS alias])`) as well.
-            self.expect_token(&Token::RParen)?;
-
-            if let Some(outer_alias) = self.maybe_parse_table_alias()? {
-                // Snowflake also allows specifying an alias *after* parens
-                // e.g. `FROM (mytable) AS alias`
-                match &mut table_and_joins.relation {
-                    TableFactor::Derived { alias, .. }
-                    | TableFactor::Table { alias, .. }
-                    | TableFactor::Function { alias, .. }
-                    | TableFactor::RowsFrom { alias, .. }
-                    | TableFactor::UNNEST { alias, .. }
-                    | TableFactor::JsonTable { alias, .. }
-                    | TableFactor::XmlTable { alias, .. }
-                    | TableFactor::OpenJsonTable { alias, .. }
-                    | TableFactor::TableFunction { alias, .. }
-                    | TableFactor::Pivot { alias, .. }
-                    | TableFactor::Unpivot { alias, .. }
-                    | TableFactor::MatchRecognize { alias, .. }
-                    | TableFactor::SemanticView { alias, .. }
-                    | TableFactor::NestedJoin { alias, .. } => {
-                        // but not `FROM (mytable AS alias1) AS alias2`.
-                        if let Some(inner_alias) = alias {
-                            return Err(ParserError::ParserError(format!(
-                                "duplicate alias {inner_alias}"
-                            )));
-                        }
-                        // Act as if the alias was specified normally next
-                        // to the table name: `(mytable) AS alias` ->
-                        // `(mytable AS alias)`
-                        alias.replace(outer_alias);
-                    }
-                };
-            }
-            // Do not store the extra set of parens in the AST
-            Ok(table_and_joins.relation)
-        } else {
-            // The SQL spec prohibits derived tables and bare tables from
-            // appearing alone in parentheses (e.g. `FROM (mytable)`)
-            self.expected_ref("joined table", self.peek_token_ref())
         }
     }
 

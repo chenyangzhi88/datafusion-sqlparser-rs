@@ -25,3 +25,11 @@ The gateway and its SQL adapters use decoded tokenizer values (the default unesc
 - OUTPUT INTO remains a table destination, including SQL Server table variables; it does not inherit MySQL SELECT INTO variable/file semantics. DELETE inheritance formatting retains pretty-print indentation, and an empty JSON_OBJECT RETURNING clause has no leading blank.
 
 Parser-package validation uses `cargo test --all-features`, `cargo fmt --all -- --check`, and `cargo clippy --all-targets --all-features -- -D warnings`. Passing these checks does not certify the parent server's SQL/protocol compatibility or replace its downstream integration tests. Existing ignored tests remain explicitly unexecuted.
+
+- MySQL table index renames accept both `RENAME INDEX` and `RENAME KEY`,
+  including the actual option-bearing MySQL dialect. A dedicated existing-index
+  rename AST preserves quoted identifiers/spans and prints canonical `RENAME
+  INDEX`; PostgreSQL constraint/column/table rename behavior and rejection of
+  MySQL index grammar remain separate. The common rename parser moves into the
+  existing ALTER module. Public MySQL dialect coverage adds one test and the
+  PostgreSQL constraint-rename case retains its checks plus cross-dialect rejects.

@@ -647,6 +647,16 @@ fn parse_alter_table_constraints_rename() {
         }
         _ => unreachable!(),
     }
+    for sql in [
+        "ALTER TABLE tab RENAME INDEX old_name TO new_name",
+        "ALTER TABLE tab RENAME KEY old_name TO new_name",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .is_err(),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

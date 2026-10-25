@@ -2666,8 +2666,20 @@ mod mysql_byte_source {
         else {
             panic!("introduced binary")
         };
+        let binary = text(value);
+        assert_eq!(binary.bytes().unwrap(), &[0xe9]);
+        assert_eq!(
+            binary.binary_literal(),
+            Some(crate::tokenizer::MySqlHexLiteralKind::HexQuoted)
+        );
+        assert_eq!(binary.introducer(), Some("_latin1"));
         assert!(
-            matches!(value.as_ref(), Expr::Value(value) if value.value == Value::HexStringLiteral("E9".into()))
+            binary
+                .source()
+                .owner()
+                .zip(actual.source_occurrence.owner())
+                .is_some_and(|(literal, original)| std::sync::Arc::ptr_eq(literal, original)),
+            "the raw introduced HEX keeps its actual source, not a display-only literal"
         );
         // Native TYPELIB members use text_string, not introduced or adjacent
         // expression literals. Preserve both expression assertions above and
@@ -5096,5 +5108,55 @@ fn array_time_zone_capability_is_delegated_by_every_mysql_option_combination() {
                 Parser::parse_sql(&MySqlDialect {}, &sql).unwrap()
             );
         }
+    }
+}
+
+#[test]
+fn alter_table_end_marker_is_the_actual_eof_or_semicolon_without_repeating_a_literal() {
+    use crate::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
+    use crate::tokenizer::Token;
+    for dialect in [
+        &MySqlDialect {} as &dyn Dialect,
+        &GenericDialect {},
+        &PostgreSqlDialect {},
+    ] {
+        for sql in [
+            "ALTER TABLE t ALTER COLUMN n SET DEFAULT 'kept'",
+            "ALTER TABLE t ALTER COLUMN n SET DEFAULT 'kept';",
+        ] {
+            let statements = Parser::parse_sql(dialect, sql).unwrap();
+            let [Statement::AlterTable(table)] = statements.as_slice() else {
+                panic!("original ALTER TABLE");
+            };
+            assert_eq!(
+                table.end_token.0.token,
+                if sql.ends_with(';') {
+                    Token::SemiColon
+                } else {
+                    Token::EOF
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_boolean_declarations_are_native_tinyint_one_and_pg_keeps_boolean() {
+    for sql_type in ["BOOL", "BOOLEAN"] {
+        let sql = format!("CREATE TABLE b(v {sql_type} PRIMARY KEY)");
+        let statement = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap().remove(0);
+        let Statement::CreateTable(table) = statement else { unreachable!() };
+        assert_eq!(table.columns[0].data_type, DataType::TinyInt(Some(1)), "{sql}");
+        assert_eq!(Parser::new(&MySqlDialect {}).try_with_sql(sql_type).unwrap()
+            .parse_data_type().unwrap(), DataType::TinyInt(Some(1)),
+            "same original parameter/ALTER declaration constructor");
+    }
+    for (sql_type, expected) in [("BOOL", DataType::Bool), ("BOOLEAN", DataType::Boolean)] {
+        assert_eq!(Parser::new(&crate::dialect::PostgreSqlDialect {}).try_with_sql(sql_type).unwrap()
+            .parse_data_type().unwrap(), expected, "original PG Boolean type stays unchanged");
+    }
+    for invalid in ["BOOLEAN(2)", "BOOL SIGNED", "BOOLEAN UNSIGNED", "BOOLEAN ZEROFILL"] {
+        assert!(Parser::parse_sql(&MySqlDialect {}, &format!("CREATE TABLE b(v {invalid})")).is_err(),
+            "native BOOL has its own grammar without numeric modifiers: {invalid}");
     }
 }

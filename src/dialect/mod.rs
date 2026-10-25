@@ -1477,6 +1477,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Supports `ALTER TABLE ... RENAME { INDEX | KEY } old TO new`.
+    /// This is independent of PostgreSQL's constraint rename operation.
+    fn supports_alter_table_rename_index(&self) -> bool {
+        false
+    }
+
     /// Supports a final, non-comma `PARTITION BY` or `REMOVE PARTITIONING`
     /// tail after the ordinary `ALTER TABLE` action list.
     fn supports_alter_table_partition_tail(&self) -> bool {
@@ -1504,6 +1510,12 @@ pub trait Dialect: Debug + Any {
     /// Returns true if the dialect supports the `x NOTNULL`
     /// operator expression.
     fn supports_notnull_operator(&self) -> bool {
+        false
+    }
+
+    /// Returns true when BOOL and BOOLEAN declarations denote TINYINT(1),
+    /// with implicit display width and without numeric type modifiers.
+    fn boolean_type_is_tinyint(&self) -> bool {
         false
     }
 

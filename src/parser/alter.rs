@@ -19,10 +19,10 @@ use super::{Parser, ParserError};
 use crate::{
     ast::{
         helpers::key_value_options::{KeyValueOptions, KeyValueOptionsDelimiter},
-        AlterConnectorOwner, AlterPolicy, AlterPolicyOperation, AlterRoleOperation, AlterUser,
+        AlterConnectorOwner, AlterPolicy, AlterPolicyOperation, AlterRoleOperation, AlterTableOperation, AlterUser,
         AlterUserAddMfaMethodOtp, AlterUserAddRoleDelegation, AlterUserModifyMfaMethod,
         AlterUserPassword, AlterUserRemoveRoleDelegation, AlterUserSetPolicy, Expr, MfaMethodKind,
-        Password, ResetConfig, RoleOption, SetConfigValue, Statement, UserPolicyKind,
+        Password, RenameTableNameKind, ResetConfig, RoleOption, SetConfigValue, Statement, UserPolicyKind,
     },
     dialect::{MsSqlDialect, PostgreSqlDialect},
     keywords::Keyword,
@@ -30,6 +30,47 @@ use crate::{
 };
 
 impl Parser<'_> {
+    /// Parse a table rename action after the already consumed RENAME.
+    pub(super) fn parse_alter_table_rename(&mut self) -> Result<AlterTableOperation, ParserError> {
+        Ok(
+            if self.dialect.supports_alter_table_rename_index()
+                && self
+                    .parse_one_of_keywords(&[Keyword::INDEX, Keyword::KEY])
+                    .is_some()
+            {
+                let old_name = self.parse_identifier()?;
+                self.expect_keyword_is(Keyword::TO)?;
+                let new_name = self.parse_identifier()?;
+                AlterTableOperation::RenameIndex { old_name, new_name }
+            } else if dialect_of!(self is PostgreSqlDialect)
+                && self.parse_keyword(Keyword::CONSTRAINT)
+            {
+                let old_name = self.parse_identifier()?;
+                self.expect_keyword_is(Keyword::TO)?;
+                let new_name = self.parse_identifier()?;
+                AlterTableOperation::RenameConstraint { old_name, new_name }
+            } else if self.parse_keyword(Keyword::TO) {
+                let table_name = self.parse_object_name(false)?;
+                AlterTableOperation::RenameTable {
+                    table_name: RenameTableNameKind::To(table_name),
+                }
+            } else if self.parse_keyword(Keyword::AS) {
+                let table_name = self.parse_object_name(false)?;
+                AlterTableOperation::RenameTable {
+                    table_name: RenameTableNameKind::As(table_name),
+                }
+            } else {
+                let _ = self.parse_keyword(Keyword::COLUMN); // [ COLUMN ]
+                let old_column_name = self.parse_identifier()?;
+                self.expect_keyword_is(Keyword::TO)?;
+                let new_column_name = self.parse_identifier()?;
+                AlterTableOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                }
+            },
+        )
+    }
     /// Parse `ALTER ROLE` statement
     pub fn parse_alter_role(&mut self) -> Result<Statement, ParserError> {
         if dialect_of!(self is PostgreSqlDialect) {

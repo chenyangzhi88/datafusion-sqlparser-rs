@@ -1485,10 +1485,15 @@ fn parse_create_table_both_options_and_as_query() {
 
     let sql =
         r"CREATE TABLE foo (id INT(11)) ENGINE = InnoDB AS SELECT 1 DEFAULT CHARSET = utf8mb3";
-    assert!(matches!(
-        mysql_and_generic().parse_sql_statements(sql),
-        Err(ParserError::ParserError(_))
-    ));
+    // Both reject trailing table options. MySQL reserves DEFAULT at this
+    // query frontier; Generic may consume it as an alias before CHARSET.
+    // Their diagnostic text is not a shared dialect contract.
+    for dialect in [mysql(), TestedDialects::new(vec![Box::new(GenericDialect {})])] {
+        assert!(matches!(
+            dialect.parse_sql_statements(sql),
+            Err(ParserError::ParserError(_))
+        ));
+    }
 }
 
 #[test]
@@ -5766,4 +5771,38 @@ fn assert_mysql_trigger_source(sql: &str, action: &str, mut expected_header: Cre
         return_type_modifiers: None,
     });
     assert_eq!(parsed.statement, Statement::CreateTrigger(expected_header));
+}
+
+#[test]
+fn parse_alter_table_rename_index() {
+    for keyword in ["INDEX", "KEY"] {
+        let sql = format!("ALTER TABLE `tab` RENAME {keyword} `old``index` TO `new``index`");
+        let canonical = "ALTER TABLE `tab` RENAME INDEX `old``index` TO `new``index`";
+        let statement = mysql().one_statement_parses_to(&sql, canonical);
+        assert_matches!(alter_table_op_with_name(statement, "`tab`"),
+            AlterTableOperation::RenameIndex { old_name, new_name }
+                if old_name.value == "old`index" && new_name.value == "new`index"
+                    && old_name.quote_style == Some('`') && new_name.quote_style == Some('`'));
+        for ansi in [false, true] {
+            for pipes in [false, true] {
+                for no_backslash in [false, true] {
+                    let dialect = MySqlDialect::with_options(ansi, pipes, no_backslash);
+                    let statements = sqlparser::parser::Parser::parse_sql(&dialect, &sql).unwrap();
+                    assert_eq!(statements.len(), 1);
+                    assert_eq!(statements[0].to_string(), canonical);
+                }
+            }
+        }
+    }
+    mysql().verified_stmt("ALTER TABLE tab RENAME COLUMN `INDEX` TO `KEY`");
+    for sql in [
+        "ALTER TABLE tab RENAME INDEX old_name new_name",
+        "ALTER TABLE tab RENAME KEY old_name TO",
+        "ALTER TABLE tab RENAME CONSTRAINT old_name TO new_name",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(),
+            "{sql}"
+        );
+    }
 }
