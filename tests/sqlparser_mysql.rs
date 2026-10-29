@@ -5767,8 +5767,8 @@ fn assert_mysql_trigger_source(sql: &str, action: &str, mut expected_header: Cre
         data_access: None,
         comment: None,
         ordering: None,
-        parameter_type_modifiers: vec![],
-        return_type_modifiers: None,
+        parameter_type_options: vec![],
+        return_type_options: None,
     });
     assert_eq!(parsed.statement, Statement::CreateTrigger(expected_header));
 }
@@ -5805,4 +5805,651 @@ fn parse_alter_table_rename_index() {
             "{sql}"
         );
     }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn mysql_text_clone_storage_tracks_owned_single_segment_without_issuing_source() {
+    use std::sync::Arc;
+    let owner = SqlSourceOwner::adopt(
+        b"_utf8mb4'a'".to_vec(),
+        SqlSourceAdmission::new(Arc::new(())),
+    );
+    let original = MySqlText::from_occurrence(
+        owner.occurrence(9..10).unwrap(),
+        owner.occurrence(0..11).unwrap(),
+        "utf8mb4".into(),
+        '\'',
+        Some("_utf8mb4".into()),
+    )
+    .unwrap();
+    let clone = original.clone();
+    assert_eq!(
+        original.bytes().unwrap().as_ptr(),
+        clone.bytes().unwrap().as_ptr()
+    );
+    assert_ne!(original.charset().as_ptr(), clone.charset().as_ptr());
+    assert_eq!(original.clone_owned_storage_bytes(), Some(15));
+    let decoded: MySqlText =
+        serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+    assert!(
+        decoded.bytes().is_err(),
+        "decoding cannot issue the original Source"
+    );
+    // Decoding receives a shared segment vector, even for one segment. A
+    // subsequent clone owns only its detached semantic byte, while the
+    // original attached single-segment clone above owns its inline strings.
+    let clone = decoded.clone();
+    assert_eq!(decoded.segments().as_ptr(), clone.segments().as_ptr());
+    assert_eq!(decoded.clone_owned_storage_bytes(), Some(1));
+    assert!(decoded.detached_storage_bytes().unwrap().1 > 0);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn mysql_received_adjacent_storage_requires_unique_custody_and_stays_detached() {
+    use std::sync::Arc;
+    let source = SqlSourceOwner::adopt(b"'a' 'b'".to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    let semantic = SqlSourceOwner::adopt(b"ab".to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    let original = MySqlText::from_segments(
+        semantic.occurrence(0..2).unwrap(),
+        vec![
+            MySqlTextSegment::new(
+                0..1,
+                source.occurrence(0..3).unwrap(),
+                "utf8mb4".into(),
+                '\'',
+                None,
+            )
+            .unwrap(),
+            MySqlTextSegment::new(
+                1..2,
+                source.occurrence(4..7).unwrap(),
+                "utf8mb4".into(),
+                '\'',
+                None,
+            )
+            .unwrap(),
+        ],
+        SqlSourceAdmission::new(Arc::new(())),
+    )
+    .unwrap();
+    assert_eq!(original.clone_owned_storage_bytes(), Some(0));
+    let mut decoded: MySqlText =
+        serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+    assert!(decoded.validate_received_storage_admission().is_ok());
+    assert!(decoded.detached_storage_bytes().unwrap().1 > 0);
+    let clone = decoded.clone();
+    assert_eq!(decoded.segments().as_ptr(), clone.segments().as_ptr());
+    assert_eq!(clone.clone_owned_storage_bytes(), Some(2));
+    assert!(decoded.validate_received_storage_admission().is_err());
+    drop(clone);
+    decoded
+        .retain_received_storage_admission(SqlSourceAdmission::new(Arc::new(())))
+        .unwrap();
+    assert!(
+        decoded.bytes().is_err(),
+        "storage custody cannot reattach Source authority"
+    );
+    assert!(
+        decoded.validate_received_storage_admission().is_err(),
+        "custody is installed once"
+    );
+}
+
+#[cfg(feature = "visitor")]
+#[test]
+fn mysql_nested_hint_storage_visitors_keep_bounded_types_and_semantic_frontiers() {
+    use core::ops::ControlFlow;
+    use std::sync::Arc;
+    let source = SqlSourceOwner::adopt(b"/*+ */".to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    let query = || {
+        let Statement::Query(query) =
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, "SELECT 1")
+                .unwrap()
+                .remove(0)
+        else {
+            unreachable!()
+        };
+        query
+    };
+    let mut nested = query();
+    for _ in 0..8 {
+        let mut next = query();
+        let SetExpr::Select(select) = next.body.as_mut() else {
+            unreachable!()
+        };
+        let mut name = String::with_capacity(4096);
+        name.push_str("storage_only");
+        select.optimizer_hints.push(OptimizerHint {
+            prefix: String::new(),
+            text: String::new(),
+            // Deliberately inert typed metadata. Its AST storage must remain
+            // traversable before any native grammar/Source authentication.
+            style: OptimizerHintStyle::MySqlBoundSource {
+                source: source.occurrence(0..6).unwrap(),
+                text: source.occurrence(3..4).unwrap(),
+                client_collation: 255,
+                ansi_quotes: false,
+                directives: Arc::new(vec![MySqlHintDirective::Variable(
+                    name,
+                    Expr::Subquery(nested),
+                )]),
+                resolve_conditions: false,
+                syntax: Arc::new(vec![]),
+                admission: None,
+                unsupported: None,
+            },
+        });
+        nested = next;
+    }
+    let SetExpr::Select(select) = nested.body.as_mut() else {
+        unreachable!()
+    };
+    let style = &mut select.optimizer_hints[0].style;
+    #[derive(Default)]
+    struct Allocation<const CLONE: bool> {
+        bytes: usize,
+        semantic_queries: usize,
+    }
+    impl<const CLONE: bool> Visitor for Allocation<CLONE> {
+        type Break = ();
+        const VISIT_ALLOCATIONS: bool = true;
+        const VISIT_CLONE_ALLOCATIONS: bool = CLONE;
+        fn visit_allocation(&mut self, bytes: Option<usize>, shared: bool) -> ControlFlow<()> {
+            assert!(
+                shared,
+                "nested immutable hint storage keeps its original shared owner"
+            );
+            self.bytes += bytes.unwrap();
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.semantic_queries += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    let mut resident = Allocation::<false>::default();
+    let mut cloned = Allocation::<true>::default();
+    assert!(Visit::visit(style, &mut resident).is_continue());
+    assert!(Visit::visit(style, &mut cloned).is_continue());
+    assert!(resident.bytes > cloned.bytes && cloned.bytes > 0);
+    assert_eq!((resident.semantic_queries, cloned.semantic_queries), (0, 0));
+    #[derive(Default)]
+    struct Receiving {
+        hints: usize,
+        expressions: usize,
+        semantic_queries: usize,
+        stop: Option<usize>,
+    }
+    impl VisitorMut for Receiving {
+        type Break = ();
+        const VISIT_STORAGE_METADATA: bool = true;
+        fn visit_optimizer_hint_storage(&mut self, _: &mut OptimizerHintStyle) -> ControlFlow<()> {
+            self.hints += 1;
+            if self.stop == Some(self.hints) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        fn pre_visit_expr(&mut self, _: &mut Expr) -> ControlFlow<()> {
+            self.expressions += 1;
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+            self.semantic_queries += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    let mut receiving = Receiving::default();
+    assert!(VisitMut::visit(style, &mut receiving).is_continue());
+    assert_eq!(receiving.hints, 8);
+    assert!(receiving.expressions >= 8);
+    assert_eq!(receiving.semantic_queries, 0);
+    let mut stopped = Receiving {
+        stop: Some(3),
+        ..Default::default()
+    };
+    assert!(VisitMut::visit(style, &mut stopped).is_break());
+    assert_eq!((stopped.hints, stopped.semantic_queries), (3, 0));
+}
+
+
+#[test]
+fn custom_and_temporal_type_formatters_keep_all_original_separator_positions() {
+    for modifiers in [vec![], vec!["4".to_owned()], vec!["first".to_owned(), "second".to_owned()]] {
+        let expected = if modifiers.is_empty() { "YEAR".to_owned() }
+            else { format!("YEAR({})", modifiers.join(", ")) };
+        let value = DataType::Custom(ObjectName::from(vec![Ident::new("YEAR")]), modifiers);
+        assert_eq!(value.to_string(), expected);
+    }
+    let modifier = format!("{}4", "0".repeat(4096));
+    assert_eq!(DataType::Custom(ObjectName::from(vec![Ident::new("YEAR")]), vec![modifier.clone()])
+        .to_string(), format!("YEAR({modifier})"));
+    for (timezone, suffix) in [
+        (TimezoneInfo::None, ""),
+        (TimezoneInfo::WithTimeZone, " WITH TIME ZONE"),
+        (TimezoneInfo::WithoutTimeZone, " WITHOUT TIME ZONE"),
+        (TimezoneInfo::Tz, "TZ"),
+    ] {
+        for precision in [None, Some(6)] {
+            for name in ["TIME", "TIMESTAMP"] {
+                let value = if name == "TIME" { DataType::Time(precision, timezone) }
+                    else { DataType::Timestamp(precision, timezone) };
+                let precision = precision.map(|n| format!("({n})")).unwrap_or_default();
+                let expected = if timezone == TimezoneInfo::Tz {
+                    format!("{name}{suffix}{precision}")
+                } else { format!("{name}{precision}{suffix}") };
+                assert_eq!(value.to_string(), expected);
+            }
+        }
+    }
+}
+
+
+#[test]
+fn group_concat_separator_uses_text_string_grammar_without_changing_generic_values() {
+    use sqlparser::parser::Parser;
+    for separator in ["'|'", "''", "X'FF'", "0xFF", "B'11111111'", "X'00FF'"] {
+        let sql = format!("SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR {separator}) FROM t");
+        let parsed = Parser::parse_sql(&MySqlDialect {}, &sql).unwrap();
+        let Statement::Query(query) = &parsed[0] else { panic!("SELECT") };
+        let SetExpr::Select(select) = query.body.as_ref() else { panic!("SELECT") };
+        let SelectItem::UnnamedExpr(Expr::Function(function)) = &select.projection[0] else {
+            panic!("original aggregate")
+        };
+        let FunctionArguments::List(arguments) = &function.args else { panic!("args") };
+        assert!(matches!(arguments.clauses.as_slice(),
+            [FunctionArgumentClause::OrderBy(_), FunctionArgumentClause::Separator(_)]),
+            "{sql}");
+    }
+    for separator in ["NULL", "?", "_binary'|'", "CONCAT('|','')"] {
+        let sql = format!("SELECT GROUP_CONCAT(v SEPARATOR {separator}) FROM t");
+        assert!(Parser::parse_sql(&MySqlDialect {}, &sql).is_err(), "{sql}");
+    }
+    // Generic's value grammar remains independent of native text_string.
+    for separator in ["NULL", "?"] {
+        let sql = format!("SELECT GROUP_CONCAT(v SEPARATOR {separator}) FROM t");
+        assert!(Parser::parse_sql(&GenericDialect {}, &sql).is_ok(), "{sql}");
+    }
+}
+
+
+#[test]
+fn mysql_alter_engine_is_one_ordered_existing_option_with_native_value_grammar() {
+    for (sql, expected) in [
+        ("ALTER TABLE engines ENGINE=InnoDB", "InnoDB"),
+        ("ALTER TABLE engines ENGINE InnoDB", "InnoDB"),
+        ("ALTER TABLE engines ENGINE='InnoDB'", "InnoDB"),
+        ("ALTER TABLE engines ENGINE \"InnoDB\"", "InnoDB"),
+        ("ALTER TABLE engines ENGINE=`InnoDB`", "InnoDB"),
+    ] {
+        let parsed = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        let Statement::AlterTable(table) = &parsed[0] else {
+            panic!("ALTER TABLE");
+        };
+        let [
+            AlterTableOperation::SetOptionsParens {
+                options: AlterTableSetOperation::Options(options),
+            },
+        ] = table.operations.as_slice()
+        else {
+            panic!("one original ENGINE option");
+        };
+        let [SqlOption::KeyValue { key, value }] = options.as_slice() else {
+            panic!("same option");
+        };
+        assert_eq!(key.value, "ENGINE");
+        match value {
+            Expr::Identifier(value) => assert_eq!(value.value, expected),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(value) | Value::DoubleQuotedString(value),
+                ..
+            }) => assert_eq!(value, expected),
+            _ => panic!("original name/string, not executable expression: {value:?}"),
+        }
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&GenericDialect {}, sql).is_err(),
+            "Generic grammar unchanged: {sql}"
+        );
+    }
+    let statements = sqlparser::parser::Parser::parse_sql(
+        &MySqlDialect {},
+        "ALTER TABLE engines ENGINE=InnoDB,SECONDARY_ENGINE_ATTRIBUTE='{}',ADD COLUMN v INT",
+    )
+    .unwrap();
+    let Statement::AlterTable(table) = &statements[0] else {
+        panic!("ALTER TABLE");
+    };
+    assert!(matches!(
+        &table.operations[0],
+        AlterTableOperation::SetOptionsParens {
+            options: AlterTableSetOperation::Options(_)
+        }
+    ));
+    assert!(matches!(
+        &table.operations[1],
+        AlterTableOperation::SetOptionsParens {
+            options: AlterTableSetOperation::MySqlEngineAttribute { .. }
+        }
+    ));
+    assert!(matches!(
+        &table.operations[2],
+        AlterTableOperation::AddColumn { .. }
+    ));
+    for sql in [
+        "ALTER TABLE engines ENGINE=1",
+        "ALTER TABLE engines ENGINE=INNODB()",
+        "ALTER TABLE engines ENGINE=@name",
+        "ALTER TABLE engines ENGINE=_latin1'InnoDB'",
+        "ALTER TABLE engines ENGINE='InnoDB' 'extra'",
+        "ALTER TABLE engines ENGINE=InnoDB+1",
+        "ALTER TABLE engines ENGINE=InnoDB.EXTRA",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(),
+            "engine_name is not an expression: {sql}"
+        );
+    }
+}
+
+#[test]
+fn native_separator_and_engine_capabilities_follow_session_options_not_type_identity() {
+    use sqlparser::dialect::{Dialect, PostgreSqlDialect};
+    use sqlparser::parser::Parser;
+    assert!(MySqlDialect {}.supports_text_string_separator());
+    assert!(MySqlDialect {}.supports_alter_table_engine_option());
+    assert!(!GenericDialect {}.supports_text_string_separator());
+    assert!(!GenericDialect {}.supports_alter_table_engine_option());
+    assert!(!PostgreSqlDialect {}.supports_text_string_separator());
+    assert!(!PostgreSqlDialect {}.supports_alter_table_engine_option());
+    for ansi_quotes in [false, true] {
+        for pipes_as_concat in [false, true] {
+            for no_backslash_escapes in [false, true] {
+                let dialect =
+                    MySqlDialect::with_options(ansi_quotes, pipes_as_concat, no_backslash_escapes);
+                assert!(dialect.supports_text_string_separator());
+                assert!(dialect.supports_alter_table_engine_option());
+                for sql in [
+                    "SELECT GROUP_CONCAT(v SEPARATOR X'FF') FROM t",
+                    "ALTER TABLE t ENGINE=InnoDB",
+                ] {
+                    assert!(Parser::parse_sql(&dialect, sql).is_ok(), "{sql}");
+                }
+                assert!(Parser::parse_sql(
+                    &dialect,
+                    "SELECT GROUP_CONCAT(v SEPARATOR NULL) FROM t",
+                )
+                .is_err());
+            }
+        }
+    }
+    // The wrapper advertises MySQL's existing grammar identity but leaves
+    // these two independent capabilities at their default false values.
+    #[derive(Debug)]
+    struct WithoutNativeTextOrEngine;
+    impl Dialect for WithoutNativeTextOrEngine {
+        fn dialect(&self) -> std::any::TypeId {
+            std::any::TypeId::of::<MySqlDialect>()
+        }
+        fn is_identifier_start(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_part(ch)
+        }
+    }
+    let disabled = WithoutNativeTextOrEngine;
+    assert!(!disabled.supports_text_string_separator());
+    assert!(!disabled.supports_alter_table_engine_option());
+    assert!(Parser::parse_sql(&disabled, "SELECT GROUP_CONCAT(v SEPARATOR NULL) FROM t",).is_ok());
+    assert!(Parser::parse_sql(&disabled, "ALTER TABLE t ENGINE=InnoDB").is_err());
+}
+
+#[test]
+fn separator_and_engine_capabilities_enable_only_their_own_non_mysql_grammar() {
+    use sqlparser::dialect::Dialect;
+    use sqlparser::parser::Parser;
+    #[derive(Debug)]
+    struct CapabilityDialect {
+        text_separator: bool,
+        engine_option: bool,
+    }
+    impl Dialect for CapabilityDialect {
+        fn is_identifier_start(&self, ch: char) -> bool {
+            GenericDialect {}.is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            GenericDialect {}.is_identifier_part(ch)
+        }
+        fn supports_text_string_separator(&self) -> bool {
+            self.text_separator
+        }
+        fn supports_alter_table_engine_option(&self) -> bool {
+            self.engine_option
+        }
+    }
+    for text_separator in [false, true] {
+        for engine_option in [false, true] {
+            let dialect = CapabilityDialect {
+                text_separator,
+                engine_option,
+            };
+            assert_ne!(dialect.dialect(), MySqlDialect {}.dialect());
+            assert_ne!(dialect.dialect(), GenericDialect {}.dialect());
+            assert_eq!(
+                Parser::parse_sql(&dialect, "SELECT GROUP_CONCAT(v SEPARATOR X'FF') FROM t")
+                    .is_ok(),
+                text_separator,
+            );
+            assert_eq!(
+                Parser::parse_sql(&dialect, "ALTER TABLE t ENGINE=InnoDB").is_ok(),
+                engine_option,
+            );
+            assert!(Parser::parse_sql(&dialect, "SELECT 1").is_ok());
+            assert!(
+                Parser::parse_sql(&dialect, "SELECT GROUP_CONCAT(v SEPARATOR NULL) FROM t")
+                    .is_err()
+            );
+            assert!(
+                Parser::parse_sql(&dialect, "ALTER TABLE t RENAME INDEX old_name TO new_name")
+                    .is_err()
+            );
+        }
+    }
+}
+
+
+#[test]
+fn mysql_parenthesized_values_insert_preserves_the_original_query_primary() {
+    for (sql, columns, depth, replace) in [
+        ("INSERT INTO t (VALUES ROW(7))", 0, 1, false),
+        ("INSERT INTO t ((VALUES ROW(7)))", 0, 2, false),
+        ("INSERT INTO t (a) (VALUES ROW(7))", 1, 1, false),
+        ("REPLACE INTO t (VALUES ROW(7))", 0, 1, true),
+    ] {
+        let statement = mysql().verified_stmt(sql);
+        let Statement::Insert(insert) = statement else {
+            panic!("the original INSERT constructor: {sql}")
+        };
+        assert_eq!(insert.columns.len(), columns, "{sql}");
+        assert_eq!(insert.replace_into, replace, "{sql}");
+        let mut query = insert.source.as_ref().unwrap();
+        for _ in 0..depth {
+            let SetExpr::Query(child) = query.body.as_ref() else {
+                panic!("the original parenthesized query primary: {sql}")
+            };
+            query = child;
+        }
+        let SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("the original explicit VALUES constructor: {sql}")
+        };
+        assert!(values.explicit_row);
+        assert_eq!(values.rows.len(), 1);
+        assert_eq!(values.rows[0].content.len(), 1);
+        assert!(matches!(&values.rows[0].content[0],
+            Expr::Value(ValueWithSpan { value: Value::Number(value, false), .. })
+                if value.to_string() == "7"));
+    }
+}
+
+#[test]
+fn mysql_parenthesized_values_insert_keeps_column_and_lexical_boundaries() {
+    use sqlparser::dialect::Dialect;
+    use sqlparser::parser::Parser;
+    for ansi_quotes in [false, true] {
+        for pipes_as_concat in [false, true] {
+            for no_backslash_escapes in [false, true] {
+                let dialect = MySqlDialect::with_options(
+                    ansi_quotes,
+                    pipes_as_concat,
+                    no_backslash_escapes,
+                );
+                assert!(dialect.supports_parenthesized_values_in_insert());
+                for sql in [
+                    "INSERT INTO t (VALUES ROW(?))",
+                    "INSERT INTO t ((VALUES ROW(7)))",
+                    "INSERT INTO t ( /* source */ VALUES /* constructor */ ROW(7))",
+                    "REPLACE INTO t (VALUES ROW(7))",
+                ] {
+                    let parsed = Parser::parse_sql(&dialect, sql).unwrap();
+                    assert!(matches!(&parsed[0], Statement::Insert(insert)
+                        if insert.columns.is_empty()
+                        && matches!(insert.source.as_ref().unwrap().body.as_ref(), SetExpr::Query(_))),
+                        "{sql}");
+                }
+                for sql in [
+                    "INSERT INTO t (VALUES) VALUES ROW(7)",
+                    "INSERT INTO t (`VALUES`) VALUES ROW(7)",
+                    "INSERT INTO t (`VALUES`) (VALUES ROW(7))",
+                ] {
+                    let parsed = Parser::parse_sql(&dialect, sql).unwrap();
+                    let Statement::Insert(insert) = &parsed[0] else {
+                        panic!("the original target column list: {sql}")
+                    };
+                    assert!(matches!(insert.columns.as_slice(), [Expr::Identifier(column)]
+                        if column.value == "VALUES"), "{sql}");
+                }
+                for sql in [
+                    "INSERT INTO t (`VALUES` ROW(7))",
+                    "INSERT INTO t (VALUES `ROW`(7))",
+                ] {
+                    assert!(Parser::parse_sql(&dialect, sql).is_err(), "{sql}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parenthesized_values_insert_is_a_capability_not_mysql_type_identity() {
+    use sqlparser::dialect::{Dialect, PostgreSqlDialect};
+    use sqlparser::parser::Parser;
+
+    #[derive(Debug)]
+    struct MySqlIdentityWithoutParenthesizedValues;
+    impl Dialect for MySqlIdentityWithoutParenthesizedValues {
+        fn dialect(&self) -> std::any::TypeId {
+            MySqlDialect {}.dialect()
+        }
+        fn is_identifier_start(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_part(ch)
+        }
+    }
+    #[derive(Debug)]
+    struct ParenthesizedValuesWithoutMySqlIdentity;
+    impl Dialect for ParenthesizedValuesWithoutMySqlIdentity {
+        fn is_identifier_start(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_part(ch)
+        }
+        fn supports_parenthesized_values_in_insert(&self) -> bool {
+            true
+        }
+    }
+    let sql = "INSERT INTO t (VALUES ROW(7))";
+    let disabled = MySqlIdentityWithoutParenthesizedValues;
+    assert_eq!(disabled.dialect(), MySqlDialect {}.dialect());
+    assert!(!disabled.supports_parenthesized_values_in_insert());
+    assert!(Parser::parse_sql(&disabled, sql).is_err());
+    let enabled = ParenthesizedValuesWithoutMySqlIdentity;
+    assert_ne!(enabled.dialect(), MySqlDialect {}.dialect());
+    assert!(Parser::parse_sql(&enabled, sql).is_ok());
+    assert!(!GenericDialect {}.supports_parenthesized_values_in_insert());
+    assert!(Parser::parse_sql(&GenericDialect {}, sql).is_err());
+    assert!(!PostgreSqlDialect {}.supports_parenthesized_values_in_insert());
+    assert!(Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok());
+}
+
+
+#[test]
+fn mysql_lock_tables_retain_original_qualified_parts_and_quoted_boundaries() {
+    for ansi_quotes in [false, true] {
+        for pipes_as_concat in [false, true] {
+            for no_backslash_escapes in [false, true] {
+                let dialect = MySqlDialect::with_options(ansi_quotes, pipes_as_concat, no_backslash_escapes);
+                let sql = "LOCK TABLES `archive`.`v.1` AS r READ LOCAL, archive.customer LOW_PRIORITY WRITE";
+                let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+                assert_eq!(statements[0].to_string(), sql);
+                let Statement::LockTables { tables } = &statements[0] else { panic!("LOCK TABLES") };
+                assert_eq!(tables.len(), 2);
+                let parts = &tables[0].table.0;
+                assert_eq!(parts.len(), 2);
+                for (part, expected) in parts.iter().zip(["archive", "v.1"]) {
+                    let ident = part.as_ident().unwrap();
+                    assert_eq!(ident.value, expected);
+                    assert_eq!(ident.quote_style, Some('`'));
+                    assert_ne!(ident.span, Span::empty());
+                }
+                assert_eq!(tables[0].alias.as_ref().unwrap().value, "r");
+                assert_eq!(tables[0].lock_type, LockTableType::Read { local: true });
+                assert_eq!(tables[1].lock_type, LockTableType::Write { low_priority: true });
+                for literal in ["a.b", "__uni5db_mysql_lock_qualified_6462_74"] {
+                    let sql = format!("LOCK TABLES `{literal}` READ");
+                    let statements = sqlparser::parser::Parser::parse_sql(&dialect, &sql).unwrap();
+                    let Statement::LockTables { tables } = &statements[0] else { panic!("LOCK TABLES") };
+                    assert_eq!(tables[0].table.0.len(), 1);
+                    assert_eq!(tables[0].table.0[0].as_ident().unwrap().value, literal);
+                    assert_eq!(statements[0].to_string(), sql);
+                }
+                if ansi_quotes {
+                    let sql = "LOCK TABLES \"archive\".\"v.1\" READ";
+                    let statement = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+                    assert_eq!(statement[0].to_string(), sql);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_lock_tables_reject_extra_parts_without_creating_query_relations() {
+    for sql in [
+        "LOCK TABLES a.b.c READ", "LOCK TABLES a..b READ", "LOCK TABLES .a READ",
+        "LOCK TABLES a. READ", "LOCK TABLES @name READ", "LOCK TABLES a READ, b.c.d WRITE",
+    ] {
+        assert!(sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(), "{sql}");
+    }
+    let statement = mysql().verified_stmt("LOCK TABLES db.t AS a READ LOCAL, `db`.`other` LOW_PRIORITY WRITE");
+    assert!(matches!(&statement, Statement::LockTables { .. }));
+    #[cfg(feature = "serde")]
+    assert_eq!(serde_json::from_str::<Statement>(&serde_json::to_string(&statement).unwrap()).unwrap(), statement);
+    #[cfg(feature = "visitor")]
+    {
+        let mut relations = 0;
+        let _ = sqlparser::ast::visit_relations(&statement, |_| {
+            relations += 1;
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(relations, 0, "LOCK names do not issue query relation or ACL facts");
+    }
+    let pg = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {},
+        "LOCK TABLE ONLY public.t IN SHARE MODE NOWAIT").unwrap();
+    assert!(matches!(pg[0], Statement::Lock(_)));
 }

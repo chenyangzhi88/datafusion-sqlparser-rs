@@ -549,6 +549,16 @@ impl MySqlText {
         self.source().bytes()?;
         semantic.bytes()
     }
+    /// Lends only the same adapter-bound declaration semantic allocation.
+    /// This does not clone bytes, attach Source, or issue an executable Item.
+    pub fn declaration_occurrence(&self) -> Result<&SqlSourceOccurrence, String> {
+        self.declaration_bytes()?;
+        let MySqlTextSemantic::Declaration(source) = &self.semantic else {
+            unreachable!("declaration_bytes checked this original state")
+        };
+        Ok(source)
+    }
+
     /// Bind one actual single System reduction with its once-converted,
     /// pre-admitted semantic owner and the exact original Source identity.
     pub fn bind_system(
@@ -821,6 +831,68 @@ impl MySqlText {
             })
     }
 
+    /// Resident storage of this text node after catalog decoding. Attached
+    /// source owners keep their own independent admission and are not counted
+    /// as another allocation of this node. This supplies no Source authority.
+    pub fn detached_storage_bytes(&self) -> Option<(usize, usize)> {
+        let bytes = match &self.semantic {
+            MySqlTextSemantic::Detached(bytes)
+            | MySqlTextSemantic::DetachedDeclaration(bytes)
+            | MySqlTextSemantic::DetachedSystem(bytes) => bytes.capacity(),
+            _ => 0,
+        };
+        let segment_bytes = self.segments().iter().try_fold(0usize, |bytes, part| {
+            bytes.checked_add(part.charset.capacity())?
+                .checked_add(part.introducer.as_ref().map_or(0, String::capacity))
+        })?;
+        match &self.segments {
+            MySqlTextSegments::Single(_) => Some((bytes.checked_add(segment_bytes)?, 0)),
+            MySqlTextSegments::Adjacent(owner) => Some((
+                bytes,
+                owner.parts.capacity().checked_mul(core::mem::size_of::<MySqlTextSegment>())?
+                    .checked_add(Self::segment_owner_allocation_bytes())?
+                    .checked_add(segment_bytes)?,
+            )),
+        }
+    }
+
+    /// Validate only custody of this fresh decoded segment allocation. This
+    /// cannot attach an original Source or make detached transport readable.
+    pub fn validate_received_storage_admission(&self) -> Result<(), &'static str> {
+        if let MySqlTextSegments::Adjacent(owner) = &self.segments {
+            if owner.admission.is_some() || Arc::strong_count(owner) != 1 || Arc::weak_count(owner) != 0 {
+                return Err("received text segments already have custody or borrowers");
+            }
+        }
+        Ok(())
+    }
+
+    /// Install the original receiving loan before this physical segment owner
+    /// can be shared by a definition/AST clone. Source roles remain detached.
+    pub fn retain_received_storage_admission(&mut self, admission: SqlSourceAdmission) -> Result<(), &'static str> {
+        self.validate_received_storage_admission()?;
+        if let MySqlTextSegments::Adjacent(owner) = &mut self.segments {
+            Arc::get_mut(owner).ok_or("received text segments lost uniqueness")?.admission = Some(admission);
+        }
+        Ok(())
+    }
+
+    /// New owned buffers created by Clone. Adjacent immutable segment owners
+    /// and attached Source owners retain their existing admission on clone.
+    pub fn clone_owned_storage_bytes(&self) -> Option<usize> {
+        let semantic = match &self.semantic {
+            MySqlTextSemantic::Detached(bytes)
+            | MySqlTextSemantic::DetachedDeclaration(bytes)
+            | MySqlTextSemantic::DetachedSystem(bytes) => bytes.len(),
+            _ => 0,
+        };
+        match &self.segments {
+            MySqlTextSegments::Single([part]) => semantic.checked_add(part.charset.len())?
+                .checked_add(part.introducer.as_ref().map_or(0, String::len)),
+            MySqlTextSegments::Adjacent(_) => Some(semantic),
+        }
+    }
+
     /// Reattaches detached original ranges and admits the semantic transport bytes.
     /// Checks segment partition and source bounds. The caller must provide the
     /// matching original source and pre-admit semantic capacity plus any cloned
@@ -943,37 +1015,49 @@ impl Serialize for MySqlText {
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for MySqlText {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Transport {
-            bytes: Vec<u8>,
-            segments: Vec<MySqlTextSegment>,
-            role: MySqlTextRole,
-            declaration: bool,
-            #[serde(default)]
-            system: bool,
+        struct Text;
+        impl<'de> serde::de::Visitor<'de> for Text {
+            type Value = MySqlText;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("MySQL text transport")
+            }
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self, deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                #[derive(Deserialize)]
+                struct Transport {
+                    bytes: Vec<u8>,
+                    segments: Vec<MySqlTextSegment>,
+                    role: MySqlTextRole,
+                    declaration: bool,
+                    #[serde(default)]
+                    system: bool,
+                }
+                let value = Transport::deserialize(deserializer)?;
+                if value.system && value.declaration {
+                    return Err(serde::de::Error::custom(
+                        "conflicting System/declaration transport states",
+                    ));
+                }
+                check_mysql_text_segments(&value.segments, value.bytes.len())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(MySqlText {
+                    semantic: if value.system {
+                        MySqlTextSemantic::DetachedSystem(value.bytes)
+                    } else if value.declaration {
+                        MySqlTextSemantic::DetachedDeclaration(value.bytes)
+                    } else {
+                        MySqlTextSemantic::Detached(value.bytes)
+                    },
+                    segments: MySqlTextSegments::Adjacent(Arc::new(MySqlTextSegmentOwner {
+                        parts: value.segments,
+                        admission: None,
+                    })),
+                    role: value.role,
+                })
+            }
         }
-        let value = Transport::deserialize(deserializer)?;
-        if value.system && value.declaration {
-            return Err(serde::de::Error::custom(
-                "conflicting System/declaration transport states",
-            ));
-        }
-        check_mysql_text_segments(&value.segments, value.bytes.len())
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            semantic: if value.system {
-                MySqlTextSemantic::DetachedSystem(value.bytes)
-            } else if value.declaration {
-                MySqlTextSemantic::DetachedDeclaration(value.bytes)
-            } else {
-                MySqlTextSemantic::Detached(value.bytes)
-            },
-            segments: MySqlTextSegments::Adjacent(Arc::new(MySqlTextSegmentOwner {
-                parts: value.segments,
-                admission: None,
-            })),
-            role: value.role,
-        })
+        deserializer.deserialize_newtype_struct("Sqlparser.MySqlText", Text)
     }
 }
 
@@ -992,8 +1076,7 @@ macro_rules! source_visit_noop {
 source_visit_noop!(
     SqlSourceOccurrence,
     SqlCppPieceRange,
-    SqlCppLedger,
-    MySqlProjectionLiteral
+    SqlCppLedger
 );
 
 /// A projection's original grammar naming fact, not a second executable
@@ -1015,8 +1098,36 @@ impl MySqlProjectionLiteral {
 }
 
 #[cfg(feature = "visitor")]
+impl crate::ast::Visit for MySqlProjectionLiteral {
+    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS {
+            crate::ast::visitor::visit_allocation_storage(&self.0, visitor, false)?;
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+}
+#[cfg(feature = "visitor")]
+impl crate::ast::VisitMut for MySqlProjectionLiteral {
+    fn visit<V: crate::ast::VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_STORAGE_METADATA {
+            crate::ast::visitor::visit_storage_metadata_mut(&mut self.0, visitor)?;
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg(feature = "visitor")]
 impl crate::ast::Visit for MySqlText {
     fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS {
+            if V::VISIT_CLONE_ALLOCATIONS {
+                visitor.visit_allocation(self.clone_owned_storage_bytes(), false)?;
+            } else {
+                let storage = self.detached_storage_bytes();
+                visitor.visit_allocation(storage.map(|(owned, _)| owned), false)?;
+                visitor.visit_allocation(storage.map(|(_, shared)| shared), true)?;
+            }
+        }
         visitor.pre_visit_mysql_text(self)?;
         visitor.post_visit_mysql_text(self)
     }

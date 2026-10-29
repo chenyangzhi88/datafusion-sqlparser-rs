@@ -734,7 +734,7 @@ impl fmt::Display for DataType {
                 if modifiers.is_empty() {
                     write!(f, "{ty}")
                 } else {
-                    write!(f, "{}({})", ty, modifiers.join(", "))
+                    write!(f, "{}({})", ty, display_comma_separated(modifiers))
                 }
             }
             DataType::MySqlEnum(vals) | DataType::MySqlSet(vals) => {
@@ -886,15 +886,14 @@ fn format_datetime_precision_and_tz(
     time_zone: &TimezoneInfo,
 ) -> fmt::Result {
     write!(f, "{sql_type}")?;
-    let len_fmt = len.as_ref().map(|l| format!("({l})")).unwrap_or_default();
-
-    match time_zone {
-        TimezoneInfo::Tz => {
-            write!(f, "{time_zone}{len_fmt}")?;
-        }
-        _ => {
-            write!(f, "{len_fmt}{time_zone}")?;
-        }
+    if matches!(time_zone, TimezoneInfo::Tz) {
+        write!(f, "{time_zone}")?;
+    }
+    if let Some(len) = len {
+        write!(f, "({len})")?;
+    }
+    if !matches!(time_zone, TimezoneInfo::Tz) {
+        write!(f, "{time_zone}")?;
     }
 
     Ok(())

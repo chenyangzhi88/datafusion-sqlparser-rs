@@ -3730,6 +3730,86 @@ mod mysql_byte_source {
         assert_eq!(facts.live.load(Ordering::SeqCst), 0);
         assert_eq!(facts.system_text_live.load(Ordering::SeqCst), 0);
     }
+    #[test]
+    fn original_mysql_source_keeps_session_local_and_next_transaction_scopes() {
+        for (sql, session) in [
+            ("SET SESSION TRANSACTION READ ONLY", true),
+            ("SET LOCAL TRANSACTION READ WRITE", true),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                true,
+            ),
+            ("SET TRANSACTION READ ONLY", false),
+        ] {
+            let facts = Facts::new("utf8mb4");
+            let original = parsed(sql.as_bytes(), &facts, false, false);
+            let Statement::Set(Set::SetTransaction {
+                session: actual,
+                modes,
+                ..
+            }) = &original.statement
+            else {
+                panic!("original transaction grammar: {sql}");
+            };
+            assert_eq!(*actual, session, "{sql}");
+            assert_eq!(modes.len(), 1);
+            assert_eq!(cpp(&original), sql.as_bytes(), "no inserted grammar tokens");
+            drop(original);
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
+        let facts = Facts::new("utf8mb4");
+        let original = parsed(b"SET GLOBAL TRANSACTION READ ONLY", &facts, false, false);
+        assert!(matches!(&original.statement,
+                Statement::Set(Set::SetGlobalTransaction { modes }) if modes.len() == 1));
+        assert_eq!(cpp(&original), b"SET GLOBAL TRANSACTION READ ONLY");
+        drop(original);
+        assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn original_transaction_scope_uses_the_capability_with_every_mysql_option_combination() {
+        use crate::dialect::Dialect;
+        for mask in 0..8 {
+            let dialect = MySqlDialect::with_options(mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            assert!(dialect.supports_set_transaction_scope());
+            for (sql, session) in [
+                ("SET SESSION TRANSACTION READ ONLY", Some(true)),
+                ("SET LOCAL TRANSACTION READ WRITE", Some(true)),
+                ("SET TRANSACTION READ ONLY", Some(false)),
+                ("SET GLOBAL TRANSACTION READ ONLY", None),
+            ] {
+                let facts = Facts::new("utf8mb4");
+                let owner = facts.owner(sql.as_bytes().to_vec());
+                let original = Parser::new(&dialect)
+                    .try_with_mysql_source(owner.occurrence(0..sql.len()).unwrap(), &facts)
+                    .unwrap()
+                    .parse_next_mysql_source()
+                    .unwrap()
+                    .expect("original statement");
+                match (&original.statement, session) {
+                    (
+                        Statement::Set(Set::SetTransaction {
+                            session: actual,
+                            modes,
+                            ..
+                        }),
+                        Some(expected),
+                    ) => {
+                        assert_eq!(*actual, expected, "options={mask}: {sql}");
+                        assert_eq!(modes.len(), 1);
+                    }
+                    (Statement::Set(Set::SetGlobalTransaction { modes }), None) => {
+                        assert_eq!(modes.len(), 1);
+                    }
+                    _ => panic!("options={mask}: {sql} lost its original transaction scope"),
+                }
+                assert_eq!(cpp(&original), sql.as_bytes(), "options={mask}: {sql}");
+                drop(original);
+                drop(owner);
+                assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
 }
 
 fn parse_one(sql: &str) -> Statement {
@@ -5158,5 +5238,132 @@ fn mysql_boolean_declarations_are_native_tinyint_one_and_pg_keeps_boolean() {
     for invalid in ["BOOLEAN(2)", "BOOL SIGNED", "BOOLEAN UNSIGNED", "BOOLEAN ZEROFILL"] {
         assert!(Parser::parse_sql(&MySqlDialect {}, &format!("CREATE TABLE b(v {invalid})")).is_err(),
             "native BOOL has its own grammar without numeric modifiers: {invalid}");
+    }
+}
+
+
+#[test]
+fn mysql_transaction_context_is_carried_by_the_actual_set_ast_and_other_dialects_stay_unchanged() {
+    for scope in ["SESSION", "LOCAL"] {
+        for mode in [
+            "READ ONLY",
+            "READ WRITE",
+            "ISOLATION LEVEL READ COMMITTED, READ ONLY",
+        ] {
+            let sql = format!("SET /* original */ {scope} TRANSACTION {mode}");
+            assert!(
+                matches!(
+                    parse_one(&sql),
+                    Statement::Set(Set::SetTransaction {
+                        session: true,
+                        snapshot: None,
+                        ..
+                    })
+                ),
+                "{sql}"
+            );
+        }
+    }
+    assert!(matches!(
+        parse_one("SET TRANSACTION READ ONLY"),
+        Statement::Set(Set::SetTransaction { session: false, .. })
+    ));
+    assert!(matches!(
+        parse_one("SET GLOBAL TRANSACTION READ ONLY"),
+        Statement::Set(Set::SetGlobalTransaction { .. })
+    ));
+    for dialect in [
+        &crate::dialect::GenericDialect {} as &dyn crate::dialect::Dialect,
+        &crate::dialect::PostgreSqlDialect {} as &dyn crate::dialect::Dialect,
+    ] {
+        for scope in ["SESSION", "LOCAL"] {
+            let sql = format!("SET {scope} TRANSACTION READ ONLY");
+            let statements = Parser::parse_sql(dialect, &sql).unwrap();
+            assert!(
+                matches!(
+                    &statements[..],
+                    [Statement::Set(Set::SetTransaction { session: false, .. })]
+                ),
+                "{sql}"
+            );
+        }
+        assert!(matches!(
+            &Parser::parse_sql(
+                dialect,
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+            )
+            .unwrap()[..],
+            [Statement::Set(Set::SetTransaction { session: true, .. })]
+        ));
+    }
+}
+
+#[test]
+fn set_transaction_scope_is_a_dialect_capability_independent_of_mysql_type_identity() {
+    use crate::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
+    use core::any::TypeId;
+
+    #[derive(Debug)]
+    struct WrappedDialect {
+        transaction_scope: bool,
+        mysql_identity: bool,
+    }
+
+    impl Dialect for WrappedDialect {
+        fn dialect(&self) -> TypeId {
+            if self.mysql_identity {
+                TypeId::of::<MySqlDialect>()
+            } else {
+                TypeId::of::<Self>()
+            }
+        }
+
+        fn is_identifier_start(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_start(ch)
+        }
+
+        fn is_identifier_part(&self, ch: char) -> bool {
+            MySqlDialect {}.is_identifier_part(ch)
+        }
+
+        fn supports_set_transaction_scope(&self) -> bool {
+            self.transaction_scope
+        }
+    }
+
+    assert!(MySqlDialect {}.supports_set_transaction_scope());
+    assert!(!GenericDialect {}.supports_set_transaction_scope());
+    assert!(!PostgreSqlDialect {}.supports_set_transaction_scope());
+    for mysql_identity in [false, true] {
+        for transaction_scope in [false, true] {
+            let wrapped = WrappedDialect {
+                transaction_scope,
+                mysql_identity,
+            };
+            let dialect: &dyn Dialect = &wrapped;
+            assert_eq!(dialect.is::<MySqlDialect>(), mysql_identity);
+            for scope in ["SESSION", "LOCAL"] {
+                let sql = format!("SET {scope} TRANSACTION READ ONLY");
+                let statements = Parser::parse_sql(dialect, &sql).unwrap();
+                assert!(
+                    matches!(&statements[..],
+                    [Statement::Set(Set::SetTransaction { session, snapshot: None, .. })]
+                        if *session == transaction_scope),
+                    "identity={mysql_identity}, capability={transaction_scope}: {sql}"
+                );
+            }
+            assert!(matches!(
+                &Parser::parse_sql(dialect, "SET TRANSACTION READ ONLY").unwrap()[..],
+                [Statement::Set(Set::SetTransaction { session: false, .. })]
+            ));
+            assert!(matches!(
+                &Parser::parse_sql(
+                    dialect,
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+                )
+                .unwrap()[..],
+                [Statement::Set(Set::SetTransaction { session: true, .. })]
+            ));
+        }
     }
 }

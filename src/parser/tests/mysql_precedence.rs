@@ -47,3 +47,26 @@ fn generic_dialect_keeps_its_existing_caret_precedence() {
             if matches!(*left, Expr::BinaryOp { op: BinaryOperator::Plus, .. })
     ));
 }
+
+#[test]
+fn mysql_like_escape_keeps_its_introduced_literal_as_the_original_child() {
+    let expression = projected_expression(&MySqlDialect {},
+        "SELECT variable_name LIKE _latin1'Ssl!_%' ESCAPE _latin1'!' AND enabled = 1");
+    let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expression else {
+        panic!("ESCAPE must not consume the following condition");
+    };
+    assert!(matches!(*right, Expr::BinaryOp { op: BinaryOperator::Eq, .. }));
+    let Expr::Like { pattern, escape_char: Some(escape), .. } = *left else {
+        panic!("the original LIKE owns its escape child");
+    };
+    for child in [pattern, escape] {
+        assert!(matches!(*child, Expr::Prefixed { prefix, value }
+            if prefix.value == "_latin1" && matches!(*value, Expr::Value(_))));
+    }
+    let plain = projected_expression(&MySqlDialect {},
+        "SELECT variable_name LIKE 'Ssl!_%' ESCAPE '!'");
+    assert!(matches!(plain, Expr::Like { escape_char: Some(escape), .. }
+        if matches!(*escape, Expr::Value(_))));
+    assert!(Parser::parse_sql(&MySqlDialect {},
+        "SELECT variable_name LIKE 'x' ESCAPE _latin1").is_err());
+}

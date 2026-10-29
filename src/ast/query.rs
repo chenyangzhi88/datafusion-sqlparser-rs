@@ -865,6 +865,7 @@ impl fmt::Display for CteCycleClause {
 #[cfg(feature = "visitor")]
 impl Visit for CteSearchClause {
     fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS { visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.key_indices.len() } else { self.key_indices.capacity() }).checked_mul(core::mem::size_of::<usize>()), false)?; }
         self.columns.visit(visitor)?;
         self.sequence_column.visit(visitor)
     }
@@ -879,6 +880,7 @@ impl VisitMut for CteSearchClause {
 #[cfg(feature = "visitor")]
 impl Visit for CteCycleClause {
     fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS { visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.key_indices.len() } else { self.key_indices.capacity() }).checked_mul(core::mem::size_of::<usize>()), false)?; }
         self.columns.visit(visitor)?;
         self.mark_column.visit(visitor)?;
         if let Some((value, default)) = &self.mark_values {

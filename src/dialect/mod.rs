@@ -349,6 +349,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true when a supported aggregate `SEPARATOR` clause uses the
+    /// native text_string grammar rather than an arbitrary literal value.
+    fn supports_text_string_separator(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports `PARTITION BY` appearing after `ORDER BY`
     /// in a `CREATE TABLE` statement (in addition to the standard placement before `ORDER BY`).
     ///
@@ -437,6 +443,12 @@ pub trait Dialect: Debug + Any {
 
     /// Returns true if the dialect supports `BEGIN {DEFERRED | IMMEDIATE | EXCLUSIVE | TRY | CATCH} [TRANSACTION]` statements
     fn supports_start_transaction_modifier(&self) -> bool {
+        false
+    }
+
+    /// Returns true if `SET SESSION TRANSACTION` and `SET LOCAL TRANSACTION`
+    /// set the session transaction characteristics, rather than the next transaction.
+    fn supports_set_transaction_scope(&self) -> bool {
         false
     }
 
@@ -1311,6 +1323,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Supports a parenthesized explicit VALUES ROW query as an INSERT source.
+    fn supports_parenthesized_values_in_insert(&self) -> bool {
+        false
+    }
+
     /// Does the dialect support table function in insertion?
     fn supports_insert_table_function(&self) -> bool {
         false
@@ -1486,6 +1503,11 @@ pub trait Dialect: Debug + Any {
     /// Supports a final, non-comma `PARTITION BY` or `REMOVE PARTITIONING`
     /// tail after the ordinary `ALTER TABLE` action list.
     fn supports_alter_table_partition_tail(&self) -> bool {
+        false
+    }
+
+    /// Supports `ALTER TABLE ... ENGINE [=] engine_name` as a table option.
+    fn supports_alter_table_engine_option(&self) -> bool {
         false
     }
 
@@ -2032,6 +2054,14 @@ mod tests {
         struct WrappedDialect(MySqlDialect);
 
         impl Dialect for WrappedDialect {
+            fn supports_text_string_separator(&self) -> bool {
+                self.0.supports_text_string_separator()
+            }
+
+            fn supports_alter_table_engine_option(&self) -> bool {
+                self.0.supports_alter_table_engine_option()
+            }
+
             fn dialect(&self) -> std::any::TypeId {
                 self.0.dialect()
             }
@@ -2087,6 +2117,10 @@ mod tests {
                 self.0.convert_type_before_value()
             }
 
+            fn supports_parenthesized_values_in_insert(&self) -> bool {
+                self.0.supports_parenthesized_values_in_insert()
+            }
+
             fn parse_prefix(
                 &self,
                 parser: &mut sqlparser::parser::Parser,
@@ -2130,6 +2164,11 @@ mod tests {
         assert_eq!(res1, res2);
         let wrapped = WrappedDialect(MySqlDialect {});
         assert!(!wrapped.supports_time_zone_in_array_cast());
+        assert!(wrapped.supports_parenthesized_values_in_insert());
+        let values_insert = "INSERT INTO t (VALUES ROW(7))";
+        let native = Parser::parse_sql(&MySqlDialect {}, values_insert);
+        assert!(native.is_ok());
+        assert_eq!(Parser::parse_sql(&wrapped, values_insert), native);
         for target in ["TIME WITH TIME ZONE", "TIME(6) WITHOUT TIME ZONE", "TIMETZ"] {
             let sql = format!("SELECT CAST(j AS {target} ARRAY)");
             let native = Parser::parse_sql(&MySqlDialect {}, &sql);

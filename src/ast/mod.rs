@@ -1334,7 +1334,7 @@ pub enum Expr {
         /// Pattern expression.
         pattern: Box<Expr>,
         /// Optional escape character.
-        escape_char: Option<ValueWithSpan>,
+        escape_char: Option<Box<Expr>>,
     },
     /// `ILIKE` (case-insensitive `LIKE`)
     ILike {
@@ -1347,7 +1347,7 @@ pub enum Expr {
         /// Pattern expression.
         pattern: Box<Expr>,
         /// Optional escape character.
-        escape_char: Option<ValueWithSpan>,
+        escape_char: Option<Box<Expr>>,
     },
     /// `SIMILAR TO` regex
     SimilarTo {
@@ -1360,7 +1360,7 @@ pub enum Expr {
         /// Pattern expression.
         pattern: Box<Expr>,
         /// Optional escape character.
-        escape_char: Option<ValueWithSpan>,
+        escape_char: Option<Box<Expr>>,
     },
     /// MySQL: `RLIKE` regex or `REGEXP` regex
     RLike {
@@ -11797,8 +11797,9 @@ impl fmt::Display for SearchModifier {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct LockTable {
-    /// The table identifier to lock.
-    pub table: Ident,
+    /// The original unqualified or database-qualified table name to lock.
+    /// This declaration is not a query relation or an access grant.
+    pub table: ObjectName,
     /// Optional alias for the table.
     pub alias: Option<Ident>,
     /// The type of lock to apply to the table.
@@ -13601,6 +13602,37 @@ pub enum OptimizerHintStyle {
 // Allocation leases are not logical facts or serialization authority. The
 // original Source occurrence itself deserializes detached and must reattach.
 impl OptimizerHintStyle {
+    /// Receiving memory custody is independent of native hint binding. The
+    /// original Source occurrences stay detached after this installation.
+    pub fn validate_received_storage_admission(&self) -> Result<(), &'static str> {
+        let unique = |owner: &Arc<Vec<MySqlHintDirective>>| Arc::strong_count(owner) == 1 && Arc::weak_count(owner) == 0;
+        let valid = match self {
+            Self::MySqlBoundSource { directives, syntax, admission, unsupported, .. } => {
+                admission.is_none() && unique(directives)
+                    && Arc::strong_count(syntax) == 1 && Arc::weak_count(syntax) == 0
+                    && unsupported.as_ref().is_none_or(|text| Arc::strong_count(text) == 1 && Arc::weak_count(text) == 0)
+            }
+            Self::MySqlNoRangeOptimization { query_block_name, source_admissions, .. } => {
+                source_admissions.0.is_none() && source_admissions.1.is_none()
+                    && query_block_name.as_ref().is_none_or(|(owner, _)| unique(owner))
+            }
+            _ => true,
+        };
+        if valid { Ok(()) } else { Err("received hint storage already has custody or borrowers") }
+    }
+
+    /// Retain the receiving allocation loan without attaching native Source
+    /// occurrences or authorizing hint execution.
+    pub fn retain_received_storage_admission(&mut self, receiving: SqlSourceAdmission) -> Result<(), &'static str> {
+        self.validate_received_storage_admission()?;
+        match self {
+            Self::MySqlBoundSource { admission, .. } => *admission = Some(receiving),
+            Self::MySqlNoRangeOptimization { source_admissions, .. } => source_admissions.0 = Some(receiving),
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn ordinal(&self) -> u8 {
         match self {
             Self::SingleLine { .. } => 0,
@@ -13723,13 +13755,55 @@ impl core::hash::Hash for OptimizerHintStyle {
 // Expr children to be rebound or made mutable by a copied AST visitor.
 #[cfg(feature = "visitor")]
 impl Visit for OptimizerHintStyle {
-    fn visit<V: Visitor>(&self, _visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if !V::VISIT_ALLOCATIONS { return core::ops::ControlFlow::Continue(()); }
+        use visitor::visit_allocation_storage;
+        let arc_vec_header = core::mem::size_of::<Vec<MySqlHintDirective>>()
+            + 2 * core::mem::size_of::<usize>();
+        match self {
+            Self::SingleLine { prefix } => visit_allocation_storage(prefix, visitor, false)?,
+            Self::MySqlBoundSource { directives, syntax, unsupported, .. } => {
+                visitor.visit_allocation(Some(arc_vec_header), true)?;
+                visit_allocation_storage(directives.as_ref(), visitor, true)?;
+                visitor.visit_allocation(Some(core::mem::size_of::<Vec<(usize, String)>>()
+                    + 2 * core::mem::size_of::<usize>()), true)?;
+                visit_allocation_storage(syntax.as_ref(), visitor, true)?;
+                if let Some(value) = unsupported {
+                    let layout = core::alloc::Layout::new::<[usize; 2]>()
+                        .extend(core::alloc::Layout::for_value(value.as_ref()))
+                        .ok().map(|(layout, _)| layout.pad_to_align().size());
+                    visitor.visit_allocation(layout, true)?;
+                }
+            }
+            Self::MySqlNoRangeOptimization { query_block_name, table, indexes, .. } => {
+                if let Some((directives, _)) = query_block_name {
+                    visitor.visit_allocation(Some(arc_vec_header), true)?;
+                    visit_allocation_storage(directives.as_ref(), visitor, true)?;
+                }
+                visit_allocation_storage(table, visitor, false)?;
+                visit_allocation_storage(indexes, visitor, false)?;
+            }
+            Self::MultiLine | Self::MySqlSource(_) | Self::MySqlDeleteModifier(_) => {}
+        }
         core::ops::ControlFlow::Continue(())
     }
 }
 #[cfg(feature = "visitor")]
 impl VisitMut for OptimizerHintStyle {
-    fn visit<V: VisitorMut>(&mut self, _visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_STORAGE_METADATA {
+            visitor.visit_optimizer_hint_storage(self)?;
+            // The receiving pass validates uniqueness before either walk.
+            // Ordinary semantic visitors still have no hint-program children.
+            let directives = match self {
+                Self::MySqlBoundSource { directives, .. } => Some(directives),
+                Self::MySqlNoRangeOptimization { query_block_name: Some((directives, _)), .. } => Some(directives),
+                _ => None,
+            };
+            if let Some(directives) = directives.and_then(Arc::get_mut) {
+                visitor::visit_storage_metadata_mut(directives, visitor)?;
+            }
+        }
         core::ops::ControlFlow::Continue(())
     }
 }

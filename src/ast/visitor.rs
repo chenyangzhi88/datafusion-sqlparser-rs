@@ -72,6 +72,10 @@ impl<T: Visit> Visit for Option<T> {
 
 impl<T: Visit> Visit for Vec<T> {
     fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS {
+            let count = if V::VISIT_CLONE_ALLOCATIONS { self.len() } else { self.capacity() };
+            visitor.visit_allocation(count.checked_mul(core::mem::size_of::<T>()), false)?;
+        }
         for v in self {
             v.visit(visitor)?;
         }
@@ -81,6 +85,7 @@ impl<T: Visit> Visit for Vec<T> {
 
 impl<T: Visit> Visit for Box<T> {
     fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS { visitor.visit_allocation(Some(core::mem::size_of::<T>()), false)?; }
         T::visit(self, visitor)
     }
 }
@@ -124,7 +129,53 @@ macro_rules! visit_noop {
     };
 }
 
-visit_noop!(u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool, String);
+visit_noop!(u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool);
+
+impl Visit for String {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS {
+            visitor.visit_allocation(Some(if V::VISIT_CLONE_ALLOCATIONS { self.len() } else { self.capacity() }), false)?;
+        }
+        ControlFlow::Continue(())
+    }
+}
+impl VisitMut for String {
+    fn visit<V: VisitorMut>(&mut self, _: &mut V) -> ControlFlow<V::Break> {
+        ControlFlow::Continue(())
+    }
+}
+
+/// Visit storage inside metadata that is deliberately not an executable AST
+/// child. Only allocation hooks are forwarded; semantic visitors keep their
+/// existing source/evaluation frontier and traversal order.
+pub(crate) fn visit_allocation_storage<T: Visit, V: Visitor>(
+    value: &T,
+    visitor: &mut V,
+    shared: bool,
+) -> ControlFlow<V::Break> {
+    if !V::VISIT_ALLOCATIONS {
+        return ControlFlow::Continue(());
+    }
+    // Erase the outer visitor type: metadata may itself contain another
+    // hint, so Storage<Storage<V>> would grow a new monomorph at each level.
+    struct Storage<'a, B, const CLONE: bool> {
+        allocation: &'a mut dyn FnMut(Option<usize>, bool) -> ControlFlow<B>,
+    }
+    impl<B, const CLONE: bool> Visitor for Storage<'_, B, CLONE> {
+        type Break = B;
+        const VISIT_ALLOCATIONS: bool = true;
+        const VISIT_CLONE_ALLOCATIONS: bool = CLONE;
+        fn visit_allocation(&mut self, bytes: Option<usize>, shared: bool) -> ControlFlow<B> {
+            (self.allocation)(bytes, shared)
+        }
+    }
+    let mut allocation = |bytes, nested_shared| visitor.visit_allocation(bytes, shared || nested_shared);
+    if V::VISIT_CLONE_ALLOCATIONS {
+        value.visit(&mut Storage::<V::Break, true> { allocation: &mut allocation })
+    } else {
+        value.visit(&mut Storage::<V::Break, false> { allocation: &mut allocation })
+    }
+}
 
 // A tuple can contain real AST children (for example MySQL trigger ordering).
 // Traverse both components in source order rather than skipping the pair.
@@ -215,6 +266,24 @@ pub trait Visitor {
     /// boxing it with `Box` to minimize stack usage.
     type Break;
 
+    /// Allocation traversal is opt-in at monomorphization. Ordinary semantic
+    /// visitors incur no storage traversal or runtime feature branch.
+    const VISIT_ALLOCATIONS: bool = false;
+
+    /// Account new owned buffers created by Clone using initialized lengths,
+    /// while existing immutable Arc payloads remain shared. Only allocation
+    /// visitors select this; executable traversal remains unchanged.
+    const VISIT_CLONE_ALLOCATIONS: bool = false;
+
+    /// Actual resident storage reached by this traversal. `None` reports a
+    /// checked capacity overflow, never an inferred allocation or authority.
+    /// Shared storage is reported separately so deep-copy admission can borrow
+    /// the original owner instead of charging another copy. The default hook
+    /// does nothing and changes no semantic visitation or evaluation order.
+    fn visit_allocation(&mut self, _bytes: Option<usize>, _shared: bool) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+
     /// Invoked for any queries that appear in the AST before visiting children
     fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
         ControlFlow::Continue(())
@@ -304,6 +373,57 @@ pub trait Visitor {
     }
 }
 
+/// Storage-only access to metadata that is intentionally not an executable
+/// AST child. Receiving custody never rewrites expressions or visits Items.
+pub(crate) fn visit_storage_metadata_mut<T: VisitMut, V: VisitorMut>(
+    value: &mut T,
+    visitor: &mut V,
+) -> ControlFlow<V::Break> {
+    if !V::VISIT_STORAGE_METADATA {
+        return ControlFlow::Continue(());
+    }
+    // This object-safe borrow forwards only the same storage callbacks. It
+    // owns no visitor, AST, allocation, native Source or execution state.
+    trait Receiver<B> {
+        fn before_expr(&mut self, value: &mut Expr) -> ControlFlow<B>;
+        fn before_text(&mut self, value: &mut MySqlText) -> ControlFlow<B>;
+        fn after_text(&mut self, value: &mut MySqlText) -> ControlFlow<B>;
+        fn hint(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<B>;
+    }
+    impl<V: VisitorMut> Receiver<V::Break> for V {
+        fn before_expr(&mut self, value: &mut Expr) -> ControlFlow<V::Break> {
+            self.pre_visit_expr(value)
+        }
+        fn before_text(&mut self, value: &mut MySqlText) -> ControlFlow<V::Break> {
+            self.pre_visit_mysql_text(value)
+        }
+        fn after_text(&mut self, value: &mut MySqlText) -> ControlFlow<V::Break> {
+            self.post_visit_mysql_text(value)
+        }
+        fn hint(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<V::Break> {
+            self.visit_optimizer_hint_storage(value)
+        }
+    }
+    struct Storage<'a, B>(&'a mut dyn Receiver<B>);
+    impl<B> VisitorMut for Storage<'_, B> {
+        type Break = B;
+        const VISIT_STORAGE_METADATA: bool = true;
+        fn pre_visit_expr(&mut self, value: &mut Expr) -> ControlFlow<B> {
+            self.0.before_expr(value)
+        }
+        fn pre_visit_mysql_text(&mut self, value: &mut MySqlText) -> ControlFlow<B> {
+            self.0.before_text(value)
+        }
+        fn post_visit_mysql_text(&mut self, value: &mut MySqlText) -> ControlFlow<B> {
+            self.0.after_text(value)
+        }
+        fn visit_optimizer_hint_storage(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<B> {
+            self.0.hint(value)
+        }
+    }
+    value.visit(&mut Storage::<V::Break>(visitor))
+}
+
 /// A visitor that can be used to mutate an AST tree.
 ///
 /// `pre_visit_` methods are invoked before visiting all children of the
@@ -354,6 +474,20 @@ pub trait VisitorMut {
     /// stack overflow during recursion. If you need to return an error, consider
     /// boxing it with `Box` to minimize stack usage.
     type Break;
+
+    /// Only the selected receiving-storage pass inspects inert naming/hint
+    /// metadata. Ordinary mutable semantic visitors preserve their frontier.
+    const VISIT_STORAGE_METADATA: bool = false;
+
+    /// Visit inert hint storage only for the receiving pass that explicitly
+    /// enables [`Self::VISIT_STORAGE_METADATA`].
+    fn visit_optimizer_hint_storage(
+        &mut self,
+        _hint: &mut crate::ast::OptimizerHintStyle,
+    ) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
+    }
+
 
     /// Invoked for any queries that appear in the AST before visiting children
     fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {

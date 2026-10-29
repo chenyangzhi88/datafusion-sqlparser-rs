@@ -1475,6 +1475,9 @@ struct MySqlByteState<'a> {
     offset: usize,
     peeked_ascii: Option<char>,
     in_version_comment: bool,
+    // Only numeric-leading-dot qualification consumes this physical adjacency.
+    // Significant Word/Period, hint and charset relationships stay unchanged.
+    previous_word_adjacent: bool,
     has_comment: bool,
     token_start: usize,
     cpp_space: bool,
@@ -3629,6 +3632,7 @@ impl<'a> MySqlTokenCursor<'a> {
                     offset: 0,
                     peeked_ascii: None,
                     in_version_comment: false,
+                    previous_word_adjacent: false,
                     has_comment: false,
                     token_start: 0,
                     cpp_space: false,
@@ -3984,6 +3988,10 @@ impl<'a> MySqlTokenCursor<'a> {
                     word.keyword = Keyword::NoKeyword;
                 }
             }
+            // Every actual separator breaks Word adjacency, even though the
+            // significant predecessor below still owns the original hint role.
+            self.state.raw.as_mut().expect("raw cursor").previous_word_adjacent =
+                matches!(&token, Token::Word(_));
             // This FSM consults only the previous Word/Period class. Do not clone
             // an unbounded literal payload just to retain that lexical relation.
             if !matches!(&token, Token::Whitespace(_)) {
@@ -5337,7 +5345,14 @@ impl<'a> Tokenizer<'a> {
                     // starting with digits can be parsed correctly.
                     if s.value == "." && self.dialect.supports_numeric_prefix() {
                         if let Some(Token::Word(_)) = prev_token {
-                            return Ok(Some(Token::Period));
+                            // Native IDENT_SEP follows a tight Word only.
+                            // A raw significant keyword/Word before a space
+                            // or comment must let .digit start its own number.
+                            // Other previous-Word consumers (notably ._col)
+                            // still receive their unchanged lexical relation.
+                            if chars.raw.as_ref().map_or(true, |raw| raw.previous_word_adjacent) {
+                                return Ok(Some(Token::Period));
+                            }
                         }
                     }
 

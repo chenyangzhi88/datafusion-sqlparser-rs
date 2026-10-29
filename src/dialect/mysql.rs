@@ -19,15 +19,18 @@
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::string::ToString;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 use core::any::TypeId;
 
 use crate::{
-    ast::{BinaryOperator, Expr, LockTable, LockTableType, Statement, UnaryOperator},
+    ast::{BinaryOperator, Expr, LockTable, LockTableType, ObjectName, ObjectNamePart, Statement, UnaryOperator},
     dialect::{Dialect, Precedence},
     keywords::Keyword,
     mysql_keywords::mysql_8_0_46_keyword,
     parser::{Parser, ParserError},
+    tokenizer::Token,
 };
 
 use super::keywords;
@@ -134,6 +137,18 @@ fn parse_mysql_prefix(
 }
 
 impl Dialect for MySqlDialect {
+    fn supports_text_string_separator(&self) -> bool {
+        true
+    }
+
+    fn supports_alter_table_engine_option(&self) -> bool {
+        true
+    }
+
+    fn supports_set_transaction_scope(&self) -> bool {
+        true
+    }
+
     fn supports_time_zone_in_array_cast(&self) -> bool {
         false
     }
@@ -288,6 +303,10 @@ impl Dialect for MySqlDialect {
         true
     }
 
+    fn supports_parenthesized_values_in_insert(&self) -> bool {
+        true
+    }
+
     fn supports_user_host_grantee(&self) -> bool {
         true
     }
@@ -391,6 +410,18 @@ impl Dialect for MySqlDialect {
 }
 
 impl Dialect for MySqlDialectWithOptions {
+    fn supports_text_string_separator(&self) -> bool {
+        MySqlDialect {}.supports_text_string_separator()
+    }
+
+    fn supports_alter_table_engine_option(&self) -> bool {
+        MySqlDialect {}.supports_alter_table_engine_option()
+    }
+
+    fn supports_set_transaction_scope(&self) -> bool {
+        MySqlDialect {}.supports_set_transaction_scope()
+    }
+
     fn supports_time_zone_in_array_cast(&self) -> bool {
         MySqlDialect {}.supports_time_zone_in_array_cast()
     }
@@ -525,6 +556,10 @@ impl Dialect for MySqlDialectWithOptions {
         MySqlDialect {}.supports_insert_set()
     }
 
+    fn supports_parenthesized_values_in_insert(&self) -> bool {
+        MySqlDialect {}.supports_parenthesized_values_in_insert()
+    }
+
     fn supports_user_host_grantee(&self) -> bool {
         MySqlDialect {}.supports_user_host_grantee()
     }
@@ -627,7 +662,26 @@ fn parse_lock_tables(parser: &mut Parser) -> Result<Statement, ParserError> {
 
 // tbl_name [[AS] alias] lock_type
 fn parse_lock_table(parser: &mut Parser) -> Result<LockTable, ParserError> {
-    let table = parser.parse_identifier()?;
+    let mut parts = Vec::new();
+    loop {
+        // The identifier clone and its actual name-parts container belong to
+        // this parser's original Source/CPP loan, before either allocation.
+        let bytes = match &parser.peek_token_ref().token {
+            Token::Word(word) => word.value.len(),
+            Token::SingleQuotedString(value) | Token::DoubleQuotedString(value) => value.len(),
+            _ => 0,
+        };
+        parser.mysql_source_admit_retained(bytes)?;
+        let name = parser.parse_identifier()?;
+        parser.mysql_source_push(&mut parts, ObjectNamePart::Identifier(name))?;
+        if !parser.consume_token(&Token::Period) {
+            break;
+        }
+        if parts.len() == 2 {
+            return parser.expected_ref("one or two name parts in LOCK TABLES", parser.peek_token_ref());
+        }
+    }
+    let table = ObjectName(parts);
     let alias =
         parser.parse_optional_alias(&[Keyword::READ, Keyword::WRITE, Keyword::LOW_PRIORITY])?;
     let lock_type = parse_lock_tables_type(parser)?;

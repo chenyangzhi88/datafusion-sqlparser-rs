@@ -2328,7 +2328,9 @@ fn parse_ilike() {
                 pattern: Box::new(Expr::Value(
                     (Value::SingleQuotedString("%a".to_string())).with_empty_span()
                 )),
-                escape_char: Some(Value::SingleQuotedString('^'.to_string()).with_empty_span()),
+                escape_char: Some(Box::new(Expr::Value(
+                    Value::SingleQuotedString('^'.to_string()).with_empty_span(),
+                ))),
                 quantifier: None,
             },
             select.selection.unwrap()
@@ -2447,7 +2449,9 @@ fn parse_like() {
                 pattern: Box::new(Expr::Value(
                     (Value::SingleQuotedString("%a".to_string())).with_empty_span()
                 )),
-                escape_char: Some(Value::SingleQuotedString('^'.to_string()).with_empty_span()),
+                escape_char: Some(Box::new(Expr::Value(
+                    Value::SingleQuotedString('^'.to_string()).with_empty_span(),
+                ))),
                 quantifier: None,
             },
             select.selection.unwrap()
@@ -2567,7 +2571,9 @@ fn parse_similar_to() {
                 pattern: Box::new(Expr::Value(
                     (Value::SingleQuotedString("%a".to_string())).with_empty_span()
                 )),
-                escape_char: Some(Value::SingleQuotedString('^'.to_string()).with_empty_span()),
+                escape_char: Some(Box::new(Expr::Value(
+                    Value::SingleQuotedString('^'.to_string()).with_empty_span(),
+                ))),
             },
             select.selection.unwrap()
         );
@@ -2585,7 +2591,7 @@ fn parse_similar_to() {
                 pattern: Box::new(Expr::Value(
                     (Value::SingleQuotedString("%a".to_string())).with_empty_span()
                 )),
-                escape_char: Some(Value::Null.with_empty_span()),
+                escape_char: Some(Box::new(Expr::Value(Value::Null.with_empty_span()))),
             },
             select.selection.unwrap()
         );
@@ -2604,7 +2610,9 @@ fn parse_similar_to() {
                 pattern: Box::new(Expr::Value(
                     (Value::SingleQuotedString("%a".to_string())).with_empty_span()
                 )),
-                escape_char: Some(Value::SingleQuotedString('^'.to_string()).with_empty_span()),
+                escape_char: Some(Box::new(Expr::Value(
+                    Value::SingleQuotedString('^'.to_string()).with_empty_span(),
+                ))),
             })),
             select.selection.unwrap()
         );
@@ -18742,18 +18750,23 @@ fn test_parse_not_null_in_column_options() {
         " CHECK (abc IS NOT NULL)",
         ")"
     );
-    all_dialects().verified_stmt(canonical);
-    all_dialects().one_statement_parses_to(
-        concat!(
-            "CREATE TABLE foo (",
-            "abc INT DEFAULT (42 NOT NULL) NOT NULL,",
-            " def INT,",
-            " def_null BOOL GENERATED ALWAYS AS (def NOT NULL) STORED,",
-            " CHECK (abc NOT NULL)",
-            ")"
-        ),
-        canonical,
+    let abbreviated = concat!(
+        "CREATE TABLE foo (",
+        "abc INT DEFAULT (42 NOT NULL) NOT NULL,",
+        " def INT,",
+        " def_null BOOL GENERATED ALWAYS AS (def NOT NULL) STORED,",
+        " CHECK (abc NOT NULL)",
+        ")"
     );
+    let dialects = all_dialects_except(|d| d.is::<MySqlDialect>());
+    dialects.verified_stmt(canonical);
+    dialects.one_statement_parses_to(abbreviated, canonical);
+
+    // MySQL resolves BOOL to its native TINYINT(1) column type.
+    let mysql_canonical = canonical.replace("def_null BOOL", "def_null TINYINT(1)");
+    let mysql = TestedDialects::new(vec![Box::new(MySqlDialect {})]);
+    mysql.one_statement_parses_to(canonical, &mysql_canonical);
+    mysql.one_statement_parses_to(abbreviated, &mysql_canonical);
 }
 
 #[test]

@@ -4301,3 +4301,111 @@ fn json_attribute_source_kinds_are_typed_before_location_decoration_and_foreign_
     );
     let _ = owner.bytes();
 }
+
+
+#[test]
+fn raw_fractional_literals_keep_only_the_adjacent_word_qualification() {
+    let dialect = crate::dialect::MySqlDialect {};
+    for (sql, fractions, periods) in [
+        ("SELECT .25", vec![".25"], 0),
+        ("SELECT CASE WHEN TRUE THEN .25 ELSE .75 END", vec![".25", ".75"], 0),
+        ("SELECT CASE 1 WHEN 1 THEN .25 ELSE .75 END", vec![".25", ".75"], 0),
+        ("SELECT CASE WHEN TRUE THEN/*c*/.25 ELSE\n.75 END", vec![".25", ".75"], 0),
+        ("SELECT CASE WHEN TRUE THEN /*+ QB_NAME(x) */ .25 ELSE/*c*/.75 END", vec![".25", ".75"], 0),
+        ("SELECT /*+ QB_NAME(x) */ .25", vec![".25"], 0),
+        ("SELECT t .25", vec![".25"], 0),
+        ("SELECT t/*c*/.25", vec![".25"], 0),
+        ("SELECT t.15e29,t.15to29", vec![], 2),
+        ("SELECT t ._col", vec![], 1),
+        ("SELECT t/*c*/._col", vec![], 1),
+        ("SELECT t .col", vec![], 1),
+        ("SELECT t/*c*/.col", vec![], 1),
+        // Native bypasses keyword lookup for a tight qualifying Word too.
+        ("SELECT THEN.25", vec![], 1),
+    ] {
+        let facts = first_error_facts();
+        let owner = SqlSourceOwner::adopt(sql.as_bytes().to_vec(), SqlSourceAdmission::new(Arc::new(())));
+        let mut cursor = MySqlTokenCursor::new(
+            &dialect, owner.occurrence(0..sql.len()).unwrap(), &facts, None,
+        ).unwrap();
+        assert_eq!(facts.lexical_calls.get(), 0, "constructing raw cursor cannot scan {sql}");
+        let mut actual_fractions = Vec::new();
+        let mut actual_periods = 0;
+        let mut qualified = Vec::new();
+        while let Some(token) = cursor.next_token().unwrap() {
+            match token.token.token {
+                Token::Number(value, _) if value.starts_with('.') => actual_fractions.push(value),
+                Token::Period => actual_periods += 1,
+                Token::Word(word) if matches!(word.value.as_str(), "15e29" | "15to29" | "25") => qualified.push(word.value),
+                _ => {}
+            }
+        }
+        assert_eq!(actual_fractions, fractions, "{sql}");
+        assert_eq!(actual_periods, periods, "{sql}");
+        if sql == "SELECT t.15e29,t.15to29" {
+            assert_eq!(qualified, ["15e29", "15to29"], "{sql}");
+        }
+        assert!(cursor.next_token().unwrap().is_none(), "EOF cannot replay the raw relation");
+    }
+    // The decoded tokenizer/PG grammar is a separate unchanged entrance.
+    let pg = crate::dialect::PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&pg, "SELECT CASE WHEN TRUE THEN .25 ELSE .75 END")
+        .tokenize().unwrap();
+    assert_eq!(tokens.iter().filter_map(|token| match token {
+        Token::Number(value, _) if value.starts_with('.') => Some(value.as_str()),
+        _ => None,
+    }).collect::<Vec<_>>(), [".25", ".75"]);
+}
+
+
+#[test]
+fn raw_fraction_word_adjacency_keeps_the_original_optimizer_hint_barrier() {
+    struct HintCount<'a> {
+        facts: &'a CommentFacts,
+        calls: Cell<usize>,
+    }
+    impl MySqlSourceAdapter for HintCount<'_> {
+        fn client_charset(&self) -> &str { self.facts.client_charset() }
+        fn client_min_width(&self) -> u8 { self.facts.client_min_width() }
+        fn lexical_unit(&self, bytes: &[u8]) -> Result<MySqlLexicalUnit, MySqlSourceError> {
+            self.facts.lexical_unit(bytes)
+        }
+        fn system_identifier(&self, bytes: &[u8], quoted: bool) -> Result<(String, SqlSourceAdmission), MySqlSourceError> {
+            self.facts.system_identifier(bytes, quoted)
+        }
+        fn system_text(&self, text: &MySqlText) -> Result<(String, SqlSourceAdmission), MySqlSourceError> {
+            self.facts.system_text(text)
+        }
+        fn admit(&self, bytes: usize) -> Result<SqlSourceAdmission, MySqlSourceError> {
+            self.facts.admit(bytes)
+        }
+        fn consume_optimizer_hint(
+            &self,
+            _: &crate::ast::SqlSourceOccurrence,
+            _: &mut MySqlHintEmitter<'_>,
+        ) -> Result<Option<crate::ast::OptimizerHintStyle>, MySqlSourceError> {
+            self.calls.set(self.calls.get() + 1);
+            // This lexical probe has no hint factory or semantic authority.
+            Ok(None)
+        }
+    }
+    let dialect = MySqlDialect {};
+    for (sql, calls) in [
+        ("SELECT /*+ QB_NAME(x) */ .25", 1),
+        ("SELECT /* barrier */ /*+ QB_NAME(x) */ .25", 0),
+        ("SELECT /*+ QB_NAME(x) */ /*+ QB_NAME(y) */ .25", 1),
+    ] {
+        let facts = first_error_facts();
+        let adapter = HintCount { facts: &facts, calls: Cell::new(0) };
+        let owner = SqlSourceOwner::adopt(sql.as_bytes().to_vec(), SqlSourceAdmission::new(Arc::new(())));
+        let mut cursor = MySqlTokenCursor::new(
+            &dialect, owner.occurrence(0..sql.len()).unwrap(), &adapter, None,
+        ).unwrap();
+        let mut numbers = Vec::new();
+        while let Some(token) = cursor.next_token().unwrap() {
+            if let Token::Number(value, _) = token.token.token { numbers.push(value); }
+        }
+        assert_eq!(numbers, [".25"], "{sql}");
+        assert_eq!(adapter.calls.get(), calls, "{sql}");
+    }
+}

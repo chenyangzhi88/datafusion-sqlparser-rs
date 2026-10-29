@@ -2407,9 +2407,9 @@ pub struct MySqlProgramBody {
     pub ordering: Option<(bool, Ident)>,
     /// Native CHARACTER SET / COLLATE suffixes in parameter order. The
     /// actual type and member literals remain in each parameter's DataType.
-    pub parameter_type_modifiers: Vec<String>,
+    pub parameter_type_options: Vec<Vec<ColumnOptionDef>>,
     /// Native RETURNS character modifiers; its DataType stays in the header.
-    pub return_type_modifiers: Option<String>,
+    pub return_type_options: Option<Vec<ColumnOptionDef>>,
 }
 
 impl fmt::Display for CreateProcedureBody {
@@ -4196,6 +4196,15 @@ impl CreateTable {
 impl crate::ast::Visit for CreateTable {
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
+        if V::VISIT_ALLOCATIONS {
+            // These physical vectors are traversed in source order below, so
+            // report storage without introducing a second semantic traversal.
+            if self.validate_source_order().is_ok() {
+                visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.columns.len() } else { self.columns.capacity() }).checked_mul(core::mem::size_of::<ColumnDef>()), false)?;
+                visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.constraints.len() } else { self.constraints.capacity() }).checked_mul(core::mem::size_of::<TableConstraint>()), false)?;
+            }
+            visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.elements.len() } else { self.elements.capacity() }).checked_mul(core::mem::size_of::<CreateTableElement>()), false)?;
+        }
         self.or_replace.visit(visitor)?;
         self.temporary.visit(visitor)?;
         self.external.visit(visitor)?;

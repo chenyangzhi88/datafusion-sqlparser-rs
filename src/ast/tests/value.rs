@@ -367,3 +367,52 @@ fn alias_transport_and_reattachment_do_not_reissue_accepted_alias_or_ident() {
         .is_none());
     assert_eq!(original.alias_system_bytes().unwrap(), b"\xff");
 }
+
+
+#[cfg(feature = "std")]
+#[test]
+fn declaration_occurrence_lends_only_the_same_admitted_semantic_owner() {
+    use crate::ast::MySqlTextRole;
+    let original = SqlSourceOwner::adopt(b"X'FF'".to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    let semantic = SqlSourceOwner::adopt(vec![0xff], SqlSourceAdmission::new(Arc::new(())));
+    let semantic_weak = Arc::downgrade(&semantic);
+    let mut text = MySqlText::from_occurrence(
+        semantic.occurrence(0..1).unwrap(),
+        original.occurrence(0..5).unwrap(),
+        "binary".into(),
+        '\'',
+        None,
+    )
+    .unwrap();
+    assert!(text.declaration_occurrence().is_err());
+    assert!(
+        text.clone()
+            .with_role(MySqlTextRole::Literal)
+            .declaration_occurrence()
+            .is_err()
+    );
+    let foreign = SqlSourceOwner::adopt(b"X'FF'".to_vec(), SqlSourceAdmission::new(Arc::new(())));
+    assert!(
+        text.bind_declaration(
+            semantic.occurrence(0..1).unwrap(),
+            "binary".into(),
+            &foreign
+        )
+        .is_err()
+    );
+    text.bind_declaration(
+        semantic.occurrence(0..1).unwrap(),
+        "binary".into(),
+        &original,
+    )
+    .unwrap();
+    let loan = text.declaration_occurrence().unwrap().clone();
+    assert!(Arc::ptr_eq(loan.owner().unwrap(), &semantic));
+    assert_eq!(loan.bytes().unwrap(), &[0xff]);
+    assert_eq!(loan.range(), 0..1);
+    drop(semantic);
+    drop(text);
+    assert!(semantic_weak.upgrade().is_some());
+    drop(loan);
+    assert!(semantic_weak.upgrade().is_none());
+}
