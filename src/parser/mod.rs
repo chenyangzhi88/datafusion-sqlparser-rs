@@ -14349,9 +14349,13 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             };
-            if options.iter().any(|existing| {
-                core::mem::discriminant(existing) == core::mem::discriminant(&option)
-            }) {
+            // Native keeps each COMMENT in source order and its existing
+            // partition receiver selects the last value before conversion.
+            if !matches!(&option, MySqlPartitionOption::Comment(_))
+                && options.iter().any(|existing| {
+                    core::mem::discriminant(existing) == core::mem::discriminant(&option)
+                })
+            {
                 return Err(ParserError::ParserError(format!(
                     "duplicate MySQL partition option {option}"
                 )));
