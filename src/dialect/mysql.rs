@@ -118,6 +118,17 @@ fn parse_mysql_prefix(
 ) -> Option<Result<Expr, ParserError>> {
     use crate::tokenizer::Token;
 
+    if matches!(&parser.peek_token_ref().token, Token::Word(word)
+        if word.quote_style.is_none() && word.keyword == Keyword::CAST)
+        && parser.peek_nth_token_ref(1).token == Token::LParen
+    {
+        // Native CAST owns its expression before any type production. The
+        // shared typed-string probe would otherwise observe NULL AS type as
+        // custom type modifiers before the real NULL literal can reduce.
+        parser.next_token();
+        return Some(parser.parse_cast_expr(crate::ast::CastKind::Cast));
+    }
+
     let operator = match &parser.peek_token_ref().token {
         Token::ExclamationMark => UnaryOperator::BangNot,
         Token::Plus if pipes_as_concat => UnaryOperator::Plus,
