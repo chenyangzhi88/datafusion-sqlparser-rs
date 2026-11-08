@@ -770,6 +770,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Whether a SELECT destination may follow ORDER BY/LIMIT and its
+    /// locking clauses, as in MySQL's trailing INTO OUTFILE/variable syntax.
+    fn supports_select_into_after_query(&self) -> bool {
+        false
+    }
+
     /// Dialect-specific infix parser override
     ///
     /// This method is called to parse the next infix expression.
@@ -1819,6 +1825,13 @@ pub trait Dialect: Debug + Any {
     /// [Spark SQL](https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select.html)
     fn supports_select_item_multi_column_alias(&self) -> bool {
         false
+    }
+
+    /// Whether expression parsing may probe a custom type name before its
+    /// literal. Dialects with only fixed typed-literal keywords can avoid
+    /// demanding an ordinary function's arguments through a type production.
+    fn supports_custom_type_literal_lookahead(&self) -> bool {
+        true
     }
 
     /// Returns true if the dialect supports XML-related expressions

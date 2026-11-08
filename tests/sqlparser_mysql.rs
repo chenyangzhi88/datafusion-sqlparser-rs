@@ -6453,3 +6453,102 @@ fn mysql_lock_tables_reject_extra_parts_without_creating_query_relations() {
         "LOCK TABLE ONLY public.t IN SHARE MODE NOWAIT").unwrap();
     assert!(matches!(pg[0], Statement::Lock(_)));
 }
+
+#[test]
+fn mysql_trailing_into_reuses_file_destination_after_order_limit_and_locks() {
+    let destination = "INTO OUTFILE '/tmp/stack.dot' FIELDS ESCAPED BY '' LINES TERMINATED BY ''";
+    for ansi_quotes in [false, true] {
+        for pipes_as_concat in [false, true] {
+            for no_backslash_escapes in [false, true] {
+                let dialect =
+                    MySqlDialect::with_options(ansi_quotes, pipes_as_concat, no_backslash_escapes);
+                for (sql, limited, locked) in [
+                    (
+                        format!("SELECT event FROM tmp_events ORDER BY event_id {destination}"),
+                        false,
+                        false,
+                    ),
+                    (
+                        format!(
+                            "SELECT event FROM tmp_events ORDER BY event_id LIMIT 2 {destination}"
+                        ),
+                        true,
+                        false,
+                    ),
+                    (
+                        format!(
+                            "SELECT event FROM tmp_events ORDER BY event_id LIMIT 2 {destination} FOR UPDATE"
+                        ),
+                        true,
+                        true,
+                    ),
+                    (
+                        format!(
+                            "SELECT event FROM tmp_events ORDER BY event_id LIMIT 2 FOR UPDATE {destination}"
+                        ),
+                        true,
+                        true,
+                    ),
+                    (
+                        format!("SELECT event {destination} FROM tmp_events ORDER BY event_id"),
+                        false,
+                        false,
+                    ),
+                    (
+                        format!("SELECT event FROM tmp_events {destination} ORDER BY event_id"),
+                        false,
+                        false,
+                    ),
+                ] {
+                    let statements = sqlparser::parser::Parser::parse_sql(&dialect, &sql)
+                        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                    let Statement::Query(query) = &statements[0] else {
+                        panic!("expected query");
+                    };
+                    assert!(query.order_by.is_some(), "{sql}");
+                    assert_eq!(query.limit_clause.is_some(), limited, "{sql}");
+                    assert_eq!(!query.locks.is_empty(), locked, "{sql}");
+                    let SetExpr::Select(select) = query.body.as_ref() else {
+                        panic!("expected SELECT body");
+                    };
+                    let SelectIntoTarget::File(file) = &select.into.as_ref().unwrap().target else {
+                        panic!("expected same existing file destination");
+                    };
+                    assert_eq!(file.path, "/tmp/stack.dot");
+                    assert_eq!(file.fields_escaped_by.as_deref(), Some(""));
+                    assert_eq!(file.lines_terminated_by.as_deref(), Some(""));
+                    let rendered = statements[0].to_string();
+                    let reparsed =
+                        sqlparser::parser::Parser::parse_sql(&dialect, &rendered).unwrap();
+                    assert_eq!(reparsed[0].to_string(), rendered);
+                }
+            }
+        }
+    }
+    let default_mysql = mysql().one_statement_parses_to(
+        "SELECT event FROM tmp_events ORDER BY event_id INTO OUTFILE '/tmp/stack.dot'",
+        "SELECT event INTO OUTFILE '/tmp/stack.dot' FROM tmp_events ORDER BY event_id",
+    );
+    assert!(matches!(default_mysql, Statement::Query(_)));
+}
+
+#[test]
+fn mysql_trailing_into_rejects_duplicate_or_unsupported_query_destinations() {
+    for sql in [
+        "SELECT event INTO OUTFILE '/tmp/a' FROM tmp_events ORDER BY event_id INTO OUTFILE '/tmp/b'",
+        "SELECT event FROM tmp_events ORDER BY event_id INTO OUTFILE '/tmp/a' INTO OUTFILE '/tmp/b'",
+        "SELECT event FROM tmp_events ORDER BY event_id FOR UPDATE INTO OUTFILE '/tmp/a' FOR SHARE",
+        "SELECT event FROM tmp_events UNION SELECT event FROM tmp_events ORDER BY event_id INTO OUTFILE '/tmp/a'",
+    ] {
+        assert!(
+            sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql).is_err(),
+            "{sql}"
+        );
+    }
+    let trailing = "SELECT event FROM tmp_events ORDER BY event_id INTO OUTFILE '/tmp/stack.dot'";
+    assert!(sqlparser::parser::Parser::parse_sql(&GenericDialect {}, trailing).is_err());
+    assert!(
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, trailing,)
+            .is_err()
+    );
+}

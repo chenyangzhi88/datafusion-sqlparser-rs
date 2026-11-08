@@ -1457,6 +1457,31 @@ mod mysql_byte_source {
     }
 
     #[test]
+    fn canonical_mysql_function_null_arguments_do_not_enter_custom_type_lookahead() {
+        for sql in [
+            b"SELECT REPLACE(NULL,'x',demand_child()) AS v".as_slice(),
+            b"CREATE TABLE demand_ctas AS SELECT REPLACE(NULL,'x',demand_child()) AS v",
+        ] {
+            let facts = digest_facts();
+            let result = parsed(sql, &facts, false, false);
+            let Some(crate::tokenizer::MySqlCanonicalDigestReceipt::Collected(digest)) =
+                result.source_occurrence.canonical_digest()
+            else {
+                panic!("actual function and CTAS Source owns its admitted digest");
+            };
+            assert_eq!(
+                digest.unavailable(),
+                Some(crate::tokenizer::MySqlDigestUnavailable::HashService),
+                "only the fixture's absent hash service is unavailable"
+            );
+            assert_eq!(facts.digest_hash_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.source_occurrence.bytes().unwrap(), sql);
+            drop(result);
+            assert_eq!(facts.live.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
     fn canonical_null_real_alias_union_and_capacity_keep_native_default_reduce_phase() {
         for (sql, prefix) in [
             (b"SELECT NULL n".as_slice(), vec![748u16, 1100]),

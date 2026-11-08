@@ -148,6 +148,10 @@ fn parse_mysql_prefix(
 }
 
 impl Dialect for MySqlDialect {
+    fn supports_custom_type_literal_lookahead(&self) -> bool {
+        false
+    }
+
     fn supports_text_string_separator(&self) -> bool {
         true
     }
@@ -361,6 +365,10 @@ impl Dialect for MySqlDialect {
         true
     }
 
+    fn supports_select_into_after_query(&self) -> bool {
+        true
+    }
+
     fn supports_set_names(&self) -> bool {
         true
     }
@@ -421,6 +429,10 @@ impl Dialect for MySqlDialect {
 }
 
 impl Dialect for MySqlDialectWithOptions {
+    fn supports_custom_type_literal_lookahead(&self) -> bool {
+        false
+    }
+
     fn supports_text_string_separator(&self) -> bool {
         MySqlDialect {}.supports_text_string_separator()
     }
@@ -605,6 +617,10 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_select_modifiers(&self) -> bool {
         MySqlDialect {}.supports_select_modifiers()
+    }
+
+    fn supports_select_into_after_query(&self) -> bool {
+        true
     }
 
     fn supports_set_names(&self) -> bool {

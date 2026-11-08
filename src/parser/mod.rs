@@ -3678,6 +3678,21 @@ impl<'a> Parser<'a> {
         // expression that should parse as the column name "date".
         let loc = self.peek_token_ref().span.start;
         let opt_expr = self.maybe_parse(|parser| {
+            // Probing a normal function as a custom type can demand its
+            // arguments before their real literal reductions. Fixed-keyword
+            // typed-literal grammars stay on the original expression route.
+            if !parser.dialect.supports_custom_type_literal_lookahead()
+                && !matches!(
+                    &parser.peek_token_ref().token,
+                    Token::Word(word) if word.quote_style.is_none() && matches!(
+                        word.keyword,
+                        Keyword::BINARY | Keyword::INTERVAL | Keyword::DATE
+                            | Keyword::TIME | Keyword::TIMESTAMP
+                    )
+                )
+            {
+                return parser_err!("not a typed literal prefix", loc);
+            }
             match parser.parse_data_type()? {
                 DataType::Interval {
                     fields: None,
@@ -20163,7 +20178,7 @@ impl<'a> Parser<'a> {
             }
             .into())
         } else {
-            let body = self.parse_query_body(self.dialect.prec_unknown())?;
+            let mut body = self.parse_query_body(self.dialect.prec_unknown())?;
 
             let order_by = self.parse_optional_order_by()?;
 
@@ -20177,6 +20192,16 @@ impl<'a> Parser<'a> {
                 None
             };
 
+            // MySQL's existing destination may follow the full ORDER/LIMIT
+            // query expression, before or after its locking clauses. Keep it
+            // on the same SELECT; set-operation destinations remain unsupported.
+            if self.dialect.supports_select_into_after_query() {
+                if let SetExpr::Select(select) = body.as_mut() {
+                    if select.into.is_none() && self.parse_keyword(Keyword::INTO) {
+                        select.into = Some(self.parse_select_into(true)?);
+                    }
+                }
+            }
             let mut for_clause = None;
             let mut locks = Vec::new();
             while self.parse_keyword(Keyword::FOR) {
@@ -20185,6 +20210,13 @@ impl<'a> Parser<'a> {
                     break;
                 } else {
                     locks.push(self.parse_lock()?);
+                }
+            }
+            if self.dialect.supports_select_into_after_query() {
+                if let SetExpr::Select(select) = body.as_mut() {
+                    if select.into.is_none() && self.parse_keyword(Keyword::INTO) {
+                        select.into = Some(self.parse_select_into(true)?);
+                    }
                 }
             }
             let format_clause =
