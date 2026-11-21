@@ -20038,7 +20038,15 @@ impl<'a> Parser<'a> {
             });
         }
 
-        match self.maybe_parse(|parser| parser.parse_statement())? {
+        let explained = if describe_alias == DescribeAlias::Explain
+            && dialect_of!(self is MySqlDialect)
+            && self.peek_keyword(Keyword::TABLE)
+        {
+            Some(Statement::Query(self.parse_query()?))
+        } else {
+            self.maybe_parse(|parser| parser.parse_statement())?
+        };
+        match explained {
             Some(Statement::ExplainForConnection { .. })
             | Some(Statement::Explain { .. })
             | Some(Statement::ExplainTable { .. }) => Err(ParserError::ParserError(
@@ -20077,16 +20085,8 @@ impl<'a> Parser<'a> {
                         _ => None,
                     };
 
-                let has_table_keyword = if describe_alias == DescribeAlias::Explain
-                    && dialect_of!(self is MySqlDialect)
-                {
-                    self.parse_keyword(Keyword::TABLE)
-                } else if self.dialect.describe_requires_table_keyword() {
-                    // only allow to use TABLE keyword for DESC|DESCRIBE statement
-                    self.parse_keyword(Keyword::TABLE)
-                } else {
-                    false
-                };
+                let has_table_keyword = self.dialect.describe_requires_table_keyword()
+                    && self.parse_keyword(Keyword::TABLE);
 
                 let table_name = self.parse_object_name(false)?;
                 Ok(Statement::ExplainTable {
