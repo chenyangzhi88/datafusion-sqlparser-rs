@@ -25284,7 +25284,7 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_conflict_clause()
         };
-        let (table, postgres_target_inheritance) = if dialect_of!(self is PostgreSqlDialect) {
+        let (mut table, postgres_target_inheritance) = if dialect_of!(self is PostgreSqlDialect) {
             self.parse_postgres_dml_target()?
         } else {
             (
@@ -25292,6 +25292,25 @@ impl<'a> Parser<'a> {
                 PostgresTargetInheritance::Default,
             )
         };
+        if self.dialect.supports_update_table_reference_list() {
+            while self.consume_token(&Token::Comma) {
+                let next = self.parse_table_and_joins()?;
+                let relation = if next.joins.is_empty() {
+                    next.relation
+                } else {
+                    TableFactor::NestedJoin {
+                        table_with_joins: Box::new(next),
+                        alias: None,
+                    }
+                };
+                table.joins.push(Join {
+                    postgres_using_bindings: None,
+                    relation,
+                    global: false,
+                    join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+                });
+            }
+        }
         let from_before_set = if self.parse_keyword(Keyword::FROM) {
             Some(UpdateTableFromKind::BeforeSet(
                 self.parse_table_with_joins()?,

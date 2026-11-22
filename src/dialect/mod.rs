@@ -553,6 +553,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Whether UPDATE table references support comma-separated groups.
+    fn supports_update_table_reference_list(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports `ORDER BY` in `UPDATE` statements.
     ///
     /// ```sql

@@ -382,6 +382,10 @@ impl Dialect for MySqlDialect {
     }
 
     /// See: <https://dev.mysql.com/doc/refman/8.4/en/update.html>
+    fn supports_update_table_reference_list(&self) -> bool {
+        true
+    }
+
     fn supports_update_order_by(&self) -> bool {
         true
     }
@@ -637,6 +641,10 @@ impl Dialect for MySqlDialectWithOptions {
 
     fn supports_comma_separated_set_assignments(&self) -> bool {
         MySqlDialect {}.supports_comma_separated_set_assignments()
+    }
+
+    fn supports_update_table_reference_list(&self) -> bool {
+        true
     }
 
     fn supports_update_order_by(&self) -> bool {

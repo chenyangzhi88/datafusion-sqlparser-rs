@@ -6552,3 +6552,15 @@ fn mysql_trailing_into_rejects_duplicate_or_unsupported_query_destinations() {
             .is_err()
     );
 }
+
+#[test]
+fn parse_mysql_update_table_reference_list() {
+    mysql().one_statement_parses_to(
+        "UPDATE h, matches_rows AS m SET h.n = h.n + 1, m.v = m.v + 1 WHERE h.v = m.v",
+        "UPDATE h CROSS JOIN matches_rows AS m SET h.n = h.n + 1, m.v = m.v + 1 WHERE h.v = m.v",
+    );
+    mysql().one_statement_parses_to(
+        "UPDATE a, b JOIN c ON b.id = c.id SET a.n = c.n",
+        "UPDATE a CROSS JOIN (b JOIN c ON b.id = c.id) SET a.n = c.n",
+    );
+}
