@@ -1478,6 +1478,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if unquoted `ON` is accepted as a SET variable value.
+    fn supports_set_on_value(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports space-separated column options
     /// in a `CREATE TABLE` statement. For example:
     /// ```sql

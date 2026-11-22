@@ -21386,7 +21386,9 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            let value = if let Some(expr) = self.try_parse_expr_sub_query()? {
+            let value = if self.dialect.supports_set_on_value() && self.peek_keyword(Keyword::ON) {
+                Expr::Identifier(self.parse_identifier()?)
+            } else if let Some(expr) = self.try_parse_expr_sub_query()? {
                 expr
             } else if let Ok(expr) = self.parse_expr() {
                 expr

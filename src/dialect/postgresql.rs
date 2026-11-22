@@ -307,6 +307,10 @@ impl Dialect for PostgreSqlDialect {
         false
     }
 
+    fn supports_set_on_value(&self) -> bool {
+        true
+    }
+
     fn supports_alter_column_type_using(&self) -> bool {
         true
     }

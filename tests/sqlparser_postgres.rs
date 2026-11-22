@@ -10435,3 +10435,28 @@ fn parse_postgres_load_sconst_reports_closed_errors_and_source_locations() {
         );
     }
 }
+
+#[test]
+fn parse_postgres_set_on_value_keeps_statement_and_list_boundaries() {
+    let statements = sqlparser::parser::Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SET log_lock_waits = on; SET LOCAL log_lock_waits TO ON; SET a = off, on; SELECT 1",
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 4);
+    for (index, expected) in [(0, &["on"][..]), (1, &["ON"]), (2, &["off", "on"])] {
+        let Statement::Set(Set::SingleAssignment { values, .. }) = &statements[index] else {
+            panic!("expected SET assignment");
+        };
+        assert_eq!(values.len(), expected.len());
+        for (value, expected) in values.iter().zip(expected) {
+            let Expr::Identifier(value) = value else {
+                panic!("expected SET value identifier");
+            };
+            assert_eq!(&value.value, expected);
+        }
+    }
+    assert!(matches!(statements[3], Statement::Query(_)));
+    assert!(pg().parse_sql_statements("SET a = ON + 1").is_err());
+    assert!(pg().parse_sql_statements("SELECT ON").is_err());
+}
