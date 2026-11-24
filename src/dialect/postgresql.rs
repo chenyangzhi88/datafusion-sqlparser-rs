@@ -59,11 +59,13 @@ const AND_PREC: u8 = 20;
 const OR_PREC: u8 = 10;
 
 impl Dialect for PostgreSqlDialect {
-    // CREATE/GRANT start an embedded schema element; WINDOW starts the named
-    // window clause. They cannot be implicit aliases, but remain allowed
-    // after AS through is_select_item_alias.
+    // These PostgreSQL clause keywords are unavailable as bare column aliases.
+    // ON starts the conflict clause of INSERT after an unparenthesized source.
     fn is_column_alias(&self, keyword: &Keyword, _parser: &mut Parser) -> bool {
-        !matches!(keyword, Keyword::CREATE | Keyword::GRANT | Keyword::WINDOW)
+        !matches!(
+            keyword,
+            Keyword::CREATE | Keyword::GRANT | Keyword::WINDOW | Keyword::ON
+        )
             && !crate::keywords::RESERVED_FOR_COLUMN_ALIAS.contains(keyword)
     }
 
