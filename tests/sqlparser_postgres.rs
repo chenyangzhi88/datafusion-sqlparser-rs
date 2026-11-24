@@ -10460,3 +10460,32 @@ fn parse_postgres_set_on_value_keeps_statement_and_list_boundaries() {
     assert!(pg().parse_sql_statements("SET a = ON + 1").is_err());
     assert!(pg().parse_sql_statements("SELECT ON").is_err());
 }
+
+#[test]
+fn parse_pg_routine_set_uses_the_statement_value_grammar() {
+    for spelling in ["ON", "OFF"] {
+        let sql = format!(
+            "CREATE FUNCTION b35_setting_value() RETURNS INT SET check_function_bodies TO {spelling} LANGUAGE SQL AS 'SELECT 1'"
+        );
+        let statements = pg().parse_sql_statements(&sql).unwrap();
+        let [Statement::CreateFunction(CreateFunction {
+            set_params,
+            function_body: Some(_),
+            ..
+        })] = statements.as_slice()
+        else {
+            panic!("expected one function with its body");
+        };
+        let [FunctionDefinitionSetParam {
+            value: FunctionSetValue::Values(values),
+            ..
+        }] = set_params.as_slice()
+        else {
+            panic!("expected one routine setting");
+        };
+        let [value] = values.as_slice() else {
+            panic!("expected one setting value");
+        };
+        assert_eq!(value.to_string(), spelling);
+    }
+}

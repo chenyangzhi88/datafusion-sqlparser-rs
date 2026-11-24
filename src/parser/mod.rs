@@ -9006,8 +9006,7 @@ impl<'a> Parser<'a> {
                     if self.parse_keyword(Keyword::DEFAULT) {
                         FunctionSetValue::Default
                     } else {
-                        let values = self.parse_comma_separated(Parser::parse_expr)?;
-                        FunctionSetValue::Values(values)
+                        FunctionSetValue::Values(self.parse_set_values(false)?)
                     }
                 };
                 set_params.push(FunctionDefinitionSetParam { name, value });
