@@ -20052,6 +20052,15 @@ impl<'a> Parser<'a> {
             && self.peek_keyword(Keyword::TABLE)
         {
             Some(Statement::Query(self.parse_query()?))
+        } else if describe_alias == DescribeAlias::Explain
+            && dialect_of!(self is MySqlDialect)
+            && [Keyword::WITH, Keyword::SELECT, Keyword::VALUES, Keyword::INSERT, Keyword::UPDATE, Keyword::DELETE]
+                .into_iter()
+                .any(|keyword| self.peek_keyword(keyword))
+        {
+            // An unquoted query or DML starter selects this grammar.
+            // Retain its actual first error instead of retrying as a table name.
+            Some(self.parse_statement()?)
         } else {
             self.maybe_parse(|parser| parser.parse_statement())?
         };
