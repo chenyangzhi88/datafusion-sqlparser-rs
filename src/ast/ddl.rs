@@ -5859,6 +5859,8 @@ pub struct CreateView {
     pub comment: Option<String>,
     /// if true, has RedShift [`WITH NO SCHEMA BINDING`] clause <https://docs.aws.amazon.com/redshift/latest/dg/r_CREATE_VIEW.html>
     pub with_no_schema_binding: bool,
+    /// The PostgreSQL materialized view population clause.
+    pub with_data: Option<bool>,
     /// if true, has SQLite `IF NOT EXISTS` clause <https://www.sqlite.org/lang_createview.html>
     pub if_not_exists: bool,
     /// if true, has SQLite `TEMP` or `TEMPORARY` clause <https://www.sqlite.org/lang_createview.html>
@@ -5939,6 +5941,9 @@ impl fmt::Display for CreateView {
         self.query.fmt(f)?;
         if self.with_no_schema_binding {
             write!(f, " WITH NO SCHEMA BINDING")?;
+        }
+        if let Some(with_data) = self.with_data {
+            f.write_str(if with_data { " WITH DATA" } else { " WITH NO DATA" })?;
         }
         if let Some(check_option) = &self.check_option {
             write!(f, " {check_option}")?;

@@ -9956,6 +9956,14 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword_is(Keyword::AS)?;
         let query = self.parse_query()?;
+        let postgres_materialized = materialized && dialect_of!(self is PostgreSqlDialect);
+        let with_data = if postgres_materialized && self.parse_keyword(Keyword::WITH) {
+            let with_data = !self.parse_keyword(Keyword::NO);
+            self.expect_keyword(Keyword::DATA)?;
+            Some(with_data)
+        } else {
+            None
+        };
         let with_no_schema_binding = dialect_of!(self is RedshiftSqlDialect | GenericDialect)
             && self.parse_keywords(&[
                 Keyword::WITH,
@@ -9964,6 +9972,7 @@ impl<'a> Parser<'a> {
                 Keyword::BINDING,
             ]);
         let check_option = if dialect_of!(self is MySqlDialect | PostgreSqlDialect | GenericDialect)
+            && !postgres_materialized
             && self.peek_keyword(Keyword::WITH)
         {
             let with_token = AttachedToken(self.expect_keyword(Keyword::WITH)?);
@@ -9997,6 +10006,7 @@ impl<'a> Parser<'a> {
             cluster_by,
             comment,
             with_no_schema_binding,
+            with_data,
             if_not_exists,
             temporary,
             copy_grants,
