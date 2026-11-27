@@ -45,6 +45,7 @@ pub(crate) fn derive_visit(
         modifier,
     } = visit_type;
 
+    let dyn_visitor_trait = format_ident!("Dyn{}", visitor_trait.to_string());
     let attributes = Attributes::parse(&input.attrs);
     // Add a bound `T: Visit` to every type parameter T.
     let generics = add_trait_bounds(input.generics, visit_type);
@@ -58,15 +59,15 @@ pub(crate) fn derive_visit(
         // Note that it uses [`recursive::recursive`] to protect from stack overflow.
         // See tests in https://github.com/apache/datafusion-sqlparser-rs/pull/1522/ for more info.
         impl #impl_generics sqlparser::ast::#visit_trait for #name #ty_generics #where_clause {
-             #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
-            fn visit<V: sqlparser::ast::#visitor_trait>(
+            #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
+            fn visit_dyn(
                 &#modifier self,
-                visitor: &mut V
-            ) -> ::std::ops::ControlFlow<V::Break> {
+                visitor: &mut dyn sqlparser::ast::#dyn_visitor_trait
+            ) -> bool {
                 #pre_visit
                 #children
                 #post_visit
-                ::std::ops::ControlFlow::Continue(())
+                true
             }
         }
     };
@@ -127,11 +128,11 @@ impl Attributes {
     fn visit(&self, s: TokenStream) -> (Option<TokenStream>, Option<TokenStream>) {
         let pre_visit = self.with.as_ref().map(|m| {
             let m = format_ident!("pre_{}", m);
-            quote!(visitor.#m(#s)?;)
+            quote!(if !visitor.#m(#s) { return false; })
         });
         let post_visit = self.with.as_ref().map(|m| {
             let m = format_ident!("post_{}", m);
-            quote!(visitor.#m(#s)?;)
+            quote!(if !visitor.#m(#s) { return false; })
         });
         (pre_visit, post_visit)
     }
@@ -169,13 +170,21 @@ fn visit_children(
                         let (pre_visit, post_visit) = attributes.visit(quote!(value));
                         quote_spanned!(f.span() =>
                             if let Some(value) = &#modifier self.#name {
-                                #pre_visit sqlparser::ast::#visit_trait::visit(value, visitor)?; #post_visit
+                                #pre_visit
+                                if !sqlparser::ast::#visit_trait::visit_dyn(value, visitor) {
+                                    return false;
+                                }
+                                #post_visit
                             }
                         )
                     } else {
                         let (pre_visit, post_visit) = attributes.visit(quote!(&#modifier self.#name));
                         quote_spanned!(f.span() =>
-                            #pre_visit sqlparser::ast::#visit_trait::visit(&#modifier self.#name, visitor)?; #post_visit
+                            #pre_visit
+                            if !sqlparser::ast::#visit_trait::visit_dyn(&#modifier self.#name, visitor) {
+                                return false;
+                            }
+                            #post_visit
                         )
                     }
                 });
@@ -187,8 +196,14 @@ fn visit_children(
                 let recurse = fields.unnamed.iter().enumerate().map(|(i, f)| {
                     let index = Index::from(i);
                     let attributes = Attributes::parse(&f.attrs);
-                    let (pre_visit, post_visit) = attributes.visit(quote!(&self.#index));
-                    quote_spanned!(f.span() => #pre_visit sqlparser::ast::#visit_trait::visit(&#modifier self.#index, visitor)?; #post_visit)
+                    let (pre_visit, post_visit) = attributes.visit(quote!(&#modifier self.#index));
+                    quote_spanned!(f.span() =>
+                        #pre_visit
+                        if !sqlparser::ast::#visit_trait::visit_dyn(&#modifier self.#index, visitor) {
+                            return false;
+                        }
+                        #post_visit
+                    )
                 });
                 quote! {
                     #(#recurse)*
@@ -208,7 +223,13 @@ fn visit_children(
                             let name = &f.ident;
                             let attributes = Attributes::parse(&f.attrs);
                             let (pre_visit, post_visit) = attributes.visit(name.to_token_stream());
-                            quote_spanned!(f.span() => #pre_visit sqlparser::ast::#visit_trait::visit(#name, visitor)?; #post_visit)
+                            quote_spanned!(f.span() =>
+                                #pre_visit
+                                if !sqlparser::ast::#visit_trait::visit_dyn(#name, visitor) {
+                                    return false;
+                                }
+                                #post_visit
+                            )
                         });
 
                         quote!(
@@ -218,12 +239,22 @@ fn visit_children(
                         )
                     }
                     Fields::Unnamed(fields) => {
-                        let names = fields.unnamed.iter().enumerate().map(|(i, f)| format_ident!("_{}", i, span = f.span()));
+                        let names = fields
+                            .unnamed
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| format_ident!("_{}", i, span = f.span()));
                         let visit = fields.unnamed.iter().enumerate().map(|(i, f)| {
                             let name = format_ident!("_{}", i);
                             let attributes = Attributes::parse(&f.attrs);
                             let (pre_visit, post_visit) = attributes.visit(name.to_token_stream());
-                            quote_spanned!(f.span() => #pre_visit sqlparser::ast::#visit_trait::visit(#name, visitor)?; #post_visit)
+                            quote_spanned!(f.span() =>
+                                #pre_visit
+                                if !sqlparser::ast::#visit_trait::visit_dyn(#name, visitor) {
+                                    return false;
+                                }
+                                #post_visit
+                            )
                         });
 
                         quote! {

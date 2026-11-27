@@ -18,7 +18,8 @@
 //! Recursive visitors for ast Nodes. See [`Visitor`] for more details.
 
 use crate::ast::{
-    DataType, Expr, MySqlText, ObjectName, Query, Select, Statement, TableFactor, ValueWithSpan,
+    DataType, Expr, MySqlText, ObjectName, OptimizerHintStyle, Query, Select, Statement,
+    TableFactor, ValueWithSpan,
 };
 use core::ops::ControlFlow;
 
@@ -29,6 +30,7 @@ use core::ops::ControlFlow;
 ///
 /// This trait should be automatically derived for sqlparser AST nodes
 /// using the [Visit](sqlparser_derive::Visit) proc macro.
+/// Manual implementations can override `visit` or `visit_dyn`.
 ///
 /// ```text
 /// #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -38,7 +40,33 @@ pub trait Visit {
     ///
     /// Implementations should call the appropriate visitor hooks to traverse
     /// child nodes and return a `ControlFlow` value to allow early exit.
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break>;
+    #[inline]
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        let mut adapter = DynVisitorAdapter {
+            visitor,
+            break_value: None,
+        };
+        let completed = self.visit_dyn(&mut adapter);
+        adapter.finish(completed)
+    }
+
+    /// Erased traversal entry point. Stop and return `false` when a hook
+    /// or child returns `false`.
+    #[doc(hidden)]
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        // Downstream implementations can still override the generic entry
+        // point. Reify their compile-time flags using a fixed set of types.
+        match (
+            visitor.visits_allocations(),
+            visitor.visits_clone_allocations(),
+        ) {
+            (false, false) => self.visit(&mut TypedVisitor::<false, false>(visitor)),
+            (false, true) => self.visit(&mut TypedVisitor::<false, true>(visitor)),
+            (true, false) => self.visit(&mut TypedVisitor::<true, false>(visitor)),
+            (true, true) => self.visit(&mut TypedVisitor::<true, true>(visitor)),
+        }
+        .is_continue()
+    }
 }
 
 /// A type that can be visited by a [`VisitorMut`]. See [`VisitorMut`] for
@@ -48,6 +76,7 @@ pub trait Visit {
 ///
 /// This trait should be automatically derived for sqlparser AST nodes
 /// using the [VisitMut](sqlparser_derive::VisitMut) proc macro.
+/// Manual implementations can override `visit` or `visit_dyn`.
 ///
 /// ```text
 /// #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -58,72 +87,98 @@ pub trait VisitMut {
     /// Implementations should call the appropriate mutable visitor hooks to
     /// traverse and allow in-place mutation of child nodes. Returning a
     /// `ControlFlow` value permits early termination of the traversal.
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break>;
+    #[inline]
+    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
+        let mut adapter = DynVisitorMutAdapter {
+            visitor,
+            break_value: None,
+        };
+        let completed = self.visit_dyn(&mut adapter);
+        adapter.finish(completed)
+    }
+
+    /// Erased traversal entry point. Stop and return `false` when a hook
+    /// or child returns `false`.
+    #[doc(hidden)]
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        if visitor.visits_storage_metadata() {
+            self.visit(&mut TypedVisitorMut::<true>(visitor))
+        } else {
+            self.visit(&mut TypedVisitorMut::<false>(visitor))
+        }
+        .is_continue()
+    }
 }
 
 impl<T: Visit> Visit for Option<T> {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        if let Some(s) = self {
-            s.visit(visitor)?;
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        match self {
+            Some(value) => value.visit_dyn(visitor),
+            None => true,
         }
-        ControlFlow::Continue(())
     }
 }
 
 impl<T: Visit> Visit for Vec<T> {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS {
-            let count = if V::VISIT_CLONE_ALLOCATIONS { self.len() } else { self.capacity() };
-            visitor.visit_allocation(count.checked_mul(core::mem::size_of::<T>()), false)?;
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        if visitor.visits_allocations() && !visit_vec_allocation(self, visitor) {
+            return false;
         }
-        for v in self {
-            v.visit(visitor)?;
-        }
-        ControlFlow::Continue(())
+        self.iter().all(|value| value.visit_dyn(visitor))
     }
 }
 
+pub(crate) fn visit_vec_allocation<T>(value: &Vec<T>, visitor: &mut dyn DynVisitor) -> bool {
+    let count = if visitor.visits_clone_allocations() {
+        value.len()
+    } else {
+        value.capacity()
+    };
+    visitor.visit_allocation(count.checked_mul(core::mem::size_of::<T>()), false)
+}
+
 impl<T: Visit> Visit for Box<T> {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS { visitor.visit_allocation(Some(core::mem::size_of::<T>()), false)?; }
-        T::visit(self, visitor)
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        if visitor.visits_allocations()
+            && !visitor.visit_allocation(Some(core::mem::size_of::<T>()), false)
+        {
+            return false;
+        }
+        T::visit_dyn(self, visitor)
     }
 }
 
 impl<T: VisitMut> VisitMut for Option<T> {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
-        if let Some(s) = self {
-            s.visit(visitor)?;
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        match self {
+            Some(value) => value.visit_dyn(visitor),
+            None => true,
         }
-        ControlFlow::Continue(())
     }
 }
 
 impl<T: VisitMut> VisitMut for Vec<T> {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
-        for v in self {
-            v.visit(visitor)?;
-        }
-        ControlFlow::Continue(())
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        self.iter_mut().all(|value| value.visit_dyn(visitor))
     }
 }
 
 impl<T: VisitMut> VisitMut for Box<T> {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
-        T::visit(self, visitor)
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        T::visit_dyn(self, visitor)
     }
 }
 
 macro_rules! visit_noop {
-    ($($t:ty),+) => {
+    ($($t:ty),+ $(,)?) => {
         $(impl Visit for $t {
-            fn visit<V: Visitor>(&self, _visitor: &mut V) -> ControlFlow<V::Break> {
-               ControlFlow::Continue(())
+            fn visit_dyn(&self, _: &mut dyn DynVisitor) -> bool {
+                true
             }
         })+
         $(impl VisitMut for $t {
-            fn visit<V: VisitorMut>(&mut self, _visitor: &mut V) -> ControlFlow<V::Break> {
-               ControlFlow::Continue(())
+            fn visit_dyn(&mut self, _: &mut dyn DynVisitorMut) -> bool {
+                true
             }
         })+
     };
@@ -132,64 +187,64 @@ macro_rules! visit_noop {
 visit_noop!(u8, u16, u32, u64, usize, i8, i16, i32, i64, char, bool);
 
 impl Visit for String {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS {
-            visitor.visit_allocation(Some(if V::VISIT_CLONE_ALLOCATIONS { self.len() } else { self.capacity() }), false)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
-impl VisitMut for String {
-    fn visit<V: VisitorMut>(&mut self, _: &mut V) -> ControlFlow<V::Break> {
-        ControlFlow::Continue(())
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        !visitor.visits_allocations()
+            || visitor.visit_allocation(
+                Some(if visitor.visits_clone_allocations() {
+                    self.len()
+                } else {
+                    self.capacity()
+                }),
+                false,
+            )
     }
 }
 
-/// Visit storage inside metadata that is deliberately not an executable AST
-/// child. Only allocation hooks are forwarded; semantic visitors keep their
-/// existing source/evaluation frontier and traversal order.
-pub(crate) fn visit_allocation_storage<T: Visit, V: Visitor>(
+impl VisitMut for String {
+    fn visit_dyn(&mut self, _: &mut dyn DynVisitorMut) -> bool {
+        true
+    }
+}
+
+/// Forward allocation callbacks from metadata outside the executable AST.
+pub(crate) fn visit_allocation_storage<T: Visit>(
     value: &T,
-    visitor: &mut V,
+    visitor: &mut dyn DynVisitor,
     shared: bool,
-) -> ControlFlow<V::Break> {
-    if !V::VISIT_ALLOCATIONS {
-        return ControlFlow::Continue(());
+) -> bool {
+    struct Storage<'a> {
+        visitor: &'a mut dyn DynVisitor,
+        shared: bool,
     }
-    // Erase the outer visitor type: metadata may itself contain another
-    // hint, so Storage<Storage<V>> would grow a new monomorph at each level.
-    struct Storage<'a, B, const CLONE: bool> {
-        allocation: &'a mut dyn FnMut(Option<usize>, bool) -> ControlFlow<B>,
-    }
-    impl<B, const CLONE: bool> Visitor for Storage<'_, B, CLONE> {
-        type Break = B;
-        const VISIT_ALLOCATIONS: bool = true;
-        const VISIT_CLONE_ALLOCATIONS: bool = CLONE;
-        fn visit_allocation(&mut self, bytes: Option<usize>, shared: bool) -> ControlFlow<B> {
-            (self.allocation)(bytes, shared)
+
+    impl DynVisitor for Storage<'_> {
+        fn visits_allocations(&self) -> bool {
+            true
+        }
+
+        fn visits_clone_allocations(&self) -> bool {
+            self.visitor.visits_clone_allocations()
+        }
+
+        fn visit_allocation(&mut self, bytes: Option<usize>, shared: bool) -> bool {
+            self.visitor.visit_allocation(bytes, self.shared || shared)
         }
     }
-    let mut allocation = |bytes, nested_shared| visitor.visit_allocation(bytes, shared || nested_shared);
-    if V::VISIT_CLONE_ALLOCATIONS {
-        value.visit(&mut Storage::<V::Break, true> { allocation: &mut allocation })
-    } else {
-        value.visit(&mut Storage::<V::Break, false> { allocation: &mut allocation })
-    }
+
+    !visitor.visits_allocations() || value.visit_dyn(&mut Storage { visitor, shared })
 }
 
 // A tuple can contain real AST children (for example MySQL trigger ordering).
 // Traverse both components in source order rather than skipping the pair.
 impl<A: Visit, B: Visit> Visit for (A, B) {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        self.0.visit(visitor)?;
-        self.1.visit(visitor)
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        self.0.visit_dyn(visitor) && self.1.visit_dyn(visitor)
     }
 }
 
 impl<A: VisitMut, B: VisitMut> VisitMut for (A, B) {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
-        self.0.visit(visitor)?;
-        self.1.visit(visitor)
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        self.0.visit_dyn(visitor) && self.1.visit_dyn(visitor)
     }
 }
 
@@ -266,8 +321,7 @@ pub trait Visitor {
     /// boxing it with `Box` to minimize stack usage.
     type Break;
 
-    /// Allocation traversal is opt-in at monomorphization. Ordinary semantic
-    /// visitors incur no storage traversal or runtime feature branch.
+    /// Opt in to traversal of allocation storage.
     const VISIT_ALLOCATIONS: bool = false;
 
     /// Account new owned buffers created by Clone using initialized lengths,
@@ -373,55 +427,36 @@ pub trait Visitor {
     }
 }
 
-/// Storage-only access to metadata that is intentionally not an executable
-/// AST child. Receiving custody never rewrites expressions or visits Items.
-pub(crate) fn visit_storage_metadata_mut<T: VisitMut, V: VisitorMut>(
+/// Forward the callbacks used to receive storage outside the executable AST.
+pub(crate) fn visit_storage_metadata_mut<T: VisitMut>(
     value: &mut T,
-    visitor: &mut V,
-) -> ControlFlow<V::Break> {
-    if !V::VISIT_STORAGE_METADATA {
-        return ControlFlow::Continue(());
-    }
-    // This object-safe borrow forwards only the same storage callbacks. It
-    // owns no visitor, AST, allocation, native Source or execution state.
-    trait Receiver<B> {
-        fn before_expr(&mut self, value: &mut Expr) -> ControlFlow<B>;
-        fn before_text(&mut self, value: &mut MySqlText) -> ControlFlow<B>;
-        fn after_text(&mut self, value: &mut MySqlText) -> ControlFlow<B>;
-        fn hint(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<B>;
-    }
-    impl<V: VisitorMut> Receiver<V::Break> for V {
-        fn before_expr(&mut self, value: &mut Expr) -> ControlFlow<V::Break> {
-            self.pre_visit_expr(value)
+    visitor: &mut dyn DynVisitorMut,
+) -> bool {
+    struct Storage<'a>(&'a mut dyn DynVisitorMut);
+
+    impl DynVisitorMut for Storage<'_> {
+        fn visits_storage_metadata(&self) -> bool {
+            true
         }
-        fn before_text(&mut self, value: &mut MySqlText) -> ControlFlow<V::Break> {
-            self.pre_visit_mysql_text(value)
+
+        fn pre_visit_expr(&mut self, value: &mut Expr) -> bool {
+            self.0.pre_visit_expr(value)
         }
-        fn after_text(&mut self, value: &mut MySqlText) -> ControlFlow<V::Break> {
-            self.post_visit_mysql_text(value)
+
+        fn pre_visit_mysql_text(&mut self, value: &mut MySqlText) -> bool {
+            self.0.pre_visit_mysql_text(value)
         }
-        fn hint(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<V::Break> {
-            self.visit_optimizer_hint_storage(value)
+
+        fn post_visit_mysql_text(&mut self, value: &mut MySqlText) -> bool {
+            self.0.post_visit_mysql_text(value)
+        }
+
+        fn visit_optimizer_hint_storage(&mut self, value: &mut OptimizerHintStyle) -> bool {
+            self.0.visit_optimizer_hint_storage(value)
         }
     }
-    struct Storage<'a, B>(&'a mut dyn Receiver<B>);
-    impl<B> VisitorMut for Storage<'_, B> {
-        type Break = B;
-        const VISIT_STORAGE_METADATA: bool = true;
-        fn pre_visit_expr(&mut self, value: &mut Expr) -> ControlFlow<B> {
-            self.0.before_expr(value)
-        }
-        fn pre_visit_mysql_text(&mut self, value: &mut MySqlText) -> ControlFlow<B> {
-            self.0.before_text(value)
-        }
-        fn post_visit_mysql_text(&mut self, value: &mut MySqlText) -> ControlFlow<B> {
-            self.0.after_text(value)
-        }
-        fn visit_optimizer_hint_storage(&mut self, value: &mut crate::ast::OptimizerHintStyle) -> ControlFlow<B> {
-            self.0.hint(value)
-        }
-    }
-    value.visit(&mut Storage::<V::Break>(visitor))
+
+    !visitor.visits_storage_metadata() || value.visit_dyn(&mut Storage(visitor))
 }
 
 /// A visitor that can be used to mutate an AST tree.
@@ -584,6 +619,134 @@ pub trait VisitorMut {
     fn post_visit_data_type(&mut self, _data_type: &mut DataType) -> ControlFlow<Self::Break> {
         ControlFlow::Continue(())
     }
+}
+
+// Keep the hook signatures in one place for erasure and the reverse bridge.
+// The typed adapter owns the break payload; only the continue/break bit
+// crosses the erased traversal.
+macro_rules! define_dyn_visitor {
+    (
+        $dyn_trait:ident, $adapter:ident, $bridge:ident, $typed_trait:ident;
+        $( $flag:ident => $flag_method:ident ),+;
+        $( fn $hook:ident($( $arg:ident: $arg_type:ty ),+); )+
+    ) => {
+        #[doc(hidden)]
+        pub trait $dyn_trait {
+            $(
+                fn $flag_method(&self) -> bool {
+                    false
+                }
+            )+
+
+            $(
+                fn $hook(&mut self, $( $arg: $arg_type ),+) -> bool {
+                    $( let _ = $arg; )+
+                    true
+                }
+            )+
+        }
+
+        struct $adapter<'a, V: $typed_trait> {
+            visitor: &'a mut V,
+            break_value: Option<V::Break>,
+        }
+
+        impl<V: $typed_trait> $adapter<'_, V> {
+            fn finish(self, completed: bool) -> ControlFlow<V::Break> {
+                if completed {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(self.break_value.expect("erased visitor stopped without a break value"))
+                }
+            }
+        }
+
+        impl<V: $typed_trait> $dyn_trait for $adapter<'_, V> {
+            $(
+                fn $flag_method(&self) -> bool {
+                    V::$flag
+                }
+            )+
+
+            $(
+                fn $hook(&mut self, $( $arg: $arg_type ),+) -> bool {
+                    match self.visitor.$hook($( $arg ),+) {
+                        ControlFlow::Continue(()) => true,
+                        ControlFlow::Break(value) => {
+                            self.break_value = Some(value);
+                            false
+                        }
+                    }
+                }
+            )+
+        }
+
+        struct $bridge<'a, $( const $flag: bool ),+>(&'a mut dyn $dyn_trait);
+
+        impl<$( const $flag: bool ),+> $typed_trait for $bridge<'_, $( $flag ),+> {
+            type Break = ();
+            $( const $flag: bool = $flag; )+
+
+            $(
+                fn $hook(&mut self, $( $arg: $arg_type ),+) -> ControlFlow<()> {
+                    if self.0.$hook($( $arg ),+) {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                }
+            )+
+        }
+    };
+}
+
+define_dyn_visitor! {
+    DynVisitor, DynVisitorAdapter, TypedVisitor, Visitor;
+    VISIT_ALLOCATIONS => visits_allocations,
+    VISIT_CLONE_ALLOCATIONS => visits_clone_allocations;
+    fn visit_allocation(bytes: Option<usize>, shared: bool);
+    fn pre_visit_query(query: &Query);
+    fn post_visit_query(query: &Query);
+    fn pre_visit_select(select: &Select);
+    fn post_visit_select(select: &Select);
+    fn pre_visit_relation(relation: &ObjectName);
+    fn post_visit_relation(relation: &ObjectName);
+    fn pre_visit_table_factor(table_factor: &TableFactor);
+    fn post_visit_table_factor(table_factor: &TableFactor);
+    fn pre_visit_expr(expr: &Expr);
+    fn post_visit_expr(expr: &Expr);
+    fn pre_visit_statement(statement: &Statement);
+    fn post_visit_statement(statement: &Statement);
+    fn pre_visit_value(value: &ValueWithSpan);
+    fn post_visit_value(value: &ValueWithSpan);
+    fn pre_visit_mysql_text(text: &MySqlText);
+    fn post_visit_mysql_text(text: &MySqlText);
+    fn pre_visit_data_type(data_type: &DataType);
+    fn post_visit_data_type(data_type: &DataType);
+}
+
+define_dyn_visitor! {
+    DynVisitorMut, DynVisitorMutAdapter, TypedVisitorMut, VisitorMut;
+    VISIT_STORAGE_METADATA => visits_storage_metadata;
+    fn visit_optimizer_hint_storage(hint: &mut OptimizerHintStyle);
+    fn pre_visit_query(query: &mut Query);
+    fn post_visit_query(query: &mut Query);
+    fn pre_visit_select(select: &mut Select);
+    fn post_visit_select(select: &mut Select);
+    fn pre_visit_relation(relation: &mut ObjectName);
+    fn post_visit_relation(relation: &mut ObjectName);
+    fn pre_visit_table_factor(table_factor: &mut TableFactor);
+    fn post_visit_table_factor(table_factor: &mut TableFactor);
+    fn pre_visit_expr(expr: &mut Expr);
+    fn post_visit_expr(expr: &mut Expr);
+    fn pre_visit_statement(statement: &mut Statement);
+    fn post_visit_statement(statement: &mut Statement);
+    fn pre_visit_value(value: &mut ValueWithSpan);
+    fn post_visit_value(value: &mut ValueWithSpan);
+    fn pre_visit_mysql_text(text: &mut MySqlText);
+    fn post_visit_mysql_text(text: &mut MySqlText);
+    fn pre_visit_data_type(data_type: &mut DataType);
+    fn post_visit_data_type(data_type: &mut DataType);
 }
 
 struct RelationVisitor<F>(F);

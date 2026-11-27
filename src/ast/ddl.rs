@@ -4195,200 +4195,250 @@ impl CreateTable {
 #[cfg(feature = "visitor")]
 impl crate::ast::Visit for CreateTable {
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
-    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS {
-            // These physical vectors are traversed in source order below, so
-            // report storage without introducing a second semantic traversal.
-            if self.validate_source_order().is_ok() {
-                visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.columns.len() } else { self.columns.capacity() }).checked_mul(core::mem::size_of::<ColumnDef>()), false)?;
-                visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.constraints.len() } else { self.constraints.capacity() }).checked_mul(core::mem::size_of::<TableConstraint>()), false)?;
+    fn visit_dyn(&self, visitor: &mut dyn crate::ast::DynVisitor) -> bool {
+        if visitor.visits_allocations() {
+            use crate::ast::visitor::visit_vec_allocation;
+
+            // The physical vectors are traversed in source order below.
+            if self.validate_source_order().is_ok()
+                && !(visit_vec_allocation(&self.columns, visitor)
+                    && visit_vec_allocation(&self.constraints, visitor))
+            {
+                return false;
             }
-            visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.elements.len() } else { self.elements.capacity() }).checked_mul(core::mem::size_of::<CreateTableElement>()), false)?;
+            if !visit_vec_allocation(&self.elements, visitor) {
+                return false;
+            }
         }
-        self.or_replace.visit(visitor)?;
-        self.temporary.visit(visitor)?;
-        self.external.visit(visitor)?;
-        self.dynamic.visit(visitor)?;
-        self.global.visit(visitor)?;
-        self.if_not_exists.visit(visitor)?;
-        self.transient.visit(visitor)?;
-        self.volatile.visit(visitor)?;
-        self.iceberg.visit(visitor)?;
-        self.snapshot.visit(visitor)?;
-        visitor.pre_visit_relation(&self.name)?;
-        self.name.visit(visitor)?;
-        visitor.post_visit_relation(&self.name)?;
-        // Public malformed ASTs have no generic Visitor::Break to construct.
-        // Real parser/admission/DDL/Display paths reject them first. A direct
-        // visitor still reaches each actual owner without panic or fake order.
+        if !(self.or_replace.visit_dyn(visitor)
+            && self.temporary.visit_dyn(visitor)
+            && self.external.visit_dyn(visitor)
+            && self.dynamic.visit_dyn(visitor)
+            && self.global.visit_dyn(visitor)
+            && self.if_not_exists.visit_dyn(visitor)
+            && self.transient.visit_dyn(visitor)
+            && self.volatile.visit_dyn(visitor)
+            && self.iceberg.visit_dyn(visitor)
+            && self.snapshot.visit_dyn(visitor))
+        {
+            return false;
+        }
+        if !visitor.pre_visit_relation(&self.name) {
+            return false;
+        }
+        if !self.name.visit_dyn(visitor) {
+            return false;
+        }
+        if !visitor.post_visit_relation(&self.name) {
+            return false;
+        }
+        // When the source order is invalid, visit each physical owner in the
+        // fallback order. The parser, admission, DDL and Display validate it.
         if self.validate_source_order().is_ok() {
             for element in &self.elements {
-                match element {
-                    CreateTableElement::Column(ordinal) => self.columns[*ordinal].visit(visitor)?,
-                    CreateTableElement::Constraint(ordinal) => {
-                        self.constraints[*ordinal].visit(visitor)?
+                let continued = match element {
+                    CreateTableElement::Column(ordinal) => {
+                        self.columns[*ordinal].visit_dyn(visitor)
                     }
-                    CreateTableElement::Like(like) => like.visit(visitor)?,
+                    CreateTableElement::Constraint(ordinal) => {
+                        self.constraints[*ordinal].visit_dyn(visitor)
+                    }
+                    CreateTableElement::Like(like) => like.visit_dyn(visitor),
+                };
+                if !continued {
+                    return false;
                 }
             }
         } else {
-            self.columns.visit(visitor)?;
-            self.constraints.visit(visitor)?;
+            if !(self.columns.visit_dyn(visitor) && self.constraints.visit_dyn(visitor)) {
+                return false;
+            }
             for element in &self.elements {
                 if let CreateTableElement::Like(like) = element {
-                    like.visit(visitor)?;
+                    if !like.visit_dyn(visitor) {
+                        return false;
+                    }
                 }
             }
         }
-        self.hive_distribution.visit(visitor)?;
-        self.hive_formats.visit(visitor)?;
-        self.table_options.visit(visitor)?;
-        self.file_format.visit(visitor)?;
-        self.location.visit(visitor)?;
-        self.query.visit(visitor)?;
-        self.without_rowid.visit(visitor)?;
-        self.like.visit(visitor)?;
-        self.clone.visit(visitor)?;
-        self.version.visit(visitor)?;
-        self.comment.visit(visitor)?;
-        self.on_commit.visit(visitor)?;
-        self.on_cluster.visit(visitor)?;
-        self.primary_key.visit(visitor)?;
-        self.order_by.visit(visitor)?;
-        self.partition_by.visit(visitor)?;
-        self.mysql_partitioning.visit(visitor)?;
-        self.cluster_by.visit(visitor)?;
-        self.clustered_by.visit(visitor)?;
-        self.inherits.visit(visitor)?;
-        if let Some(value) = &self.partition_of {
-            visitor.pre_visit_relation(value)?;
-            value.visit(visitor)?;
-            visitor.post_visit_relation(value)?;
+        if !(self.hive_distribution.visit_dyn(visitor)
+            && self.hive_formats.visit_dyn(visitor)
+            && self.table_options.visit_dyn(visitor)
+            && self.file_format.visit_dyn(visitor)
+            && self.location.visit_dyn(visitor)
+            && self.query.visit_dyn(visitor)
+            && self.without_rowid.visit_dyn(visitor)
+            && self.like.visit_dyn(visitor)
+            && self.clone.visit_dyn(visitor)
+            && self.version.visit_dyn(visitor)
+            && self.comment.visit_dyn(visitor)
+            && self.on_commit.visit_dyn(visitor)
+            && self.on_cluster.visit_dyn(visitor)
+            && self.primary_key.visit_dyn(visitor)
+            && self.order_by.visit_dyn(visitor)
+            && self.partition_by.visit_dyn(visitor)
+            && self.mysql_partitioning.visit_dyn(visitor)
+            && self.cluster_by.visit_dyn(visitor)
+            && self.clustered_by.visit_dyn(visitor)
+            && self.inherits.visit_dyn(visitor))
+        {
+            return false;
         }
-        self.for_values.visit(visitor)?;
-        self.strict.visit(visitor)?;
-        self.copy_grants.visit(visitor)?;
-        self.enable_schema_evolution.visit(visitor)?;
-        self.change_tracking.visit(visitor)?;
-        self.data_retention_time_in_days.visit(visitor)?;
-        self.max_data_extension_time_in_days.visit(visitor)?;
-        self.default_ddl_collation.visit(visitor)?;
-        self.with_aggregation_policy.visit(visitor)?;
-        self.with_row_access_policy.visit(visitor)?;
-        self.with_storage_lifecycle_policy.visit(visitor)?;
-        self.with_tags.visit(visitor)?;
-        self.external_volume.visit(visitor)?;
-        self.base_location.visit(visitor)?;
-        self.catalog.visit(visitor)?;
-        self.catalog_sync.visit(visitor)?;
-        self.storage_serialization_policy.visit(visitor)?;
-        self.target_lag.visit(visitor)?;
-        self.warehouse.visit(visitor)?;
-        self.refresh_mode.visit(visitor)?;
-        self.initialize.visit(visitor)?;
-        self.require_user.visit(visitor)?;
-        self.diststyle.visit(visitor)?;
-        self.distkey.visit(visitor)?;
-        self.sortkey.visit(visitor)?;
-        self.backup.visit(visitor)?;
-        core::ops::ControlFlow::Continue(())
+        if let Some(value) = &self.partition_of {
+            if !visitor.pre_visit_relation(value) {
+                return false;
+            }
+            if !value.visit_dyn(visitor) {
+                return false;
+            }
+            if !visitor.post_visit_relation(value) {
+                return false;
+            }
+        }
+        self.for_values.visit_dyn(visitor)
+            && self.strict.visit_dyn(visitor)
+            && self.copy_grants.visit_dyn(visitor)
+            && self.enable_schema_evolution.visit_dyn(visitor)
+            && self.change_tracking.visit_dyn(visitor)
+            && self.data_retention_time_in_days.visit_dyn(visitor)
+            && self.max_data_extension_time_in_days.visit_dyn(visitor)
+            && self.default_ddl_collation.visit_dyn(visitor)
+            && self.with_aggregation_policy.visit_dyn(visitor)
+            && self.with_row_access_policy.visit_dyn(visitor)
+            && self.with_storage_lifecycle_policy.visit_dyn(visitor)
+            && self.with_tags.visit_dyn(visitor)
+            && self.external_volume.visit_dyn(visitor)
+            && self.base_location.visit_dyn(visitor)
+            && self.catalog.visit_dyn(visitor)
+            && self.catalog_sync.visit_dyn(visitor)
+            && self.storage_serialization_policy.visit_dyn(visitor)
+            && self.target_lag.visit_dyn(visitor)
+            && self.warehouse.visit_dyn(visitor)
+            && self.refresh_mode.visit_dyn(visitor)
+            && self.initialize.visit_dyn(visitor)
+            && self.require_user.visit_dyn(visitor)
+            && self.diststyle.visit_dyn(visitor)
+            && self.distkey.visit_dyn(visitor)
+            && self.sortkey.visit_dyn(visitor)
+            && self.backup.visit_dyn(visitor)
     }
 }
 
 #[cfg(feature = "visitor")]
 impl crate::ast::VisitMut for CreateTable {
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
-    fn visit<V: crate::ast::VisitorMut>(
-        &mut self,
-        visitor: &mut V,
-    ) -> core::ops::ControlFlow<V::Break> {
-        self.or_replace.visit(visitor)?;
-        self.temporary.visit(visitor)?;
-        self.external.visit(visitor)?;
-        self.dynamic.visit(visitor)?;
-        self.global.visit(visitor)?;
-        self.if_not_exists.visit(visitor)?;
-        self.transient.visit(visitor)?;
-        self.volatile.visit(visitor)?;
-        self.iceberg.visit(visitor)?;
-        self.snapshot.visit(visitor)?;
-        visitor.pre_visit_relation(&mut self.name)?;
-        self.name.visit(visitor)?;
-        visitor.post_visit_relation(&mut self.name)?;
-        // Public malformed ASTs have no generic Visitor::Break to construct.
-        // Real parser/admission/DDL/Display paths reject them first. A direct
-        // visitor still reaches each actual owner without panic or fake order.
+    fn visit_dyn(&mut self, visitor: &mut dyn crate::ast::DynVisitorMut) -> bool {
+        if !(self.or_replace.visit_dyn(visitor)
+            && self.temporary.visit_dyn(visitor)
+            && self.external.visit_dyn(visitor)
+            && self.dynamic.visit_dyn(visitor)
+            && self.global.visit_dyn(visitor)
+            && self.if_not_exists.visit_dyn(visitor)
+            && self.transient.visit_dyn(visitor)
+            && self.volatile.visit_dyn(visitor)
+            && self.iceberg.visit_dyn(visitor)
+            && self.snapshot.visit_dyn(visitor))
+        {
+            return false;
+        }
+        if !visitor.pre_visit_relation(&mut self.name) {
+            return false;
+        }
+        if !self.name.visit_dyn(visitor) {
+            return false;
+        }
+        if !visitor.post_visit_relation(&mut self.name) {
+            return false;
+        }
+        // When the source order is invalid, visit each physical owner in the
+        // fallback order. The parser, admission, DDL and Display validate it.
         if self.validate_source_order().is_ok() {
             for element in &mut self.elements {
-                match element {
-                    CreateTableElement::Column(ordinal) => self.columns[*ordinal].visit(visitor)?,
-                    CreateTableElement::Constraint(ordinal) => {
-                        self.constraints[*ordinal].visit(visitor)?
+                let continued = match element {
+                    CreateTableElement::Column(ordinal) => {
+                        self.columns[*ordinal].visit_dyn(visitor)
                     }
-                    CreateTableElement::Like(like) => like.visit(visitor)?,
+                    CreateTableElement::Constraint(ordinal) => {
+                        self.constraints[*ordinal].visit_dyn(visitor)
+                    }
+                    CreateTableElement::Like(like) => like.visit_dyn(visitor),
+                };
+                if !continued {
+                    return false;
                 }
             }
         } else {
-            self.columns.visit(visitor)?;
-            self.constraints.visit(visitor)?;
+            if !(self.columns.visit_dyn(visitor) && self.constraints.visit_dyn(visitor)) {
+                return false;
+            }
             for element in &mut self.elements {
                 if let CreateTableElement::Like(like) = element {
-                    like.visit(visitor)?;
+                    if !like.visit_dyn(visitor) {
+                        return false;
+                    }
                 }
             }
         }
-        self.hive_distribution.visit(visitor)?;
-        self.hive_formats.visit(visitor)?;
-        self.table_options.visit(visitor)?;
-        self.file_format.visit(visitor)?;
-        self.location.visit(visitor)?;
-        self.query.visit(visitor)?;
-        self.without_rowid.visit(visitor)?;
-        self.like.visit(visitor)?;
-        self.clone.visit(visitor)?;
-        self.version.visit(visitor)?;
-        self.comment.visit(visitor)?;
-        self.on_commit.visit(visitor)?;
-        self.on_cluster.visit(visitor)?;
-        self.primary_key.visit(visitor)?;
-        self.order_by.visit(visitor)?;
-        self.partition_by.visit(visitor)?;
-        self.mysql_partitioning.visit(visitor)?;
-        self.cluster_by.visit(visitor)?;
-        self.clustered_by.visit(visitor)?;
-        self.inherits.visit(visitor)?;
-        if let Some(value) = &mut self.partition_of {
-            visitor.pre_visit_relation(value)?;
-            value.visit(visitor)?;
-            visitor.post_visit_relation(value)?;
+        if !(self.hive_distribution.visit_dyn(visitor)
+            && self.hive_formats.visit_dyn(visitor)
+            && self.table_options.visit_dyn(visitor)
+            && self.file_format.visit_dyn(visitor)
+            && self.location.visit_dyn(visitor)
+            && self.query.visit_dyn(visitor)
+            && self.without_rowid.visit_dyn(visitor)
+            && self.like.visit_dyn(visitor)
+            && self.clone.visit_dyn(visitor)
+            && self.version.visit_dyn(visitor)
+            && self.comment.visit_dyn(visitor)
+            && self.on_commit.visit_dyn(visitor)
+            && self.on_cluster.visit_dyn(visitor)
+            && self.primary_key.visit_dyn(visitor)
+            && self.order_by.visit_dyn(visitor)
+            && self.partition_by.visit_dyn(visitor)
+            && self.mysql_partitioning.visit_dyn(visitor)
+            && self.cluster_by.visit_dyn(visitor)
+            && self.clustered_by.visit_dyn(visitor)
+            && self.inherits.visit_dyn(visitor))
+        {
+            return false;
         }
-        self.for_values.visit(visitor)?;
-        self.strict.visit(visitor)?;
-        self.copy_grants.visit(visitor)?;
-        self.enable_schema_evolution.visit(visitor)?;
-        self.change_tracking.visit(visitor)?;
-        self.data_retention_time_in_days.visit(visitor)?;
-        self.max_data_extension_time_in_days.visit(visitor)?;
-        self.default_ddl_collation.visit(visitor)?;
-        self.with_aggregation_policy.visit(visitor)?;
-        self.with_row_access_policy.visit(visitor)?;
-        self.with_storage_lifecycle_policy.visit(visitor)?;
-        self.with_tags.visit(visitor)?;
-        self.external_volume.visit(visitor)?;
-        self.base_location.visit(visitor)?;
-        self.catalog.visit(visitor)?;
-        self.catalog_sync.visit(visitor)?;
-        self.storage_serialization_policy.visit(visitor)?;
-        self.target_lag.visit(visitor)?;
-        self.warehouse.visit(visitor)?;
-        self.refresh_mode.visit(visitor)?;
-        self.initialize.visit(visitor)?;
-        self.require_user.visit(visitor)?;
-        self.diststyle.visit(visitor)?;
-        self.distkey.visit(visitor)?;
-        self.sortkey.visit(visitor)?;
-        self.backup.visit(visitor)?;
-        core::ops::ControlFlow::Continue(())
+        if let Some(value) = &mut self.partition_of {
+            if !visitor.pre_visit_relation(value) {
+                return false;
+            }
+            if !value.visit_dyn(visitor) {
+                return false;
+            }
+            if !visitor.post_visit_relation(value) {
+                return false;
+            }
+        }
+        self.for_values.visit_dyn(visitor)
+            && self.strict.visit_dyn(visitor)
+            && self.copy_grants.visit_dyn(visitor)
+            && self.enable_schema_evolution.visit_dyn(visitor)
+            && self.change_tracking.visit_dyn(visitor)
+            && self.data_retention_time_in_days.visit_dyn(visitor)
+            && self.max_data_extension_time_in_days.visit_dyn(visitor)
+            && self.default_ddl_collation.visit_dyn(visitor)
+            && self.with_aggregation_policy.visit_dyn(visitor)
+            && self.with_row_access_policy.visit_dyn(visitor)
+            && self.with_storage_lifecycle_policy.visit_dyn(visitor)
+            && self.with_tags.visit_dyn(visitor)
+            && self.external_volume.visit_dyn(visitor)
+            && self.base_location.visit_dyn(visitor)
+            && self.catalog.visit_dyn(visitor)
+            && self.catalog_sync.visit_dyn(visitor)
+            && self.storage_serialization_policy.visit_dyn(visitor)
+            && self.target_lag.visit_dyn(visitor)
+            && self.warehouse.visit_dyn(visitor)
+            && self.refresh_mode.visit_dyn(visitor)
+            && self.initialize.visit_dyn(visitor)
+            && self.require_user.visit_dyn(visitor)
+            && self.diststyle.visit_dyn(visitor)
+            && self.distkey.visit_dyn(visitor)
+            && self.sortkey.visit_dyn(visitor)
+            && self.backup.visit_dyn(visitor)
     }
 }
 

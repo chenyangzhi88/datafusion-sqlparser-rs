@@ -13755,56 +13755,95 @@ impl core::hash::Hash for OptimizerHintStyle {
 // Expr children to be rebound or made mutable by a copied AST visitor.
 #[cfg(feature = "visitor")]
 impl Visit for OptimizerHintStyle {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if !V::VISIT_ALLOCATIONS { return core::ops::ControlFlow::Continue(()); }
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        if !visitor.visits_allocations() {
+            return true;
+        }
         use visitor::visit_allocation_storage;
-        let arc_vec_header = core::mem::size_of::<Vec<MySqlHintDirective>>()
-            + 2 * core::mem::size_of::<usize>();
+        let arc_vec_header =
+            core::mem::size_of::<Vec<MySqlHintDirective>>() + 2 * core::mem::size_of::<usize>();
         match self {
-            Self::SingleLine { prefix } => visit_allocation_storage(prefix, visitor, false)?,
-            Self::MySqlBoundSource { directives, syntax, unsupported, .. } => {
-                visitor.visit_allocation(Some(arc_vec_header), true)?;
-                visit_allocation_storage(directives.as_ref(), visitor, true)?;
-                visitor.visit_allocation(Some(core::mem::size_of::<Vec<(usize, String)>>()
-                    + 2 * core::mem::size_of::<usize>()), true)?;
-                visit_allocation_storage(syntax.as_ref(), visitor, true)?;
+            Self::SingleLine { prefix } => return visit_allocation_storage(prefix, visitor, false),
+            Self::MySqlBoundSource {
+                directives,
+                syntax,
+                unsupported,
+                ..
+            } => {
+                if !visitor.visit_allocation(Some(arc_vec_header), true) {
+                    return false;
+                }
+                if !visit_allocation_storage(directives.as_ref(), visitor, true) {
+                    return false;
+                }
+                let syntax_header = core::mem::size_of::<Vec<(usize, String)>>()
+                    + 2 * core::mem::size_of::<usize>();
+                if !visitor.visit_allocation(Some(syntax_header), true) {
+                    return false;
+                }
+                if !visit_allocation_storage(syntax.as_ref(), visitor, true) {
+                    return false;
+                }
                 if let Some(value) = unsupported {
                     let layout = core::alloc::Layout::new::<[usize; 2]>()
                         .extend(core::alloc::Layout::for_value(value.as_ref()))
-                        .ok().map(|(layout, _)| layout.pad_to_align().size());
-                    visitor.visit_allocation(layout, true)?;
+                        .ok()
+                        .map(|(layout, _)| layout.pad_to_align().size());
+                    if !visitor.visit_allocation(layout, true) {
+                        return false;
+                    }
                 }
             }
-            Self::MySqlNoRangeOptimization { query_block_name, table, indexes, .. } => {
+            Self::MySqlNoRangeOptimization {
+                query_block_name,
+                table,
+                indexes,
+                ..
+            } => {
                 if let Some((directives, _)) = query_block_name {
-                    visitor.visit_allocation(Some(arc_vec_header), true)?;
-                    visit_allocation_storage(directives.as_ref(), visitor, true)?;
+                    if !visitor.visit_allocation(Some(arc_vec_header), true) {
+                        return false;
+                    }
+                    if !visit_allocation_storage(directives.as_ref(), visitor, true) {
+                        return false;
+                    }
                 }
-                visit_allocation_storage(table, visitor, false)?;
-                visit_allocation_storage(indexes, visitor, false)?;
+                if !visit_allocation_storage(table, visitor, false) {
+                    return false;
+                }
+                if !visit_allocation_storage(indexes, visitor, false) {
+                    return false;
+                }
             }
             Self::MultiLine | Self::MySqlSource(_) | Self::MySqlDeleteModifier(_) => {}
         }
-        core::ops::ControlFlow::Continue(())
+        true
     }
 }
 #[cfg(feature = "visitor")]
 impl VisitMut for OptimizerHintStyle {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_STORAGE_METADATA {
-            visitor.visit_optimizer_hint_storage(self)?;
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        if visitor.visits_storage_metadata() {
+            if !visitor.visit_optimizer_hint_storage(self) {
+                return false;
+            }
             // The receiving pass validates uniqueness before either walk.
             // Ordinary semantic visitors still have no hint-program children.
             let directives = match self {
                 Self::MySqlBoundSource { directives, .. } => Some(directives),
-                Self::MySqlNoRangeOptimization { query_block_name: Some((directives, _)), .. } => Some(directives),
+                Self::MySqlNoRangeOptimization {
+                    query_block_name: Some((directives, _)),
+                    ..
+                } => Some(directives),
                 _ => None,
             };
             if let Some(directives) = directives.and_then(Arc::get_mut) {
-                visitor::visit_storage_metadata_mut(directives, visitor)?;
+                if !visitor::visit_storage_metadata_mut(directives, visitor) {
+                    return false;
+                }
             }
         }
-        core::ops::ControlFlow::Continue(())
+        true
     }
 }
 

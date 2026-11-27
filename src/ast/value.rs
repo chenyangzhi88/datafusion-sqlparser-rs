@@ -1065,19 +1065,15 @@ impl<'de> Deserialize<'de> for MySqlText {
 macro_rules! source_visit_noop {
     ($($ty:ty),* $(,)?) => {$ (
         impl crate::ast::Visit for $ty {
-            fn visit<V: crate::ast::Visitor>(&self, _: &mut V) -> core::ops::ControlFlow<V::Break> { core::ops::ControlFlow::Continue(()) }
+            fn visit_dyn(&self, _: &mut dyn crate::ast::DynVisitor) -> bool { true }
         }
         impl crate::ast::VisitMut for $ty {
-            fn visit<V: crate::ast::VisitorMut>(&mut self, _: &mut V) -> core::ops::ControlFlow<V::Break> { core::ops::ControlFlow::Continue(()) }
+            fn visit_dyn(&mut self, _: &mut dyn crate::ast::DynVisitorMut) -> bool { true }
         }
     )*};
 }
 #[cfg(feature = "visitor")]
-source_visit_noop!(
-    SqlSourceOccurrence,
-    SqlCppPieceRange,
-    SqlCppLedger
-);
+source_visit_noop!(SqlSourceOccurrence, SqlCppPieceRange, SqlCppLedger);
 
 /// A projection's original grammar naming fact, not a second executable
 /// literal. Visitors must not rewrite/evaluate it along with the VALUE Item.
@@ -1099,46 +1095,47 @@ impl MySqlProjectionLiteral {
 
 #[cfg(feature = "visitor")]
 impl crate::ast::Visit for MySqlProjectionLiteral {
-    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS {
-            crate::ast::visitor::visit_allocation_storage(&self.0, visitor, false)?;
-        }
-        core::ops::ControlFlow::Continue(())
+    fn visit_dyn(&self, visitor: &mut dyn crate::ast::DynVisitor) -> bool {
+        crate::ast::visitor::visit_allocation_storage(&self.0, visitor, false)
     }
 }
 #[cfg(feature = "visitor")]
 impl crate::ast::VisitMut for MySqlProjectionLiteral {
-    fn visit<V: crate::ast::VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_STORAGE_METADATA {
-            crate::ast::visitor::visit_storage_metadata_mut(&mut self.0, visitor)?;
-        }
-        core::ops::ControlFlow::Continue(())
+    fn visit_dyn(&mut self, visitor: &mut dyn crate::ast::DynVisitorMut) -> bool {
+        crate::ast::visitor::visit_storage_metadata_mut(&mut self.0, visitor)
     }
 }
 
 #[cfg(feature = "visitor")]
 impl crate::ast::Visit for MySqlText {
-    fn visit<V: crate::ast::Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS {
-            if V::VISIT_CLONE_ALLOCATIONS {
-                visitor.visit_allocation(self.clone_owned_storage_bytes(), false)?;
+    fn visit_dyn(&self, visitor: &mut dyn crate::ast::DynVisitor) -> bool {
+        if visitor.visits_allocations() {
+            if visitor.visits_clone_allocations() {
+                if !visitor.visit_allocation(self.clone_owned_storage_bytes(), false) {
+                    return false;
+                }
             } else {
                 let storage = self.detached_storage_bytes();
-                visitor.visit_allocation(storage.map(|(owned, _)| owned), false)?;
-                visitor.visit_allocation(storage.map(|(_, shared)| shared), true)?;
+                if !visitor.visit_allocation(storage.map(|(owned, _)| owned), false) {
+                    return false;
+                }
+                if !visitor.visit_allocation(storage.map(|(_, shared)| shared), true) {
+                    return false;
+                }
             }
         }
-        visitor.pre_visit_mysql_text(self)?;
+        if !visitor.pre_visit_mysql_text(self) {
+            return false;
+        }
         visitor.post_visit_mysql_text(self)
     }
 }
 #[cfg(feature = "visitor")]
 impl crate::ast::VisitMut for MySqlText {
-    fn visit<V: crate::ast::VisitorMut>(
-        &mut self,
-        visitor: &mut V,
-    ) -> core::ops::ControlFlow<V::Break> {
-        visitor.pre_visit_mysql_text(self)?;
+    fn visit_dyn(&mut self, visitor: &mut dyn crate::ast::DynVisitorMut) -> bool {
+        if !visitor.pre_visit_mysql_text(self) {
+            return false;
+        }
         visitor.post_visit_mysql_text(self)
     }
 }

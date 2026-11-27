@@ -864,42 +864,70 @@ impl fmt::Display for CteCycleClause {
 // traverse only the source clause and its actual mark expressions.
 #[cfg(feature = "visitor")]
 impl Visit for CteSearchClause {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS { visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.key_indices.len() } else { self.key_indices.capacity() }).checked_mul(core::mem::size_of::<usize>()), false)?; }
-        self.columns.visit(visitor)?;
-        self.sequence_column.visit(visitor)
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        if visitor.visits_allocations()
+            && !visitor::visit_vec_allocation(&self.key_indices, visitor)
+        {
+            return false;
+        }
+        if !self.columns.visit_dyn(visitor) {
+            return false;
+        }
+        self.sequence_column.visit_dyn(visitor)
     }
 }
 #[cfg(feature = "visitor")]
 impl VisitMut for CteSearchClause {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        VisitMut::visit(&mut self.columns, visitor)?;
-        VisitMut::visit(&mut self.sequence_column, visitor)
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        if !VisitMut::visit_dyn(&mut self.columns, visitor) {
+            return false;
+        }
+        VisitMut::visit_dyn(&mut self.sequence_column, visitor)
     }
 }
 #[cfg(feature = "visitor")]
 impl Visit for CteCycleClause {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        if V::VISIT_ALLOCATIONS { visitor.visit_allocation((if V::VISIT_CLONE_ALLOCATIONS { self.key_indices.len() } else { self.key_indices.capacity() }).checked_mul(core::mem::size_of::<usize>()), false)?; }
-        self.columns.visit(visitor)?;
-        self.mark_column.visit(visitor)?;
-        if let Some((value, default)) = &self.mark_values {
-            value.visit(visitor)?;
-            default.visit(visitor)?;
+    fn visit_dyn(&self, visitor: &mut dyn DynVisitor) -> bool {
+        if visitor.visits_allocations()
+            && !visitor::visit_vec_allocation(&self.key_indices, visitor)
+        {
+            return false;
         }
-        self.path_column.visit(visitor)
+        if !self.columns.visit_dyn(visitor) {
+            return false;
+        }
+        if !self.mark_column.visit_dyn(visitor) {
+            return false;
+        }
+        if let Some((value, default)) = &self.mark_values {
+            if !value.visit_dyn(visitor) {
+                return false;
+            }
+            if !default.visit_dyn(visitor) {
+                return false;
+            }
+        }
+        self.path_column.visit_dyn(visitor)
     }
 }
 #[cfg(feature = "visitor")]
 impl VisitMut for CteCycleClause {
-    fn visit<V: VisitorMut>(&mut self, visitor: &mut V) -> core::ops::ControlFlow<V::Break> {
-        VisitMut::visit(&mut self.columns, visitor)?;
-        VisitMut::visit(&mut self.mark_column, visitor)?;
-        if let Some((value, default)) = &mut self.mark_values {
-            VisitMut::visit(value, visitor)?;
-            VisitMut::visit(default, visitor)?;
+    fn visit_dyn(&mut self, visitor: &mut dyn DynVisitorMut) -> bool {
+        if !VisitMut::visit_dyn(&mut self.columns, visitor) {
+            return false;
         }
-        VisitMut::visit(&mut self.path_column, visitor)
+        if !VisitMut::visit_dyn(&mut self.mark_column, visitor) {
+            return false;
+        }
+        if let Some((value, default)) = &mut self.mark_values {
+            if !VisitMut::visit_dyn(value, visitor) {
+                return false;
+            }
+            if !VisitMut::visit_dyn(default, visitor) {
+                return false;
+            }
+        }
+        VisitMut::visit_dyn(&mut self.path_column, visitor)
     }
 }
 
